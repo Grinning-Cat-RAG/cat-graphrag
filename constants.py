@@ -35,6 +35,15 @@ TECHNOLOGY_PATTERNS = [
 # N entities → N*(N-1)/2 pairs: beyond this threshold, the cost is too high.
 MAX_CO_OCCURRENCE_ENTITIES = 10
 
+# spaCy long-text chunking (NER on very large documents)
+# - segments larger than this are split at paragraph boundaries first, then
+#   hard-split; parser/ner memory grows superlinearly with text length
+#   (spaCy discussion #9170 / #11985), so keep segments well under the
+#   pipeline's max_length (default 10**6).
+SPACY_MAX_SEGMENT_CHARS = 100_000
+# nlp.pipe batch size; worst-case in-flight chars = batch_size * segment cap.
+SPACY_PIPE_BATCH_SIZE = 8
+
 # Maps spaCy verb lemmas to semantic relation type labels.
 # Unlisted verbs fall back to "RELATED_TO".
 VERB_TO_RELATION_TYPE: Dict[str, str] = {

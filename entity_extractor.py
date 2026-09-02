@@ -3,14 +3,21 @@ import hashlib
 import re
 from langdetect import DetectorFactory, detect_langs
 from cat import log
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from spacy import load as spacy_load
 from spacy.util import is_package as spacy_is_package
 from spacy.cli.download import download as spacy_download
 from spacy.language import Language
 from spacy.tokens import Doc
 
-from .constants import SPACY_TO_ENTITY_TYPE, TECHNOLOGY_PATTERNS, MAX_CO_OCCURRENCE_ENTITIES, VERB_TO_RELATION_TYPE
+from .constants import (
+    SPACY_TO_ENTITY_TYPE,
+    TECHNOLOGY_PATTERNS,
+    MAX_CO_OCCURRENCE_ENTITIES,
+    VERB_TO_RELATION_TYPE,
+    SPACY_MAX_SEGMENT_CHARS,
+    SPACY_PIPE_BATCH_SIZE,
+)
 from .models import ExtractedEntity, ExtractedRelation, EntityType, DocumentWithEntities
 
 
@@ -72,6 +79,95 @@ async def _get_or_load_model(model_name: str) -> Language:
         _SPACY_MODEL_CACHE[model_name] = nlp
         log.info(f"Loaded spaCy model '{model_name}' (globally cached)")
         return nlp
+
+
+# ---------------------------------------------------------------------------
+# Long-text segmentation
+#
+# spaCy's max_length guard (default 10**6) raises E088 for longer texts and
+# parser/NER memory grows superlinearly with text length. Per the spaCy
+# team's guidance for large documents, long inputs are split at paragraph
+# boundaries into contiguous segments (each ≤ SPACY_MAX_SEGMENT_CHARS chars)
+# processed with a single batched ``nlp.pipe`` call. Joining the segments
+# reproduces the original text exactly (partition invariant), so character
+# offsets stay global: each segment's local offsets are shifted by its start
+# offset in the original text.
+# ---------------------------------------------------------------------------
+
+
+def _hard_split(chunk: str, cap: int) -> Tuple[str, str]:
+    """Split *chunk* (``len(chunk) > cap``) into ``(head, rest)``.
+
+    *head* is always ``<= cap`` chars. Prefers a whitespace-aware cut: the
+    last space within ``[0.75 * cap, cap]``, keeping the space at the end of
+    *head* (so *rest* does not start with whitespace). Falls back to a raw cut
+    at ``cap`` when the window contains no space.
+    """
+    window = chunk[:cap]
+    cut = window.rfind(" ", int(0.75 * cap))
+    if cut == -1:
+        cut = cap
+    else:
+        cut += 1  # keep the space with the head
+    return chunk[:cut], chunk[cut:]
+
+
+def _segment_text(text: str) -> List[Tuple[int, str]]:
+    """Split *text* into contiguous segments ≤ SPACY_MAX_SEGMENT_CHARS chars.
+
+    Returns a list of ``(start_offset, segment_text)`` pairs. The segment
+    texts concatenated in order reproduce *text* exactly (partition
+    invariant) and ``start_offset`` is the running cumulative length, i.e. the
+    segment's position inside the original text.
+
+    Split points prefer paragraph boundaries (double newlines; the separator
+    is kept attached to the preceding paragraph). A single paragraph larger
+    than the cap is hard-split (whitespace-aware, else raw).
+    """
+    cap = SPACY_MAX_SEGMENT_CHARS
+    # re.split with a capturing group keeps the separators in the result, so
+    # concatenating the chunks (and thus the final segments) is lossless.
+    # Empty chunks (leading/trailing/only separators) are dropped safely:
+    # they contribute nothing to the partition invariant.
+    chunks = [c for c in re.split(r"(\r?\n\s*\r?\n)", text) if c]
+
+    # Hard-split any chunk larger than the cap (recursively for the rest).
+    parts: List[str] = []
+    for chunk in chunks:
+        while len(chunk) > cap:
+            head, chunk = _hard_split(chunk, cap)
+            parts.append(head)
+        parts.append(chunk)
+
+    # Greedily pack adjacent parts into segments of at most `cap` chars.
+    segment_texts: List[str] = []
+    for part in parts:
+        if segment_texts and len(segment_texts[-1]) + len(part) <= cap:
+            segment_texts[-1] += part
+        else:
+            segment_texts.append(part)
+
+    # Offsets are running cumulated lengths → exact partition of the original.
+    segments: List[Tuple[int, str]] = []
+    offset = 0
+    for segment_text in segment_texts:
+        segments.append((offset, segment_text))
+        offset += len(segment_text)
+    return segments
+
+
+def _run_segment_pipe(
+    nlp: Language, segments: List[Tuple[int, str]], batch_size: int
+) -> List[Tuple[Doc, int]]:
+    """Run ``nlp.pipe`` over the segments, pairing each doc with its offset.
+
+    Must be called from a worker thread: ``nlp.pipe`` is blocking CPU work and
+    returns a generator that has to be consumed here. ``nlp.pipe`` yields one
+    doc per input text, in input order, so ``zip(segments, docs)`` pairs each
+    doc with the offset of the segment it was produced from.
+    """
+    docs = nlp.pipe([text for _, text in segments], batch_size=batch_size)
+    return [(doc, offset) for (offset, _), doc in zip(segments, docs)]
 
 
 class EntityExtractor:
@@ -186,6 +282,13 @@ class EntityExtractor:
     async def extract(self, text: str, document_id: str, metadata: Dict = None) -> DocumentWithEntities:
         """
         Extracts entities and relations from text.
+
+        Long texts are split into contiguous segments (paragraph-aligned,
+        each ≤ SPACY_MAX_SEGMENT_CHARS chars) processed together with a single
+        batched ``nlp.pipe`` call inside a worker thread — this keeps every
+        processed text far below spaCy's max_length guard (E088) while the
+        entity/relation offsets stay global (per-segment local offsets are
+        shifted by the segment's start offset).
         """
         if not self._initialized:
             await self.ensure_initialized()
@@ -193,10 +296,16 @@ class EntityExtractor:
         # Process text with spaCy
         lang = self._detect_language(text)
         nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
-        doc: Doc = await asyncio.to_thread(nlp, text)
 
-        # Extract entities
-        extracted_entities = self.extract_entities(doc)
+        segments = _segment_text(text)
+        # nlp.pipe is blocking CPU work (like the previous nlp(text)); the
+        # generator is consumed inside the worker thread, never in the loop.
+        pairs = await asyncio.to_thread(_run_segment_pipe, nlp, segments, SPACY_PIPE_BATCH_SIZE)
+
+        # Extract entities (global offsets: per-segment local + segment start)
+        extracted_entities = []
+        for doc, offset in pairs:
+            extracted_entities.extend(self.extract_entities(doc, offset=offset))
 
         # Add technology entities with regex (captures things spaCy might miss)
         extracted_entities.extend(self.extract_technologies_regex(text))
@@ -205,7 +314,7 @@ class EntityExtractor:
         extracted_entities = self.deduplicate_entities(extracted_entities)
 
         # Extract relations
-        relations = self._extract_relations(doc, extracted_entities, text)
+        relations = self._extract_relations(pairs, extracted_entities, text)
 
         # Add co-occurrence relations only for small entity sets.
         # N*(N-1)/2 pairs are too expensive for large documents.
@@ -234,16 +343,22 @@ class EntityExtractor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def extract_entities(doc: Doc) -> List[ExtractedEntity]:
-        """Extracts named entities from the spaCy document."""
+    def extract_entities(doc: Doc, offset: int = 0) -> List[ExtractedEntity]:
+        """Extracts named entities from the spaCy document.
+
+        ``offset`` shifts the entity char spans — used when *doc* was produced
+        from a segment of a larger text so that the returned offsets stay
+        global (see ``extract``); defaults to 0, keeping single-document calls
+        (e.g. the query path in graphrag_handler) unchanged.
+        """
         entities = []
         for ent in doc.ents:
             entity_type = SPACY_TO_ENTITY_TYPE.get(ent.label_, EntityType.UNKNOWN)
             entities.append(ExtractedEntity(
                 name=ent.text.strip(),
                 type=entity_type,
-                start_char=ent.start_char,
-                end_char=ent.end_char,
+                start_char=ent.start_char + offset,
+                end_char=ent.end_char + offset,
                 confidence=0.9 if entity_type != EntityType.UNKNOWN else 0.5
             ))
         return entities
@@ -286,7 +401,7 @@ class EntityExtractor:
 
     @staticmethod
     def _extract_relations(
-        doc: Doc,
+        segments: List[Tuple[Doc, int]],
         entities: List[ExtractedEntity],
         full_text: str
     ) -> List[ExtractedRelation]:
@@ -297,11 +412,15 @@ class EntityExtractor:
            Uses spaCy's dependency tree to find Subject-Verb-Object triples.
            Passive voice is supported via the "agent" arc
            (e.g. "Python was developed by Guido" → DEVELOPS(Guido, Python)).
+           ``segments`` holds one ``(doc, offset)`` pair per text segment: each
+           doc's local token spans (``tok.idx``, subtrees) are shifted by its
+           segment offset so entity lookups match the global entity offsets.
 
         2. **Proximity-fallback phase** (secondary, weight=0.6):
            For pairs not already found by the parser, a 100-char sliding window
            catches implicit relations (enumerations, appositions, etc.) using
-           lightweight keyword patterns.
+           lightweight keyword patterns. Already runs on global offsets + the
+           full text, so it also catches pairs spanning segment boundaries.
         """
         relations: List[ExtractedRelation] = []
 
@@ -319,75 +438,79 @@ class EntityExtractor:
                     return ent
             return None
 
-        def find_entity_for_token(tok) -> ExtractedEntity | None:
+        def find_entity_for_token(tok, offset: int) -> ExtractedEntity | None:
             """
             Tries to resolve a dependency-tree token to one of our entities.
 
-            1. Checks the token's own character span.
+            1. Checks the token's own character span (local ``tok.idx`` shifted
+               by the segment ``offset`` into global coordinates).
             2. If not found, expands to the token's subtree (handles compound
                proper nouns like "New York" or "Apache Kafka").
                The expansion is capped at 5 tokens to avoid matching full clauses.
             """
-            ent = find_entity_for_span(tok.idx, tok.idx + len(tok.text))
+            ent = find_entity_for_span(offset + tok.idx, offset + tok.idx + len(tok.text))
             if ent:
                 return ent
             subtree = list(tok.subtree)
             if 2 <= len(subtree) <= 5:
-                span_start = subtree[0].idx
-                span_end = subtree[-1].idx + len(subtree[-1].text)
+                span_start = offset + subtree[0].idx
+                span_end = offset + subtree[-1].idx + len(subtree[-1].text)
                 return find_entity_for_span(span_start, span_end)
             return None
 
         # ── phase 1: SVO via dependency parser ───────────────────────────────
+        # seen_pairs is shared across all segments: the same SVO triple found
+        # in two segments yields a single relation.
 
         seen_pairs: set = set()
 
-        for token in doc:
-            if token.pos_ not in ("VERB", "AUX"):
-                continue
+        for doc, offset in segments:
+            for token in doc:
+                if token.pos_ not in ("VERB", "AUX"):
+                    continue
 
-            # Grammatical subjects (active and passive)
-            subjects = [
-                child for child in token.children
-                if child.dep_ in ("nsubj", "nsubjpass")
-            ]
+                # Grammatical subjects (active and passive)
+                subjects = [
+                    child for child in token.children
+                    if child.dep_ in ("nsubj", "nsubjpass")
+                ]
 
-            # Grammatical objects: direct, attributive, prepositional
-            objects = [
-                child for child in token.children
-                if child.dep_ in ("dobj", "attr", "acomp", "oprd")
-            ]
-            for prep in (c for c in token.children if c.dep_ == "prep"):
-                objects.extend(
-                    gc for gc in prep.children if gc.dep_ in ("pobj", "pcomp")
-                )
+                # Grammatical objects: direct, attributive, prepositional
+                objects = [
+                    child for child in token.children
+                    if child.dep_ in ("dobj", "attr", "acomp", "oprd")
+                ]
+                for prep in (c for c in token.children if c.dep_ == "prep"):
+                    objects.extend(
+                        gc for gc in prep.children if gc.dep_ in ("pobj", "pcomp")
+                    )
 
-            # Passive agent: "X was built by Y" → "by Y" agent arc
-            # The pobj of "by" becomes the logical subject.
-            for agent in (c for c in token.children if c.dep_ == "agent"):
-                subjects.extend(gc for gc in agent.children if gc.dep_ == "pobj")
+                # Passive agent: "X was built by Y" → "by Y" agent arc
+                # The pobj of "by" becomes the logical subject.
+                for agent in (c for c in token.children if c.dep_ == "agent"):
+                    subjects.extend(gc for gc in agent.children if gc.dep_ == "pobj")
 
-            rel_type = VERB_TO_RELATION_TYPE.get(token.lemma_, "RELATED_TO")
+                rel_type = VERB_TO_RELATION_TYPE.get(token.lemma_, "RELATED_TO")
 
-            for subj_tok in subjects:
-                for obj_tok in objects:
-                    subj_ent = find_entity_for_token(subj_tok)
-                    obj_ent = find_entity_for_token(obj_tok)
+                for subj_tok in subjects:
+                    for obj_tok in objects:
+                        subj_ent = find_entity_for_token(subj_tok, offset)
+                        obj_ent = find_entity_for_token(obj_tok, offset)
 
-                    if not subj_ent or not obj_ent or subj_ent.name == obj_ent.name:
-                        continue
+                        if not subj_ent or not obj_ent or subj_ent.name == obj_ent.name:
+                            continue
 
-                    pair_key = (subj_ent.name, obj_ent.name, rel_type)
-                    if pair_key in seen_pairs:
-                        continue
-                    seen_pairs.add(pair_key)
+                        pair_key = (subj_ent.name, obj_ent.name, rel_type)
+                        if pair_key in seen_pairs:
+                            continue
+                        seen_pairs.add(pair_key)
 
-                    relations.append(ExtractedRelation(
-                        source_entity=subj_ent.name,
-                        target_entity=obj_ent.name,
-                        relation_type=rel_type,
-                        weight=0.85,  # syntactically grounded → higher confidence
-                    ))
+                        relations.append(ExtractedRelation(
+                            source_entity=subj_ent.name,
+                            target_entity=obj_ent.name,
+                            relation_type=rel_type,
+                            weight=0.85,  # syntactically grounded → higher confidence
+                        ))
 
         # ── phase 2: proximity fallback ───────────────────────────────────────
         # Catches pairs not expressed through explicit verbs
