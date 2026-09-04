@@ -75,6 +75,11 @@ class EpochMixin:
             "embedding_prop": f"embedding_{gen}",
             "index": f"{self._document_vector_index}_{gen}",
             "relation": f"SIMILAR_TO_{gen}",
+            # Entity embeddings follow the SAME generation scheme as document
+            # embeddings, so entity vector search always targets the property
+            # and index of the CURRENT generation (no legacy `e.embedding`).
+            "entity_embedding_prop": f"entity_embedding_{gen}",
+            "entity_index": f"{self._entity_vector_index}_{gen}",
         }
 
     def _rebuild_for_generation(self, gen: str) -> None:
@@ -210,7 +215,7 @@ class EpochMixin:
 
         if key == "recall_entity_by_vector":
             return f"""
-            CALL db.index.vector.queryNodes('{self._entity_vector_index}', $k, $vector)
+            CALL db.index.vector.queryNodes('{names["entity_index"]}', $k, $vector)
             YIELD node AS ent, score AS ent_score
             WHERE ent.tenant_id = $tenant_id
             MATCH (d:Document {{tenant_id: $tenant_id}})-[:MENTIONS]->(ent)

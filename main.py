@@ -1,7 +1,9 @@
 from typing import List, Dict, Any
+import asyncio
 from langchain_core.documents import Document
 
 from cat import hook, RecallSettings, VectorDatabaseSettings
+from cat.log import log
 from cat.looking_glass.stray_cat import StrayCat
 from cat.services.memory.models import PointStruct
 
@@ -13,6 +15,29 @@ from .entity_extractor import EntityExtractor
 def factory_allowed_vector_databases(allowed: List[VectorDatabaseSettings], cat) -> List:
     allowed.append(Neo4jGraphRAGConfig)
     return allowed
+
+
+@hook(priority=10)
+async def after_cheshire_cat_creation(cat) -> None:
+    """
+    Boot-time provenance migration.
+
+    Every agent's graph that predates the PROVENANCE / ``source_files``
+    tracking (nodes and relations created before this feature) is reconciled
+    in the background, so the file-deletion cascade works for historical data
+    too. ``recompute_provenance`` self-skips tenants that are already
+    reconciled (a single ``provenance_reconciled`` marker count), so this is a
+    cheap no-op on every boot after the first migration.
+    """
+    handler = getattr(cat, "vector_memory_handler", None)
+    if not isinstance(handler, GraphRAGHandler):
+        return
+    task = asyncio.create_task(handler.recompute_provenance())
+    handler._pending_entity_tasks.append(task)
+    log.info(
+        f"[GraphRAG] Scheduled provenance reconciliation for "
+        f"{getattr(handler, 'agent_id', 'unknown')}"
+    )
 
 
 @hook(priority=10)

@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# opencode
+.sisyphus/
+.opencode/
+.omo/
+AGENTS.md
+
 # C extensions
 *.so
 

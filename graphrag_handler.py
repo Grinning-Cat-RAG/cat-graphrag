@@ -210,7 +210,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             async with self._driver.session(database=self._neo4j_database) as session:
                 await session.run("RETURN 1")
             await self._backfill_missing_entity_ids()
-            log.info(f"Connected to Neo4j at {self._neo4j_uri}")
+            log.debug(f"Connected to Neo4j at {self._neo4j_uri}")
         except Exception as e:
             log.error(f"Failed to connect to Neo4j: {e}")
             raise
@@ -253,55 +253,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 log.info(f"[GraphRAG] Backfilled id on {len(rows)} Entity node(s)")
         except Exception as e2:
             log.warning(f"[GraphRAG] Backfill skipped: {e2}")
-
-    async def _ensure_vector_indexes_in_session(self, session, vector_dimensions: int):
-        """Creates vector indexes for Document and Entity, using an already opened session."""
-        # Index for Document
-        doc_index_query = f"""
-        CREATE VECTOR INDEX {self._document_vector_index} IF NOT EXISTS
-        FOR (d:Document) ON d.embedding
-        OPTIONS {{
-            indexConfig: {{
-                `vector.dimensions`: {vector_dimensions},
-                `vector.similarity_function`: 'cosine',
-                `vector.hnsw.ef_construction`: 200,
-                `vector.hnsw.m`: 16
-            }}
-        }}
-        """
-
-        # Index for Entity (optional)
-        entity_index_query = f"""
-        CREATE VECTOR INDEX {self._entity_vector_index} IF NOT EXISTS
-        FOR (e:Entity) ON e.embedding
-        OPTIONS {{
-            indexConfig: {{
-                `vector.dimensions`: {vector_dimensions},
-                `vector.similarity_function`: 'cosine',
-                `vector.hnsw.ef_construction`: 200,
-                `vector.hnsw.m`: 16
-            }}
-        }}
-        """
-
-        # Create document index
-        try:
-            await session.run(doc_index_query)
-            log.info(f"Document vector index ensured: {self._document_vector_index}")
-        except Exception as e:
-            if "already exists" not in str(e):
-                log.error(f"Document index creation warning: {e}")
-                raise e
-
-        # Create an entity index (if enabled)
-        if self._enable_entity_embeddings:
-            try:
-                await session.run(entity_index_query)
-                log.info(f"Entity vector index ensured: {self._entity_vector_index}")
-            except Exception as e:
-                if "already exists" not in str(e):
-                    log.error(f"Entity index creation warning: {e}")
-                    raise e
 
     @staticmethod
     async def _ensure_constraints_in_session(session):
@@ -362,13 +313,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return record["embedder_name"], int(record["embedder_size"])
         return None
 
-    async def _drop_vector_indexes_in_session(self, session) -> None:
+    async def _drop_vector_indexes_in_session(self, session, names: Dict[str, str] | None = None) -> None:
         """Drops the document (and optional entity) vector index so they can be
-        recreated with the new embedder dimensions."""
-        for index_name in [
-            self._document_vector_index,
-            self._entity_vector_index,
-        ]:
+        recreated with the new embedder dimensions.
+
+        Drops both the legacy unversioned indexes (``document_embeddings`` /
+        ``entity_embeddings``, kept for backward cleanup of pre-P4 installs) and,
+        when ``names`` is provided, the CURRENT generation's versioned indexes.
+        """
+        index_names = [self._document_vector_index, self._entity_vector_index]
+        if names:
+            index_names += [names["index"], names["entity_index"]]
+        for index_name in index_names:
             try:
                 # noinspection SqlNoDataSourceInspection
                 await session.run(f"DROP INDEX {index_name} IF EXISTS")
@@ -420,16 +376,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         log.info(f"[GraphRAG] Tenant data wiped for agent_id={self.agent_id}")
 
-    async def _ensure_vector_index_in_session(self, session, index_name: str, embedding_prop: str, vector_dimensions: int) -> None:
-        """Creates a single Document vector index at the given (versioned) name.
+    async def _ensure_vector_index_in_session(self, session, index_name: str, embedding_prop: str, vector_dimensions: int, node_label: str = "Document") -> None:
+        """Creates a single vector index at the given (versioned) name.
 
-        Mirror of ``_ensure_vector_indexes_in_session`` scoped to one index,
-        used by the shadow-build phase of ``reembed_tenant`` to create
-        ``document_embeddings_{gen}`` on ``embedding_{gen}``.
+        Scoped to one index, used by the shadow-build phase of ``reembed_tenant``
+        to create ``document_embeddings_{gen}`` on ``embedding_{gen}`` (Document)
+        or ``entity_embeddings_{gen}`` on ``entity_embedding_{gen}`` (Entity).
         """
         query = f"""
         CREATE VECTOR INDEX {index_name} IF NOT EXISTS
-        FOR (d:Document) ON d.{embedding_prop}
+        FOR (n:{node_label}) ON n.{embedding_prop}
         OPTIONS {{
             indexConfig: {{
                 `vector.dimensions`: {vector_dimensions},
@@ -441,10 +397,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         try:
             await session.run(query)
-            log.info(f"Document vector index ensured: {index_name}")
+            log.info(f"{node_label} vector index ensured: {index_name}")
         except Exception as e:
             if "already exists" not in str(e):
-                log.error(f"Document index creation warning: {e}")
+                log.error(f"{node_label} index creation warning: {e}")
                 raise e
 
     async def _create_similarity_relationships_for_gen(
@@ -501,6 +457,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Drop the old vector index (Neo4j vector indexes are immutable —
             # the new generation carries its own index at the new dims).
             await session.run(cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS"))
+            await session.run(cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS"))
             # Delete the old SIMILAR_TO edges (both endpoints tenant-filtered).
             await session.run(
                 cast(
@@ -523,9 +480,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 ),
                 tenant_id=tenant_id,
             )
+            # Remove the old entity embedding property from every tenant Entity.
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    REMOVE e.{names['entity_embedding_prop']}
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
 
     async def reembed_tenant(self, tenant_id: str, new_embedder) -> None:
-        """Seamless shadow-swap of the tenant's embedding generation.
+        """Seamless shadow-swap of the tenant's embedding generation (P4, todo 12).
 
         Phase A (shadow): re-embed every stored Document of *tenant_id* with
         ``new_embedder`` into the NEW versioned names (``embedding_{new_gen}``,
@@ -635,6 +603,32 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 new_embedder.size,
             )
 
+        # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
+        #     embeddings are NOT recomputed on a swap — carry them forward from
+        #     the old generation into the new one (same vectors, new property),
+        #     and create the new entity vector index.
+        old_names = self._versioned_names(old_gen)
+        async with self._get_session() as session:
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
+                    SET e.{new_names["entity_embedding_prop"]} =
+                        e.{old_names["entity_embedding_prop"]}
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            await self._ensure_vector_index_in_session(
+                session,
+                new_names["entity_index"],
+                new_names["entity_embedding_prop"],
+                new_embedder.size,
+                node_label="Entity",
+            )
+
         # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
         #    _create_similarity_relationships against the new index/relation).
         for doc_id, vector, collection_name in valid_pairs:
@@ -709,31 +703,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if index_needs_rebuild:
                     await self._drop_vector_indexes_in_session(session)
 
-            # Always ensure indexes exist with the correct dimensions.
-            # If they were just dropped, this recreates them;
-            # if they already match, IF NOT EXISTS is a no-op.
-            await self._ensure_vector_indexes_in_session(session, embedder_size)
-
-            # ───────────────── Versioned-schema bootstrap ─────────────────────
-            # The decorated read paths query the versioned index/property for
-            # the current generation (e.g. document_embeddings_v1 / embedding_v1).
-            # On a fresh install — or on pre-P4 data that only carries the
-            # unversioned `embedding` property — that versioned schema does not
-            # exist yet, so the first memory recall would target a missing index
-            # and fail. Ensure the versioned index for the current generation and
-            # backfill the legacy unversioned embedding into it, so reads never
-            # hit a missing index.
+            # Always ensure indexes exist with the correct dimensions (versioned
+            # schema, todo 11 P4): the read paths query the CURRENT generation's
+            # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
+            # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
+            # index is created anymore — the legacy `embedding` / `e.embedding`
+            # properties only feed the one-time backfill below.
             gen = await self._read_generation()
             if gen != self._generation:
                 self._rebuild_for_generation(gen)
             names = self._names
+
+            if index_needs_rebuild:
+                await self._drop_vector_indexes_in_session(session, names)
+
             # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
             # is a silent NO-OP when the index already exists at an OLD
-            # dimensionality. The versioned index is the one all read paths
-            # actually use (find_similar / recall), so repair it synchronously
+            # dimensionality. The versioned indexes are the ones all read paths
+            # actually use (find_similar / recall), so repair them synchronously
             # HERE at boot — before any ingestion worker can race ahead and
             # hit the dimension mismatch. embedder_size is a plain parameter,
             # it does not require the embedder object (injected later by hooks).
+            # — Document index
             v_index_dims = await self._get_index_dimensions(session, names["index"])
             if v_index_dims is not None and v_index_dims != embedder_size:
                 log.warning(
@@ -748,13 +739,29 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             await self._ensure_vector_index_in_session(
                 session, names["index"], names["embedding_prop"], embedder_size
             )
+            # — Entity index (same generation scheme)
+            ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
+            if ev_index_dims is not None and ev_index_dims != embedder_size:
+                log.warning(
+                    f"[GraphRAG] Versioned index {names['entity_index']} has "
+                    f"{ev_index_dims} dims but embedder is {embedder_size}; "
+                    "dropping and recreating it at boot (vectors already "
+                    "correct, no re-embed needed)."
+                )
+                await session.run(
+                    cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                )
+            await self._ensure_vector_index_in_session(
+                session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
+            )
             # Backfill: copy the legacy unversioned `embedding` property into the
             # current generation's property for existing documents that lack it,
             # BUT only when the stored vector already matches the embedder dims
             # (a stale pre-change vector in the index property would poison the
-            # vector index). (The driver suppresses the 01N52 "property does not
-            # exist" GQL warning on a fresh database, so the IS NOT NULL filter
-            # is safe.)
+            # vector index). Once migrated, the legacy property is REMOVED so
+            # the schema converges to the versioned-only shape. (The driver
+            # suppresses the 01N52 "property does not exist" GQL warning on a
+            # fresh database, so the IS NOT NULL filter is safe.)
             await session.run(
                 cast(
                     LiteralString,
@@ -764,6 +771,23 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                       AND d.{names["embedding_prop"]} IS NULL
                       AND size(d.embedding) = $dims
                     SET d.{names["embedding_prop"]} = d.embedding
+                    REMOVE d.embedding
+                    """,
+                ),
+                tenant_id=self.agent_id,
+                dims=embedder_size,
+            )
+            # Same one-time backfill for Entity nodes.
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    MATCH (e:Entity {{tenant_id: $tenant_id}})
+                    WHERE e.embedding IS NOT NULL
+                      AND e.{names["entity_embedding_prop"]} IS NULL
+                      AND size(e.embedding) = $dims
+                    SET e.{names["entity_embedding_prop"]} = e.embedding
+                    REMOVE e.embedding
                     """,
                 ),
                 tenant_id=self.agent_id,
@@ -963,13 +987,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         DETACH DELETE c, d
         """
         # Step 2: delete entities that are now unreferenced (no more MENTIONS
-        # from any document, across all collections for this tenant).
+        # from any document, across all collections for this tenant, and no
+        # remaining PROVENANCE edge — which also covers CONCEPT entities that
+        # never carry MENTIONS edges).
         # DETACH is required because the entity may still carry other
         # relationship types (RELATED_TO, CO_OCCURS_WITH, CONCEPT_RELATION, etc.)
         # that are not captured by the MENTIONS check.
         delete_orphan_entities_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-()
+        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
         DETACH DELETE e
         """
         # Step 3: delete orphaned SourceFile nodes with no remaining PART_OF.
@@ -1043,13 +1069,23 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector_list = list(vector)
 
         # ── Guard: zero / non-finite embedding vector ─────────────────────────
-        if not self._is_valid_vector(vector_list):
+        # Qdrant (and other dense stores) cannot hold a point without a valid
+        # vector, so they must drop it. The Neo4j graph, instead, CAN: the
+        # versioned schema keeps `embedding_{gen}` OPTIONAL on :Document, the
+        # vector index simply ignores nodes without it, and the graph relations
+        # (MENTIONS / RELATED_TO / PROVENANCE) still make the chunk reachable.
+        # A failed/cold embedder (zero-vector fallback) must therefore NOT lose
+        # the chunk: we store it without the embedding and let the re-embed /
+        # backfill phase set the vector later.
+        vector_valid = self._is_valid_vector(vector_list)
+        if not vector_valid:
             log.warning(
-                f"[GraphRAG] Skipping point {point_id}: embedding vector has zero or "
-                "non-finite L2-norm. The embedder may have returned a fallback zero "
-                "tensor (e.g. empty input, cold-start failure, or unreachable model)."
+                f"[GraphRAG] Storing point {point_id} WITHOUT embedding: "
+                "embedding vector has zero or non-finite L2-norm. The embedder may "
+                "have returned a fallback zero tensor (e.g. empty input, cold-start "
+                "failure, or unreachable model). The chunk is kept (graph relations "
+                "still find it) and the embedding can be backfilled later."
             )
-            return None
 
         metadata = metadata or {}
         metadata["tenant_id"] = self.agent_id
@@ -1070,12 +1106,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             self._rebuild_for_generation(gen)
         embedding_prop = self._names["embedding_prop"]
 
+        # The embedding property is set ONLY when the vector is valid: a node
+        # stored without `embedding_{gen}` is skipped by the vector index but
+        # stays reachable via the graph (entity/relation recall, keywords).
         create_query = f"""
         MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
         CREATE (d:Document {{
             id: $id,
             content: $content,
-            {embedding_prop}: $embedding,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
@@ -1091,7 +1129,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=self.agent_id,
                 id=point_id,
                 content=content,
-                embedding=vector_list,
                 metadata=metadata_json,
             )
             # Consuming the result surfaces any server-side error immediately
@@ -1105,14 +1142,30 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 return None
 
+        # Set the embedding only when valid — a second, conditional write keeps
+        # the CREATE simple and makes the "no embedding" state explicit.
+        if vector_valid:
+            async with self._get_session() as session:
+                await session.run(
+                    cast(
+                        LiteralString,
+                        f"MATCH (d:Document {{id: $id}}) SET d.{embedding_prop} = $embedding",
+                    ),
+                    id=point_id,
+                    embedding=vector_list,
+                )
+
         # Start entity extraction in the background
         if self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
 
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
-        sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
-        self._pending_entity_tasks.append(sim_task)
+        # Only when the vector is valid: a zero/non-finite vector would produce
+        # meaningless (or failing) vector-similarity edges.
+        if vector_valid:
+            sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
+            self._pending_entity_tasks.append(sim_task)
 
         # Clean up completed tasks
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
@@ -1143,18 +1196,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Relations with the same (source, target, type) key are deduplicated
         in Python before being sent, averaging their weights.
         """
-        batch_entity_query = """
+        entity_embedding_prop = self._names["entity_embedding_prop"]
+        batch_entity_query = f"""
         UNWIND $entities AS ent
-        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
-            e.embedding  = ent.embedding
+            e.{entity_embedding_prop} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
-            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
+            e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
+                THEN ent.embedding ELSE e.{entity_embedding_prop} END
         """
 
         batch_mention_query = """
@@ -1172,9 +1227,38 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
         MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
         MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
-        ON CREATE SET r.weight = rel.weight, r.created_at = datetime()
-        ON MATCH SET  r.weight = (r.weight + rel.weight) / 2
+        ON CREATE SET
+            r.weight = rel.weight,
+            r.created_at = datetime(),
+            r.source_files = rel.source_files
+        ON MATCH SET
+            r.weight = (r.weight + rel.weight) / 2,
+            r.source_files = CASE
+                WHEN rel.source_files IS NULL THEN r.source_files
+                WHEN r.source_files IS NULL THEN rel.source_files
+                ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
+            END
         """
+
+        # File-provenance edges: every entity created from this document's
+        # content gets a (Document)-[:PROVENANCE]->(Entity) edge, so a file
+        # deletion cascade can prune the entity exactly when ALL documents
+        # that referenced it are gone. `tracked_by_provenance` marks the
+        # entity as provenance-managed (legacy entities created before this
+        # migration are left untouched by the prune).
+        batch_provenance_query = """
+        UNWIND $mentions AS m
+        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+        MERGE (d)-[:PROVENANCE]->(e)
+        SET e.tracked_by_provenance = true
+        """
+
+        # Which file produced this document? Used for the per-edge provenance
+        # list on RELATED_TO relations (None for non-file memories such as
+        # episodic points, which are never wiped per-source).
+        _doc_source = (metadata or {}).get("source")
+        _source_files = [_doc_source] if _doc_source else None
 
         try:
             extracted = await self._entity_extractor.extract(content, document_id, metadata)
@@ -1244,6 +1328,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         "target_id": target_id,
                         "rel_type":  relation.relation_type,
                         "weight":    relation.weight,
+                        "source_files": _source_files,
                     }
             relations_batch = list(rel_map.values())
 
@@ -1266,6 +1351,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 await tx.run(
                     cast(LiteralString, batch_mention_query),
+                    mentions=mentions_batch,
+                    doc_id=document_id,
+                    tenant_id=self.agent_id,
+                )
+                await tx.run(
+                    cast(LiteralString, batch_provenance_query),
                     mentions=mentions_batch,
                     doc_id=document_id,
                     tenant_id=self.agent_id,
@@ -1304,6 +1395,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         if not self._entity_extractor:
             return
+
+        # Sync the versioned names with the CURRENT generation before writing
+        # the entity embedding property (a concurrent re-embed swap may have
+        # flipped the Epoch token since __init__).
+        gen = await self._read_generation(tenant_id)
+        if gen != self._generation:
+            self._rebuild_for_generation(gen)
 
         # 1. Fetch every stored Document of this tenant (content = page_content).
         async with self._neo4j_write_semaphore:
@@ -1380,18 +1478,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         # 4. Write in a single managed write transaction (auto-retried by the
         #    driver on TransientError), capped by the shared write semaphore.
-        batch_entity_query = """
+        batch_entity_query = f"""
         UNWIND $entities AS ent
-        MERGE (e:Entity {id: ent.id, tenant_id: $tenant_id})
+        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
-            e.embedding  = ent.embedding
+            e.{self._names["entity_embedding_prop"]} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
-            e.embedding  = CASE WHEN ent.embedding IS NOT NULL THEN ent.embedding ELSE e.embedding END
+            e.{self._names["entity_embedding_prop"]} = CASE WHEN ent.embedding IS NOT NULL
+                THEN ent.embedding ELSE e.{self._names["entity_embedding_prop"]} END
         """
 
         batch_mention_query = """
@@ -1401,6 +1500,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         MERGE (d)-[r:MENTIONS]->(e)
         ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
         ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
+        """
+
+        # File-provenance edges for the (re-)matched Technology entities, so
+        # they participate in the per-source deletion cascade like NER/CONCEPT
+        # entities do.
+        batch_provenance_query = """
+        UNWIND $mentions AS m
+        MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+        MERGE (d)-[:PROVENANCE]->(e)
+        SET e.tracked_by_provenance = true
         """
 
         # Remove MENTIONS edges from each doc to Technology entities that are no
@@ -1435,6 +1545,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     mentions=mentions_batch,
                     tenant_id=tenant_id,
                 )
+                await tx.run(
+                    cast(LiteralString, batch_provenance_query),
+                    mentions=mentions_batch,
+                    tenant_id=tenant_id,
+                )
             await tx.run(
                 cast(LiteralString, delete_stale_mentions_query),
                 doc_terms=doc_terms_payload,
@@ -1453,6 +1568,200 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"[GraphRAG] Refreshed Technology entities for tenant_id={tenant_id} "
             f"({len(entities_batch)} entities, {len(mentions_batch)} mentions)"
         )
+
+    async def recompute_provenance(self, tenant_id: str | None = None) -> None:
+        """One-time backfill of provenance metadata for legacy (pre-migration) data.
+
+        Idempotent migration for tenants whose entities/relations were created
+        before the PROVENANCE / ``source_files`` tracking existed. It derives
+        the missing metadata from the graph itself — NO re-ingest, NO re-embed,
+        NO LLM calls:
+
+          Phase A (one query): create ``(Document)-[:PROVENANCE]->(Entity)``
+            edges from the existing ``MENTIONS`` edges and set
+            ``tracked_by_provenance`` on the entities (legacy documents
+            already carry MENTIONS from the original ingestion).
+          Phase B (python): backfill ``source_files`` on ``RELATED_TO`` edges
+            that lack it, derived from the source files of the documents that
+            MENTION BOTH endpoints (the same co-mention signal that produced
+            the relation).
+          Phase C (one query): unprovenanced ``CONCEPT`` entities (they never
+            receive MENTIONS edges) are linked as provenance of the documents
+            whose content mentions their name (>= 3 chars, to keep the match
+            meaningful).
+
+        Finally sets the ``provenance_reconciled`` marker on every Collection
+        of the tenant, so subsequent boots skip it with a single count query.
+        Safe to run at boot for every agent — self-skips non-legacy tenants.
+        """
+        tenant_id = tenant_id or self.agent_id
+        await self._ensure_connected()
+
+        # ── Fast-path: already reconciled → single cheap count → skip ──
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(
+                    LiteralString,
+                    """
+                    MATCH (c:Collection {tenant_id: $tenant_id})
+                    RETURN count(c) AS total,
+                           sum(CASE WHEN c.provenance_reconciled = true THEN 1 ELSE 0 END) AS done
+                    """,
+                ),
+                tenant_id=tenant_id,
+            )
+            rec = await result.single()
+            total = rec["total"] if rec else 0
+            done = rec["done"] if rec else 0
+            if total == 0:
+                log.debug(f"[GraphRAG] Provenance: no collections for {tenant_id}, skip")
+                return
+            if done == total:
+                log.debug(f"[GraphRAG] Provenance already reconciled for {tenant_id}")
+                return
+
+        # ── Phase A: derive PROVENANCE edges from existing MENTIONS ──────
+        try:
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+                            MERGE (d)-[:PROVENANCE]->(e)
+                            SET e.tracked_by_provenance = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+
+                    # ── Phase C: CONCEPT entities ← documents citing their name ──
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (e:Entity {tenant_id: $tenant_id, type: 'CONCEPT'})
+                            WHERE NOT (e)<-[:PROVENANCE]-()
+                            WITH e, toLower(e.name) AS lname
+                            WHERE size(lname) >= 3
+                            MATCH (d:Document {tenant_id: $tenant_id})
+                            WHERE toLower(d.content) CONTAINS lname
+                            MERGE (d)-[:PROVENANCE]->(e)
+                            SET e.tracked_by_provenance = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance phases A/C failed for {tenant_id}: {e}")
+            return
+
+        # ── Phase B: backfill source_files on legacy RELATED_TO edges ─────
+        try:
+            async with self._get_session() as session:
+                result = await session.run(
+                    cast(
+                        LiteralString,
+                        """
+                        MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
+                        WHERE r.source_files IS NULL
+                        RETURN s.id AS s, t.id AS t
+                        """,
+                    ),
+                    tenant_id=tenant_id,
+                )
+                legacy_edges = [(rec["s"], rec["t"]) async for rec in result]
+
+            if legacy_edges:
+                async with self._get_session() as session:
+                    # Document id → source file (metadata is a JSON string).
+                    result = await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})
+                            RETURN d.id AS id, d.metadata AS metadata
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+                    doc_sources: Dict[str, str] = {}
+                    async for rec in result:
+                        try:
+                            meta = json.loads(rec["metadata"])
+                            src = meta.get("source")
+                            if src:
+                                doc_sources[rec["id"]] = str(src)
+                        except (TypeError, ValueError):
+                            continue  # metadata not a JSON string / unparsable
+
+                    # Entity id → set of documents that MENTION it.
+                    result = await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (d:Document {tenant_id: $tenant_id})-[:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+                            RETURN d.id AS did, e.id AS eid
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+                    entity_docs: Dict[str, set] = {}
+                    async for rec in result:
+                        entity_docs.setdefault(rec["eid"], set()).add(rec["did"])
+
+                # Provenance of an edge = files of the docs mentioning both ends.
+                edge_payload = []
+                for s_id, t_id in legacy_edges:
+                    common = entity_docs.get(s_id, set()) & entity_docs.get(t_id, set())
+                    files = sorted({doc_sources[did] for did in common if did in doc_sources})
+                    if files:
+                        edge_payload.append({"s": s_id, "t": t_id, "files": files})
+                edge_payload.sort(key=lambda e: (e["s"], e["t"]))  # lock ordering
+
+                if edge_payload:
+                    async with self._neo4j_write_semaphore:
+                        async with self._get_session() as session:
+                            await session.run(
+                                cast(
+                                    LiteralString,
+                                    """
+                                    UNWIND $edges AS e
+                                    MATCH (s:Entity {id: e.s, tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {id: e.t, tenant_id: $tenant_id})
+                                    WHERE r.source_files IS NULL
+                                    SET r.source_files = e.files
+                                    """,
+                                ),
+                                edges=edge_payload,
+                                tenant_id=tenant_id,
+                            )
+                    log.info(
+                        f"[GraphRAG] Provenance: backfilled source_files on "
+                        f"{len(edge_payload)} RELATED_TO edges for {tenant_id}"
+                    )
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance phase B failed for {tenant_id}: {e}")
+            return
+
+        # ── Mark the tenant as reconciled ────────────────────────────────
+        try:
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            """
+                            MATCH (c:Collection {tenant_id: $tenant_id})
+                            SET c.provenance_reconciled = true
+                            """,
+                        ),
+                        tenant_id=tenant_id,
+                    )
+            log.info(f"[GraphRAG] Provenance reconciled for tenant_id={tenant_id}")
+        except Exception as e:
+            log.error(f"[GraphRAG] Provenance marker failed for {tenant_id}: {e}")
 
     @retry_on_generation_change
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
@@ -1567,8 +1876,60 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         DETACH DELETE d
         """
 
+        # ── File-deletion cascade (provenance-based graph cleanup) ──────────
+        # The core deletes points per-source with metadata {"source": <name>}.
+        # 1. Strip the deleted source from each RELATED_TO edge's provenance
+        #    list, then delete the edges whose list becomes empty (the relation
+        #    existed only because of this file).
+        # 2. Prune entities that lost ALL their provenance edges. Only
+        #    provenance-tracked entities are touched, so legacy entities
+        #    created before this migration are never wiped by mistake.
+        source = (metadata or {}).get("source")
+
         async with self._get_session() as session:
             await (await session.run(cast(LiteralString, query), **params)).consume()
+
+            if source:
+                await session.run(
+                    """
+                    MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
+                    WHERE r.source_files IS NOT NULL AND $source IN r.source_files
+                    SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                    WITH r
+                    WHERE size(r.source_files) = 0
+                    DELETE r
+                    """,
+                    source=source,
+                    tenant_id=self.agent_id,
+                )
+
+            # Entity pruning:
+            # - Per-file deletion (source set): keep the provenance-tracked
+            #   filter — only entities that lost ALL their PROVENANCE edges are
+            #   removed; legacy untracked entities are never wiped by mistake.
+            # - Full agent destroy (no source): the whole tenant is being wiped,
+            #   so prune UNCONDITIONALLY — every entity with no remaining
+            #   MENTIONS and no remaining PROVENANCE edge (all relationships
+            #   were detached when the tenant's documents were deleted). Same
+            #   rule as delete_collection / _drop_tenant_data_in_session; this
+            #   is what makes agent destroy actually empty the graph (entities
+            #   created by older plugin versions without tracked_by_provenance
+            #   used to survive forever as ghosts).
+            if source:
+                prune_query = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.tracked_by_provenance = true
+                  AND NOT (e)<-[:PROVENANCE]-()
+                DETACH DELETE e
+                """
+            else:
+                prune_query = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                DETACH DELETE e
+                """
+
+            await session.run(prune_query, tenant_id=self.agent_id)
 
         async with self._get_session() as session:
             await session.run(
@@ -1594,7 +1955,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         orphan_query = """
         MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-()
+        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
         DETACH DELETE e
         """
         orphan_sf_query = """
@@ -2383,7 +2744,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not relations:
             return
 
-        await self._store_concept_relations(tenant_id, relations)
+        # Every concept created from this source is provenance-linked to the
+        # documents (the file's chunks) that produced it, so the deletion
+        # cascade can prune it when ALL of them are gone.
+        document_ids = [p.id for p in stored_points if getattr(p, "id", None)]
+
+        await self._store_concept_relations(
+            tenant_id, relations, source=source, document_ids=document_ids
+        )
         log.info(
             f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
         )
@@ -2453,10 +2821,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return result
 
     async def _store_concept_relations(
-        self, tenant_id: str, relations: List[Dict[str, str]]
+        self,
+        tenant_id: str,
+        relations: List[Dict[str, str]],
+        source: str | None = None,
+        document_ids: List[str] | None = None,
     ) -> None:
         if not relations:
             return
+
+        source_files = [source] if source else None
 
         async with self._get_session() as session:
             for rel in relations:
@@ -2481,11 +2855,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
                         SET s.id = coalesce(s.id, $subject_id)
                         SET s.type = coalesce(s.type, 'CONCEPT')
+                        SET s.tracked_by_provenance = true
                         MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
                         SET t.id = coalesce(t.id, $object_id)
                         SET t.type = coalesce(t.type, 'CONCEPT')
+                        SET t.tracked_by_provenance = true
                         MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                         SET r.weight = coalesce(r.weight, 1.0) + 0.5
+                        SET r.source_files = CASE
+                            WHEN $source_files IS NULL THEN r.source_files
+                            WHEN r.source_files IS NULL THEN $source_files
+                            ELSE [x IN r.source_files WHERE NOT x IN $source_files] + $source_files
+                        END
                         """,
                         tenant_id=tenant_id,
                         subject=subject,
@@ -2493,7 +2874,27 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         object=object_,
                         object_id=object_id,
                         rel_type=rel_type,
+                        source_files=source_files,
                     )
+
+                    # PROVENANCE edges from every producing document to both
+                    # concept entities (concepts carry no MENTIONS edges, so
+                    # the provenance is what makes them deletable).
+                    if document_ids:
+                        await session.run(
+                            """
+                            UNWIND $doc_ids AS did
+                            MATCH (d:Document {id: did, tenant_id: $tenant_id})
+                            MATCH (s:Entity {tenant_id: $tenant_id, name: $subject})
+                            MATCH (t:Entity {tenant_id: $tenant_id, name: $object})
+                            MERGE (d)-[:PROVENANCE]->(s)
+                            MERGE (d)-[:PROVENANCE]->(t)
+                            """,
+                            doc_ids=document_ids,
+                            tenant_id=tenant_id,
+                            subject=subject,
+                            object=object_,
+                        )
                 except Exception as e:
                     log.warning(
                         f"[GraphRAG] Failed to store relation "
