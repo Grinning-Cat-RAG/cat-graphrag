@@ -213,9 +213,18 @@ def _install_pydantic_stub():
             for name, value in kwargs.items():
                 setattr(self, name, value)
 
+    def BeforeValidator(fn):
+        # Identity is enough for the stub: the real one wraps a validator fn.
+        return fn
+
+    def create_model(name, **kwargs):
+        return type(name, (BaseModel,), {})
+
     setattr(pydantic_mod, "Field", Field)
     setattr(pydantic_mod, "ConfigDict", ConfigDict)
     setattr(pydantic_mod, "BaseModel", BaseModel)
+    setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
+    setattr(pydantic_mod, "create_model", create_model)
     sys.modules["pydantic"] = pydantic_mod
 
 
@@ -329,6 +338,10 @@ class _FakeSession:
                     doc[prop] = d["vector"]
             return _FakeResult([])
 
+        # ── Shadow-build: carry entity embeddings forward (v1 -> v2) ───────
+        if "MATCH (e:Entity" in q and "SET e.entity_embedding_" in q:
+            return _FakeResult([])
+
         # ── Shadow-build: create the versioned vector index ────────────────
         if "CREATE VECTOR INDEX" in q:
             name = re.search(r"CREATE VECTOR INDEX (\S+) IF NOT EXISTS", q).group(1)
@@ -379,6 +392,10 @@ class _FakeSession:
                     doc.pop(prop, None)
             return _FakeResult([])
 
+        # ── GC: remove the old entity embedding property ───────────────────
+        if "REMOVE e.entity_embedding_" in q:
+            return _FakeResult([])
+
         raise AssertionError(f"Unhandled query in fake session:\n{q}")
 
     async def run(self, query, **params):
@@ -416,7 +433,7 @@ class _FakeEmbedder:
 
 def _make_handler(graph):
     """Build a GraphRAGHandler wired to the fake graph."""
-    from catgraphrag_swaptest import graphrag_handler
+    from .. import graphrag_handler
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -652,9 +669,6 @@ def main():
     sys.modules["catgraphrag_swaptest"] = _pkg
 
     global graphrag_handler
-    from catgraphrag_swaptest import graphrag_handler  # noqa: E402
-    from catgraphrag_swaptest import epoch  # noqa: E402
-    from catgraphrag_swaptest import versioning  # noqa: E402
 
     tests = [
         test_shadow_build_writes_v2_while_v1_intact,

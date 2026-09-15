@@ -180,9 +180,18 @@ def _install_pydantic_stub():
             for name, value in kwargs.items():
                 setattr(self, name, value)
 
+    def BeforeValidator(fn):
+        # Identity is enough for the stub: the real one wraps a validator fn.
+        return fn
+
+    def create_model(name, **kwargs):
+        return type(name, (BaseModel,), {})
+
     setattr(pydantic_mod, "Field", Field)
     setattr(pydantic_mod, "ConfigDict", ConfigDict)
     setattr(pydantic_mod, "BaseModel", BaseModel)
+    setattr(pydantic_mod, "BeforeValidator", BeforeValidator)
+    setattr(pydantic_mod, "create_model", create_model)
     sys.modules["pydantic"] = pydantic_mod
 
 
@@ -205,6 +214,7 @@ class _FakeGraph:
     """Minimal in-memory graph: Document/Entity nodes, MENTIONS + SIMILAR_TO."""
 
     def __init__(self):
+        self.epochs = {}      # tenant_id -> generation token
         self.documents = {}   # (tenant_id, doc_id) -> content
         self.entities = {}    # (tenant_id, entity_id) -> {"name", "type"}
         self.mentions = set()  # (tenant_id, doc_id, entity_id)
@@ -215,7 +225,9 @@ class _FakeGraph:
         self.documents[(tenant, doc_id)] = content
 
     def add_entity(self, tenant, entity_id, name, etype):
-        self.entities[(tenant, entity_id)] = {"name": name, "type": etype}
+        self.entities[(tenant, entity_id)] = {
+            "name": name, "type": etype, "types": [etype],
+        }
 
     def add_mention(self, tenant, doc_id, entity_id):
         self.mentions.add((tenant, doc_id, entity_id))
@@ -235,6 +247,17 @@ class _FakeGraph:
         return sum(1 for m in self.mentions if m[0] == tenant)
 
 
+def _is_tech_entity(ent):
+    """Membership-aware TECHNOLOGY check mirroring the production predicates
+
+    ``(e.type = 'TECHNOLOGY' OR 'TECHNOLOGY' IN e.types)``.
+    """
+    return bool(ent) and (
+        ent.get("type") == "TECHNOLOGY"
+        or "TECHNOLOGY" in (ent.get("types") or [])
+    )
+
+
 class _FakeResult:
     def __init__(self, records):
         self._records = list(records)
@@ -245,6 +268,9 @@ class _FakeResult:
     async def _iter(self):
         for r in self._records:
             yield r
+
+    async def single(self):
+        return self._records[0] if self._records else None
 
 
 class _FakeTx:
@@ -271,6 +297,18 @@ class _FakeSession:
         q = query
         tenant = params.get("tenant_id")
 
+        # 0. Epoch queries (refresh_technology_entities syncs the versioned
+        #    names with the current generation before writing).
+        if "RETURN e.generation AS gen" in q:
+            gen = self.graph.epochs.get(tenant)
+            if gen is None:
+                return _FakeResult([])
+            return _FakeResult([{"gen": gen}])
+
+        if "ON CREATE SET e.generation = 'v1'" in q:
+            self.graph.epochs.setdefault(tenant, "v1")
+            return _FakeResult([])
+
         # 1. Fetch stored documents of the tenant.
         if "RETURN d.id AS id, d.content AS content" in q:
             return _FakeResult([
@@ -279,13 +317,41 @@ class _FakeSession:
                 if t == tenant
             ])
 
-        # 2. MERGE entity nodes.
+        # 2a. In-tx metadata pre-read (before the entity MERGE): the refresh
+        #     write reads each entity's current metadata JSON to merge fresh
+        #     per-document contributions with it. Rows only exist for node ids
+        #     already present — absent ids yield no record, so the caller's
+        #     dict.get() defaults to None (fresh metadata).
+        if "UNWIND $ids AS eid" in q and "RETURN e.id AS id, e.metadata AS metadata" in q:
+            return _FakeResult([
+                {"id": eid, "metadata": node.get("metadata")}
+                for eid in params.get("ids", [])
+                if (node := self.graph.entities.get((tenant, eid))) is not None
+            ])
+
+        # 2. MERGE entity nodes (types init on create / membership-aware append
+        #    on match + name/metadata writes, mirroring the ON CREATE/ON MATCH
+        #    clauses of the refresh batch_entity_query).
         if "MERGE (e:Entity {id: ent.id" in q:
             for ent in params.get("entities", []):
-                self.graph.entities[(tenant, ent["id"])] = {
-                    "name": ent["name"],
-                    "type": ent["type"],
-                }
+                key = (tenant, ent["id"])
+                node = self.graph.entities.get(key)
+                if node is None:
+                    self.graph.entities[key] = {
+                        "name": ent["name"],
+                        "type": ent["type"],
+                        "types": [ent["type"]],
+                        "metadata": ent.get("metadata"),
+                    }
+                else:
+                    etype = ent["type"]
+                    types = list(node.get("types") or [])
+                    if etype not in types:
+                        types.append(etype)
+                    node["name"] = ent["name"]
+                    node["type"] = node.get("type") or etype
+                    node["types"] = types
+                    node["metadata"] = ent.get("metadata")
             return _FakeResult([])
 
         # 3. MERGE MENTIONS edges.
@@ -302,7 +368,9 @@ class _FakeSession:
                 self.graph.provenance.add((tenant, doc_id, m["entity_id"]))
             return _FakeResult([])
 
-        # 4. Delete stale MENTIONS edges to Technology entities no longer matched.
+        # 4. Delete stale MENTIONS edges to Technology entities no longer
+        #    matched. Membership-aware (primary type OR types[] membership),
+        #    mirroring the WHERE clause of delete_stale_mentions_query.
         if "DELETE r" in q and "doc_terms" in params:
             for d in params["doc_terms"]:
                 doc_id = d["doc_id"]
@@ -311,20 +379,24 @@ class _FakeSession:
                     (tenant, doc_id, eid)
                     for (t, did, eid) in self.graph.mentions
                     if t == tenant and did == doc_id
-                    and self.graph.entities.get((tenant, eid), {}).get("type") == "TECHNOLOGY"
+                    and _is_tech_entity(self.graph.entities.get((tenant, eid)))
                     and eid not in valid
                 ]
                 for m in stale:
                     self.graph.mentions.discard(m)
             return _FakeResult([])
 
-        # 5. Prune orphaned Technology entities (no remaining MENTIONS).
+        # 5. Prune orphaned Technology Entity nodes: membership-aware like the
+        #    stale-mention deletion AND provenance-guarded — a node with a
+        #    PROVENANCE edge (e.g. a merged concept-owned node) is never
+        #    removed, mirroring prune_orphan_tech_query.
         if "DETACH DELETE e" in q:
             orphans = [
                 (tenant, eid)
                 for (t, eid), ent in self.graph.entities.items()
-                if t == tenant and ent["type"] == "TECHNOLOGY"
+                if t == tenant and _is_tech_entity(ent)
                 and not any(m[0] == tenant and m[2] == eid for m in self.graph.mentions)
+                and not any(p[0] == tenant and p[2] == eid for p in self.graph.provenance)
             ]
             for key in orphans:
                 self.graph.entities.pop(key, None)
@@ -354,7 +426,7 @@ class _FakeDriver:
 
 def _make_handler(graph, patterns):
     """Build a GraphRAGHandler wired to the fake graph with the given patterns."""
-    from catgraphrag_tertest import graphrag_handler
+    from .. import graphrag_handler
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -369,8 +441,8 @@ def _make_handler(graph, patterns):
 
 def _hash(term, tenant="agent_test"):
     """Entity hash for a TECHNOLOGY term (mirrors EntityExtractor.get_entity_hash)."""
-    from catgraphrag_tertest import entity_extractor
-    from catgraphrag_tertest.models import EntityType
+    from .. import entity_extractor
+    from ..models import EntityType
 
     return entity_extractor.EntityExtractor.get_entity_hash(
         term, EntityType.TECHNOLOGY, tenant
@@ -383,7 +455,7 @@ def _hash(term, tenant="agent_test"):
 
 
 def test_hook_ignores_other_vector_databases():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -405,7 +477,7 @@ def test_hook_ignores_other_vector_databases():
 
 
 def test_hook_ignores_unchanged_patterns():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -430,7 +502,7 @@ def test_hook_ignores_unchanged_patterns():
 
 
 def test_hook_rebuilds_extractor_on_pattern_change():
-    from catgraphrag_tertest import main as main_mod
+    from .. import main as main_mod
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [])
@@ -579,10 +651,6 @@ def main():
     sys.modules["catgraphrag_tertest"] = _pkg
 
     global graphrag_handler, main, entity_extractor, models
-    from catgraphrag_tertest import graphrag_handler  # noqa: E402
-    from catgraphrag_tertest import main  # noqa: E402
-    from catgraphrag_tertest import entity_extractor  # noqa: E402
-    from catgraphrag_tertest import models  # noqa: E402
 
     tests = [
         test_hook_ignores_other_vector_databases,

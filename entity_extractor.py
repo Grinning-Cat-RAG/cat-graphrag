@@ -548,11 +548,14 @@ class EntityExtractor:
 
     @staticmethod
     def get_entity_hash(name: str, entity_type: EntityType, tenant_id: str) -> str:
-        """Generates a unique hash for an entity (for cross-document deduplication)."""
+        """Generates a unique hash for an entity (for cross-document deduplication).
+
+        `entity_type` is deprecated, ignored for identity — type is a first-wins property now.
+        """
         # Remove extra spaces, convert to lowercase
         normalized = name.lower().strip()
         # Remove leading articles
         normalized = re.sub(r'^(the|a|an)\s+', '', normalized)
 
-        key = f"{tenant_id}:{entity_type.value}:{normalized}"
+        key = f"{tenant_id}:{normalized}"
         return hashlib.md5(key.encode()).hexdigest()

@@ -455,9 +455,9 @@ if __name__ == "__main__":
     _pkg.__path__ = [REPO_ROOT]
     sys.modules["cat_graphrag_segtest"] = _pkg
 
-    from cat_graphrag_segtest import entity_extractor  # noqa: E402
-    from cat_graphrag_segtest.constants import SPACY_PIPE_BATCH_SIZE  # noqa: E402
-    from cat_graphrag_segtest.entity_extractor import EntityExtractor, _segment_text  # noqa: E402
-    from cat_graphrag_segtest.models import EntityType, ExtractedEntity  # noqa: E402
+    from .. import entity_extractor  # noqa: E402
+    from ..constants import SPACY_PIPE_BATCH_SIZE  # noqa: E402
+    from ..entity_extractor import EntityExtractor, _segment_text  # noqa: E402
+    from ..models import EntityType, ExtractedEntity  # noqa: E402
 
     main()

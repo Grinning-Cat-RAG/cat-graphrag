@@ -1,4 +1,4 @@
-"""Epoch generation helpers for the versioned schema.
+"""Epoch generation helpers for the versioned schema (todo 11, P4).
 
 Import-safe: no side effects at import time (the Cat plugin loader imports
 every ``.py`` in the plugin folder).
@@ -18,6 +18,23 @@ generation changes. No transactions are used anywhere in these paths.
 """
 
 from typing import Any, Dict, Optional, cast, LiteralString
+
+
+# ── Concept-generation retrieval gates (todo 11, concurrency lifecycle) ──────
+# An edge/node is VISIBLE iff it is untagged (spaCy: ``concept_gen IS NULL``)
+# or tagged with the ACTIVE generation. It is HIDDEN iff tagged AND its
+# ``concept_gen`` differs from the active one. The ``concept_gen_active``
+# boolean set by ``_flip_concept_gen`` is GC bookkeeping ONLY — the retrieval
+# gate never reads it (Metis M1). Module-level constants so the QA harness can
+# assert on the exact predicate text without a live Neo4j instance.
+CONCEPT_GATE_RELATION_PREDICATE = (
+    "ALL(r IN relationships(path) "
+    "WHERE r.concept_gen IS NULL OR r.concept_gen = $active_concept_gen)"
+)
+CONCEPT_GATE_NODE_PREDICATE = (
+    "ALL(n IN nodes(path) "
+    "WHERE n.concept_gen IS NULL OR n.concept_gen = $active_concept_gen)"
+)
 
 
 class EpochMixin:
@@ -197,6 +214,8 @@ class EpochMixin:
 
             MATCH path = (q_e)-[:RELATED_TO*1..{depth}]-(r_e:Entity {{tenant_id: $tenant_id}})
             WHERE NOT r_e.name IN $entity_names
+              AND {CONCEPT_GATE_RELATION_PREDICATE}
+              AND {CONCEPT_GATE_NODE_PREDICATE}
 
             MATCH (d:Document {{tenant_id: $tenant_id}})-[:MENTIONS]->(r_e)
             WHERE EXISTS {{

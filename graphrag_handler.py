@@ -2,12 +2,14 @@ import random
 import math
 import uuid
 import json
+import re
+import hashlib
 import asyncio
-from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString, Type
+from typing import Any, List, Iterable, Dict, Tuple, Optional, AsyncContextManager, cast, LiteralString, Type, Annotated, Literal
 from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
 from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
-from pydantic import Field, ConfigDict
+from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
 from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
 from cat.services.memory.models import (
@@ -15,7 +17,7 @@ from cat.services.memory.models import (
 )
 from cat.log import log
 
-# Migration guard for the seamless re-embed swap. Prefer the
+# Migration guard for the seamless re-embed swap (todo 12, P4). Prefer the
 # Cat distributed lock (Redis-backed, cross-worker); fall back to a simple
 # in-process asyncio lock when the Cat runtime is unavailable (e.g. the
 # standalone test harness stubs ``cat`` without ``cat.db.crud``).
@@ -27,7 +29,71 @@ except ImportError:
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
+from .structured_llm import StructuredLLM, StructuredLLMError
 from .versioning import ensure_version, retry_on_generation_change
+
+# Last-known GraphRAG connection config per agent, captured in ``_connect``
+# whenever a handler connects. Used by the old-store cleanup on vector-memory
+# switch (T24): after a graphrag -> other switch the Neo4j config is gone from
+# the settings store (the category holds only the newly selected config), so
+# the wipe must reconnect with the params the handler last used. Import-safe:
+# plain module-level dict, no side effects.
+_last_graphrag_config: Dict[str, Dict[str, Any]] = {}
+
+
+def _upper_str(value: Any) -> str:
+    """Strip + uppercase a value before Literal validation.
+
+    Used by ``_build_llm_output_model`` so the LLM may emit lowercase or
+    mixed-case concept/relation types and still validate against the
+    UPPERCASED whitelist keys (Metis M1, case normalization).
+    """
+    return str(value).strip().upper()
+
+
+def _normalize_entity_name(name: str) -> str:
+    """Full normalization for a stored entity name.
+
+    Must produce EXACTLY the string fed to the identity hash
+    (``EntityExtractor.get_entity_hash``): lower + strip, then removal of a
+    single leading article. Keeping both in lockstep guarantees the stored
+    name and the hash input are identical strings.
+    """
+    normalized = name.lower().strip()
+    return re.sub(r"^(the|a|an)\s+", "", normalized)
+
+
+def _merge_entity_metadata(existing_raw: Optional[str], incoming: Dict) -> Dict:
+    """Merge incoming entity metadata into existing (JSON-string) metadata.
+
+    Returns the accumulated shape ``{"source_documents": [...],
+    "confidence": <max>}``: ``source_documents`` is a dedup union and
+    ``confidence`` is a running maximum. The legacy single-document key
+    ``source_document`` is absorbed for backward compatibility.
+    """
+    prev_docs: List[str] = []
+    prev_conf: float = 0.0
+    if existing_raw:
+        try:
+            prev = json.loads(existing_raw) or {}
+        except (TypeError, ValueError):
+            prev = {}
+        prev_docs = prev.get("source_documents") or []
+        if not prev_docs and prev.get("source_document"):
+            prev_docs = [prev["source_document"]]
+        try:
+            prev_conf = float(prev.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            prev_conf = 0.0
+    try:
+        inc_conf = float(incoming.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        inc_conf = 0.0
+    docs = list(prev_docs)
+    for doc_id in incoming.get("source_documents") or []:
+        if doc_id not in docs:
+            docs.append(doc_id)
+    return {"source_documents": docs, "confidence": max(prev_conf, inc_conf)}
 
 
 class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
@@ -59,6 +125,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
+        concept_definitions: str | None = None,
+        relation_definitions: str | None = None,
         enable_knowledge_graph: bool = False,
         enable_student_knowledge_graph: bool = False,
         save_memory_snapshots: bool = False,
@@ -84,11 +152,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
         self._concept_relations_prompt = concept_relations_prompt
+        self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
+        self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
+        # Raw (unparsed) definition strings: comments + formatting preserved
+        # verbatim, same ``or DEFAULT_*`` fallback as the parsed-dict block above.
+        # Interpolated into the LLM extraction prompt (todo 4).
+        self._raw_concept_definitions = concept_definitions or DEFAULT_CONCEPT_DEFINITIONS
+        self._raw_relation_definitions = relation_definitions or DEFAULT_RELATION_DEFINITIONS
         self._enable_knowledge_graph = enable_knowledge_graph
+        # Visualization-only flag (D2): never gates backend extraction/retrieval.
         self._enable_student_knowledge_graph = enable_student_knowledge_graph
 
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
+        # Per-source view of the same background tasks (T22): maps a source
+        # name to the tasks spawned for its points, so the graph-building
+        # phase can join ONLY this source's work. Tasks are also in the flat
+        # ``_pending_entity_tasks`` list (close() drains both).
+        self._pending_source_tasks: Dict[str, List[asyncio.Task]] = {}
         # Semaphore: caps concurrent Neo4j write transactions to reduce lock
         # contention and deadlock probability during bulk PDF ingestion.
         # Shared between entity extraction and similarity writes.
@@ -106,7 +187,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._alignment_lock = asyncio.Lock()
         self._alignment_done = False
 
-        # Versioned-schema state: the generation token read from
+        # Serializes _connect against concurrent lazy-initialization: the
+        # handler connects lazily, so two concurrent first-use calls would both
+        # observe _driver is None and create two drivers (duplicate boot
+        # warnings). Double-checked guard inside the lock fixes that.
+        self._connect_lock = asyncio.Lock()
+
+        # Versioned-schema state (todo 11, P4): the generation token read from
         # (:Epoch {tenant_id, generation}), the resolved version-suffixed names,
         # and the per-generation compiled-query cache {query_key: {gen: cypher}}.
         self._generation: Optional[str] = None
@@ -193,66 +280,42 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             await self._connect()
             
     async def _connect(self):
-        try:
-            self._driver: AsyncDriver = AsyncGraphDatabase.driver(
-                self._neo4j_uri,
-                auth=(self._neo4j_user, self._neo4j_password),
-                max_connection_pool_size=self._connection_pool_size,
-                connection_acquisition_timeout=60,
-                # Suppress GQL warnings 01N51 / 01N52 ("relationship type / property
-                # key does not exist") that Neo4j emits on a fresh database before any
-                # schema elements have been written.  These are harmless — queries that
-                # match nothing simply return zero rows — but pollute the log on startup.
-                notifications_disabled_categories=["UNRECOGNIZED"],
-                **self._neo4j_kwargs,
-            )
-            assert isinstance(self._driver, AsyncDriver)
-            async with self._driver.session(database=self._neo4j_database) as session:
-                await session.run("RETURN 1")
-            await self._backfill_missing_entity_ids()
-            log.debug(f"Connected to Neo4j at {self._neo4j_uri}")
-        except Exception as e:
-            log.error(f"Failed to connect to Neo4j: {e}")
-            raise
-
-    async def _backfill_missing_entity_ids(self):
-        """Set a stable `id` on Entity nodes that lack one (e.g. concept entities
-        created by earlier versions of the plugin before `_store_concept_relations`
-        started setting the property).  Uses the same MD5 hash strategy as
-        `EntityExtractor.get_entity_hash` to guarantee consistency with newly
-        inserted entities."""
-        try:
-            async with self._driver.session(database=self._neo4j_database) as session:
-                result = await session.run(
-                    """
-                    MATCH (e:Entity)
-                    WHERE e.id IS NULL
-                    RETURN e.tenant_id AS tenant_id,
-                           e.name AS name,
-                           coalesce(e.type, 'CONCEPT') AS etype,
-                           elementId(e) AS _elid
-                    """
+        async with self._connect_lock:
+            if self._driver is not None:
+                return
+            try:
+                self._driver: AsyncDriver = AsyncGraphDatabase.driver(
+                    self._neo4j_uri,
+                    auth=(self._neo4j_user, self._neo4j_password),
+                    max_connection_pool_size=self._connection_pool_size,
+                    connection_acquisition_timeout=60,
+                    # Suppress GQL warnings 01N51 / 01N52 ("relationship type / property
+                    # key does not exist") that Neo4j emits on a fresh database before any
+                    # schema elements have been written.  These are harmless — queries that
+                    # match nothing simply return zero rows — but pollute the log on startup.
+                    notifications_disabled_categories=["UNRECOGNIZED"],
+                    **self._neo4j_kwargs,
                 )
-                rows = []
-                async for record in result:
-                    rows.append(record)
-                if not rows:
-                    return
-                for row in rows:
-                    try:
-                        enum_type = EntityType(row["etype"])
-                    except ValueError:
-                        enum_type = EntityType.CONCEPT
-                    eid = EntityExtractor.get_entity_hash(
-                        row["name"], enum_type, row["tenant_id"]
-                    )
-                    await session.run(
-                        "MATCH (e) WHERE elementId(e) = $_elid SET e.id = $eid",
-                        _elid=row["_elid"], eid=eid,
-                    )
-                log.info(f"[GraphRAG] Backfilled id on {len(rows)} Entity node(s)")
-        except Exception as e2:
-            log.warning(f"[GraphRAG] Backfill skipped: {e2}")
+                assert isinstance(self._driver, AsyncDriver)
+                async with self._driver.session(database=self._neo4j_database) as session:
+                    await session.run("RETURN 1")
+                # Record the connection config for the old-store cleanup on
+                # vector-memory switch (T24): after a graphrag -> other switch
+                # the Neo4j config is gone from the settings store, so the wipe
+                # reconnects with the params this handler last used.
+                agent_key = getattr(self, "agent_id", None)
+                if agent_key:
+                    _last_graphrag_config[agent_key] = {
+                        "neo4j_uri": self._neo4j_uri,
+                        "neo4j_user": self._neo4j_user,
+                        "neo4j_password": self._neo4j_password,
+                        "neo4j_database": self._neo4j_database,
+                        "neo4j_kwargs": self._neo4j_kwargs,
+                    }
+                log.debug(f"Connected to Neo4j at {self._neo4j_uri}")
+            except Exception as e:
+                log.error(f"Failed to connect to Neo4j: {e}")
+                raise
 
     @staticmethod
     async def _ensure_constraints_in_session(session):
@@ -915,6 +978,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Wait for cancellations to propagate
             await asyncio.gather(*tasks, return_exceptions=True)
             tasks.clear()
+        # Drop the per-source view too (same task objects, already cancelled).
+        self._pending_source_tasks.clear()
 
         driver = getattr(self, '_driver', None)
         if driver:
@@ -1097,7 +1162,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         metadata_json = json.dumps(metadata)
 
         # Resolve the current generation's embedding property name (versioned
-        # schema. The write must target the SAME property the
+        # schema, todo 11 P4). The write must target the SAME property the
         # versioned read paths query (embedding_{gen}), not the bare unversioned
         # `embedding` — otherwise new documents are invisible to the versioned
         # vector index and the first recall returns embedding: null.
@@ -1159,6 +1224,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
+            self._track_source_task((metadata or {}).get("source"), task)
 
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
         # Only when the vector is valid: a zero/non-finite vector would produce
@@ -1166,9 +1232,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if vector_valid:
             sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
             self._pending_entity_tasks.append(sim_task)
+            self._track_source_task((metadata or {}).get("source"), sim_task)
 
         # Clean up completed tasks
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
+        # Mirror the prune in the per-source view so the dict does not grow
+        # with finished tasks of sources that never get drained.
+        for _src, _tasks in list(self._pending_source_tasks.items()):
+            self._pending_source_tasks[_src] = [t for t in _tasks if not t.done()]
 
         return PointStruct(
             id=point_id,
@@ -1180,6 +1251,105 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             },
             vector=vector_list,
         )
+
+    # ========== GRAPH-BUILDING PHASE (T21-T23) ==========
+
+    def _track_source_task(self, source: Optional[str], task: asyncio.Task) -> None:
+        """Record a background task under the source that spawned it.
+
+        The same task stays in the flat ``_pending_entity_tasks`` list (so
+        ``close()`` still drains it); this dict is the per-source view the
+        graph-building phase uses to join ONLY one source's work.
+        """
+        if source:
+            self._pending_source_tasks.setdefault(source, []).append(task)
+
+    def has_pending_source_tasks(self, source: str) -> bool:
+        """Whether any LIVE background task remains for a source.
+
+        Done tasks are ignored: the completion gate (T23) must not fail on
+        work that already finished.
+        """
+        tasks = self._pending_source_tasks.get(source) or []
+        return any(not t.done() for t in tasks)
+
+    async def drain_source_tasks(self, source: str) -> None:
+        """Await (join) all background tasks spawned for one source, inline.
+
+        Pops the source's task list (both the per-source view and the flat
+        list) and gathers them. The underlying methods
+        (``_extract_and_link_entities`` / ``_create_similarity_relationships``)
+        already fail-soft internally, so a failure here is logged, not raised
+        — the deterministic phase work below re-runs the same steps awaited.
+        """
+        tasks = self._pending_source_tasks.pop(source, [])
+        if not tasks:
+            return
+        self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r}")
+
+    async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
+        """Fetch all stored points of one source, grouped by collection.
+
+        The metadata filter matches the exact JSON fragment the store writes
+        (``"source": "<name>"``), so only points of THIS source are returned.
+        Ensures the versioned generation is resolved first so the embedding
+        property read targets the current generation.
+        """
+        await self._ensure_connected()
+        if self._generation is None:
+            gen = await self._read_generation()
+            self._rebuild_for_generation(gen)
+        result: Dict[str, List[Record]] = {}
+        for collection_name in await self.get_collection_names():
+            points, _ = await self.get_all_tenant_points(
+                collection_name, metadata={"source": source}, with_vectors=True
+            )
+            if points:
+                result[collection_name] = points
+        return result
+
+    async def run_graph_building_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited graph-building phase for one source (T22).
+
+        Runs the graph work the old ``after_rabbithole_stored_documents`` hook
+        fired-and-forgot, but inline and awaited:
+
+        1. joins the source's background NER/similarity tasks
+           (``drain_source_tasks``);
+        2. re-runs ``_create_similarity_relationships`` for the source's
+           stored points (needs valid vectors — that is why the embedding
+           phase must precede);
+        3. runs the LLM concept-relations step (``_extract_concept_relations``)
+           for the source.
+
+        Returns ``{"status": "done"}`` on success and
+        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
+        points are not yet in the store. Exceptions propagate (the core maps
+        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
+        so re-running after a retry never duplicates data.
+        """
+        await self.drain_source_tasks(source)
+
+        by_collection = await self.get_source_points_by_collection(source)
+        if not by_collection:
+            return {"status": "not_ready", "retry_after": 5}
+
+        all_points: List[Record] = []
+        for collection_name, points in by_collection.items():
+            all_points.extend(points)
+            for p in points:
+                vector = getattr(p, "vector", None)
+                if vector and self._is_valid_vector(vector):
+                    await self._create_similarity_relationships(p.id, vector, collection_name)
+
+        if self._enable_knowledge_graph and self._enable_concept_relations:
+            await self._extract_concept_relations(source, all_points, stray_cat=cat)
+
+        return {"status": "done"}
 
     async def _extract_and_link_entities(
         self,
@@ -1203,13 +1373,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
+            e.types      = [ent.type],
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
             e.{entity_embedding_prop} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
+            e.name       = ent.name,
+            e.types      = CASE WHEN ent.type IN coalesce(e.types, [])
+                THEN e.types ELSE coalesce(e.types, []) + ent.type END,
+            e.metadata   = ent.metadata,
             e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
                 THEN ent.embedding ELSE e.{entity_embedding_prop} END
+        REMOVE e.concept_gen, e.concept_gen_active
         """
 
         batch_mention_query = """
@@ -1276,11 +1452,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 entities_batch.append({
                     "id":        entity_id,
-                    "name":      entity.name.lower().strip(),
+                    "name":      _normalize_entity_name(entity.name),
                     "type":      entity.type.value,
                     # Serialise to JSON string: Neo4j does not support Map-type
                     # node properties (only primitives / arrays are allowed).
-                    "metadata":  json.dumps({"source_document": document_id, "confidence": entity.confidence}),
+                    # Accumulated shape {"source_documents": [...],
+                    # "confidence": <max>} — merged against the node's existing
+                    # metadata inside _write_entities before this is persisted.
+                    "metadata":  json.dumps({"source_documents": [document_id], "confidence": entity.confidence}),
                     "embedding": None,  # populated below when enable_entity_embeddings=True
                 })
                 mentions_batch.append({
@@ -1344,6 +1523,38 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # The semaphore caps concurrent write transactions to further
             # reduce lock contention during bulk PDF ingestion.
             async def _write_entities(tx):
+                # Metadata accumulation inside the write transaction: read each
+                # entity's existing metadata, merge it into the payload
+                # (source_documents dedup union + running max confidence) and let
+                # the ON CREATE / ON MATCH write below persist the merged
+                # JSON-string shape {"source_documents": [...], "confidence": m}.
+                # The bounded lost-update window under concurrent same-entity
+                # extractions is accepted — the write semaphore caps concurrency.
+                if entities_batch:
+                    meta_result = await tx.run(
+                        cast(
+                            LiteralString,
+                            """
+                            UNWIND $ids AS id
+                            MATCH (e:Entity {id: id, tenant_id: $tenant_id})
+                            RETURN id AS id, e.metadata AS metadata
+                            """,
+                        ),
+                        ids=[ent["id"] for ent in entities_batch],
+                        tenant_id=self.agent_id,
+                    )
+                    existing_metadata = {
+                        rec["id"]: rec["metadata"]
+                        async for rec in meta_result
+                    }
+                    for ent in entities_batch:
+                        ent["metadata"] = json.dumps(
+                            _merge_entity_metadata(
+                                existing_metadata.get(ent["id"]),
+                                json.loads(ent["metadata"]),
+                            )
+                        )
+
                 await tx.run(
                     cast(LiteralString, batch_entity_query),
                     entities=entities_batch,
@@ -1431,7 +1642,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             seen: set = set()
             unique: List[str] = []
             for term in self._entity_extractor.extract_technologies_regex(content):
-                name = term.name.lower().strip()
+                # Fully-normalized name (lower + strip + leading-article strip):
+                # the EXACT string the name-only entity hash is computed over,
+                # so the stored `name` always equals the identity input.
+                name = _normalize_entity_name(term.name)
                 if name not in seen:
                     seen.add(name)
                     unique.append(name)
@@ -1457,7 +1671,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     "type":      EntityType.TECHNOLOGY.value,
                     # Serialise to JSON string: Neo4j does not support Map-type
                     # node properties (only primitives / arrays are allowed).
-                    "metadata":  json.dumps({"source_document": doc_id, "confidence": 0.85}),
+                    # Unified metadata shape (source_documents + confidence) —
+                    # merged with the node's existing metadata inside the write
+                    # transaction below (dedup union + running max confidence).
+                    "metadata":  json.dumps({
+                        "source_documents": [doc_id],
+                        "confidence": 0.85,
+                    }),
                     "embedding": None,  # no re-embed during a terminology refresh
                 })
                 mention_key = (doc_id, entity_id)
@@ -1484,11 +1704,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ON CREATE SET
             e.name       = ent.name,
             e.type       = ent.type,
+            e.types      = [ent.type],
             e.created_at = datetime(),
             e.metadata   = ent.metadata,
             e.{self._names["entity_embedding_prop"]} = ent.embedding
         ON MATCH SET
             e.last_seen  = datetime(),
+            e.name       = ent.name,
+            e.type       = coalesce(e.type, ent.type),
+            e.types      = CASE
+                WHEN e.types IS NULL THEN [ent.type]
+                WHEN ent.type IN e.types THEN e.types
+                ELSE e.types + ent.type
+            END,
+            e.metadata   = ent.metadata,
             e.{self._names["entity_embedding_prop"]} = CASE WHEN ent.embedding IS NOT NULL
                 THEN ent.embedding ELSE e.{self._names["entity_embedding_prop"]} END
         """
@@ -1514,26 +1743,62 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
 
         # Remove MENTIONS edges from each doc to Technology entities that are no
-        # longer matched by the current patterns. Only TECHNOLOGY-typed entities
-        # are touched — other entity types (and their MENTIONS) are preserved.
+        # longer matched by the current patterns. Membership-aware: entities
+        # whose primary type is TECHNOLOGY OR whose types[] already carry
+        # TECHNOLOGY are touched — merged concept-owned tech nodes included;
+        # other entity types (and their MENTIONS) are preserved.
         delete_stale_mentions_query = """
         UNWIND $doc_terms AS d
         MATCH (doc:Document {id: d.doc_id, tenant_id: $tenant_id})
         MATCH (doc)-[r:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
-        WHERE e.type = 'TECHNOLOGY' AND NOT e.id IN d.entity_ids
+        WHERE (e.type = 'TECHNOLOGY' OR 'TECHNOLOGY' IN e.types)
+          AND NOT e.id IN d.entity_ids
         DELETE r
         """
 
         # Prune Technology Entity nodes that lost their last MENTION (mirrors the
-        # orphan logic in _drop_tenant_data_in_session, restricted to TECHNOLOGY).
+        # orphan logic in _drop_tenant_data_in_session). Membership-aware like
+        # the stale-mention deletion, and provenance-guarded: a node that still
+        # carries a PROVENANCE edge (e.g. a merged concept-owned node) is NEVER
+        # deleted by this refresh — only genuinely tech-owned nodes without
+        # provenance are pruned.
         prune_orphan_tech_query = """
-        MATCH (e:Entity {tenant_id: $tenant_id, type: 'TECHNOLOGY'})
-        WHERE NOT (e)<-[:MENTIONS]-()
+        MATCH (e:Entity {tenant_id: $tenant_id})
+        WHERE (e.type = 'TECHNOLOGY' OR 'TECHNOLOGY' IN e.types)
+          AND NOT (e)<-[:MENTIONS]-()
+          AND NOT (e)<-[:PROVENANCE]-()
         DETACH DELETE e
         """
 
         async def _write_refresh(tx):
             if entities_batch:
+                # Metadata accumulation (same in-tx pattern as the extractor
+                # path): read the nodes' current metadata, merge each fresh
+                # per-document contribution (source_documents dedup union +
+                # running max confidence) and write the merged JSON back in the
+                # batch MERGE below.
+                existing_metadata: Dict[str, str] = {}
+                result = await tx.run(
+                    cast(
+                        LiteralString,
+                        """
+                        UNWIND $ids AS eid
+                        MATCH (e:Entity {id: eid, tenant_id: $tenant_id})
+                        RETURN e.id AS id, e.metadata AS metadata
+                        """,
+                    ),
+                    ids=[ent["id"] for ent in entities_batch],
+                    tenant_id=tenant_id,
+                )
+                async for record in result:
+                    existing_metadata[record["id"]] = record["metadata"]
+                for ent in entities_batch:
+                    ent["metadata"] = json.dumps(
+                        _merge_entity_metadata(
+                            existing_metadata.get(ent["id"]),
+                            json.loads(ent["metadata"]),
+                        )
+                    )
                 await tx.run(
                     cast(LiteralString, batch_entity_query),
                     entities=entities_batch,
@@ -1772,7 +2037,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         a link regardless of the direction used by future queries.
         A single UNWIND query replaces the previous one-round-trip-per-document loop.
 
-        Versioned: the vector index and the SIMILAR_TO relation
+        Versioned (todo 11, P4): the vector index and the SIMILAR_TO relation
         name are suffixed with the current generation token; the whole method
         is re-run once by the decorator if the generation flips mid-run.
         """
@@ -2140,7 +2405,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         mentions half scores 0.5. This naturally surfaces the most topically
         complete answers.
 
-        Versioned: the embedding property read is suffixed with
+        Versioned (todo 11, P4): the embedding property read is suffixed with
         the current generation token.
         """
         return await self._run_cached(
@@ -2175,10 +2440,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         depth is injected as a literal — Neo4j does not allow parameters in
         variable-length relationship bounds (*min..max).
 
-        Versioned: the embedding property read is suffixed with
+        Versioned (todo 11, P4): the embedding property read is suffixed with
         the current generation token (depth is part of the cache key since it
         is inlined into the compiled Cypher).
+
+        Concept-generation gate (todo 11, concurrency lifecycle): every
+        RELATED_TO edge and Entity node on the traversed path must be either
+        untagged (spaCy: ``concept_gen IS NULL``) or tagged with the ACTIVE
+        generation. The active gen is read from the PERSISTED marker per
+        request (``_read_concept_gen``) — the marker flip is what atomically
+        hides superseded concept generations. When no marker exists yet (no
+        flip has ever run), the effective active gen is the CURRENT config
+        fingerprint, which is what ingestion tags with: pre-feature and
+        freshly-ingested content stays visible, and a config save hides the
+        old generation as soon as the background recompute lands.
         """
+        active_gen = await self._read_concept_gen(self.agent_id)
+        if active_gen is None:
+            active_gen = self._concept_fingerprint()
         return await self._run_cached(
             f"recall_entity_related:{depth}",
             self._generation,
@@ -2188,6 +2467,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "collection_name": collection_name,
                 "decay": decay,
                 "k": k,
+                "active_concept_gen": active_gen,
             },
         )
 
@@ -2215,7 +2495,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Only active when `enable_entity_embeddings=True` and entity embeddings
         have been stored during ingestion (requires the embedder to be injected).
 
-        Versioned: the embedding property read is suffixed with
+        Versioned (todo 11, P4): the embedding property read is suffixed with
         the current generation token (the entity index itself is not versioned).
         """
         return await self._run_cached(
@@ -2244,7 +2524,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Returns raw Cypher records (dicts) so they can be merged with Phase A results
         before the final conversion to DocumentRecall.
 
-        Versioned: the vector index and the embedding property
+        Versioned (todo 11, P4): the vector index and the embedding property
         read are suffixed with the current generation token.
         """
         return await self._run_cached(
@@ -2553,7 +2833,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         profiles gracefully — only creates structure that the available metadata
         supports.
 
-        Always created (require only chunk_index + source):
+        Always created (require only source; chunk_index is used when present,
+        otherwise derived from the arrival order of the points):
           - :SourceFile node + [:PART_OF] from each document
           - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
 
@@ -2589,7 +2870,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 })
 
         if not regular_points:
-            return
+            # Fallback: some ingestion engines (e.g. efficient_ingestion) do not
+            # set chunk_index on point metadata.  Derive chunk order from the
+            # arrival order of the points instead, so the derived graph (and the
+            # LLM concept/relation extraction in step 8) still runs.  The CATALOG
+            # card stays excluded.
+            for p in stored_points:
+                meta = (p.payload or {}).get("metadata", {}) or {}
+                if meta.get("is_catalogue_card"):
+                    continue
+                regular_points.append({
+                    "id": p.id,
+                    "chunk_index": len(regular_points),
+                    "chunk_level": meta.get("chunk_level"),
+                    "parent_id": meta.get("parent_id"),
+                    "has_formula": meta.get("has_formula", False),
+                })
+            if not regular_points:
+                return
 
         regular_points.sort(key=lambda x: x["chunk_index"])
         point_ids = [rp["id"] for rp in regular_points]
@@ -2708,17 +3006,101 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction
-        if self._enable_concept_relations and stray_cat:
+        # 8 — LLM-based concept relation extraction (gated on the
+        # enable_knowledge_graph master switch, D1). Self-contained: when no
+        # stray_cat is available (vector-db path via add_points_to_tenant — the
+        # plugin hooks are unreliable under the multi-worker toggle race, so
+        # they cannot be the trigger), the agent LLM is resolved directly from
+        # the saved agent config via _resolve_agent_llm().
+        if self._enable_knowledge_graph and self._enable_concept_relations:
             try:
-                await self._extract_concept_relations(source, stored_points, stray_cat)
+                if stray_cat is not None:
+                    await self._extract_concept_relations(source, stored_points, stray_cat)
+                else:
+                    llm = await self._resolve_agent_llm()
+                    if llm is not None:
+                        await self._extract_concept_relations(source, stored_points, llm=llm)
             except Exception as e:
                 log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
 
+    async def _resolve_agent_llm(self) -> Optional[Any]:
+        """Resolve the agent's configured LLM without a ``StrayCat`` reference.
+
+        Self-contained vector-db path: step 8 of ``create_derived_graph_for_source``
+        also runs from ``add_points_to_tenant``, where no ``stray_cat`` is passed
+        and the plugin hooks are unreliable (multi-worker toggle race). The LLM
+        is resolved through the official ``ServiceProvider`` against the agent's
+        saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
+        any configured LLM class works (not just the probe's OpenRouterLLM).
+
+        The plugin manager must be AGENT-scoped (FX-8): the system
+        ``BillTheLizard`` singleton's MadHatter has ``context_execute_hook ==
+        "lizard"``, so ``execute_hook("factory_allowed_llms", ...)`` calls every
+        handler with a ``lizard=`` kwarg and the ``factory_allowed_llms(allowed,
+        cat)`` hooks of ``base_plugin``/``grinning_cat_plus`` raise ``TypeError``
+        (swallowed by ``execute_hook``) — the configured LLM class never enters
+        the allowed list and the factory falls back to ``LLMDefault``. Instead of
+        the heavy ``BillTheLizard.get_cheshire_cat(agent_id)`` (which creates a
+        FULL ``CheshireCat``: plugin discovery + Redis writes + a second vector
+        handler), a lightweight ``MadHatter(agent_id)`` is built that shares the
+        system manager's already-loaded hook registry (the same ``CatHook``
+        objects the agent's real MadHatter would use) and therefore has
+        ``context_execute_hook == "cat"``. Imports are lazy (plugin import-safe
+        rule).
+
+        Returns None when the agent has no LLM or resolution fails (step 8
+        degrades to a no-op); the resolved LLM is cached on the handler so a
+        multi-file ingestion resolves it once.
+        """
+        cached = getattr(self, "_llm", None)
+        if cached is not None:
+            return cached
+        agent_id = getattr(self, "agent_id", None)
+        if not agent_id:
+            return None
+        try:
+            # lazy imports (plugin import-safe rule)
+            from cat.looking_glass.bill_the_lizard import BillTheLizard
+            from cat.looking_glass.mad_hatter.mad_hatter import MadHatter
+            from cat.services.service_provider import ServiceProvider
+
+            system_pm = getattr(BillTheLizard(), "plugin_manager", None)
+            if system_pm is None or not getattr(system_pm, "hooks", None):
+                return None
+            # Agent-scoped MadHatter: context_execute_hook == "cat" (the system
+            # manager's is "lizard" and breaks factory_allowed_llms — FX-8).
+            agent_pm = MadHatter(agent_id)
+            agent_pm.hooks = system_pm.hooks
+            llm = await ServiceProvider().get_large_language_model(agent_id, agent_pm)
+            if llm is None or type(llm).__name__ == "LLMDefault":
+                # The dumb fallback LLM is never a usable extractor.
+                return None
+            self._llm = llm
+            return llm
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[GraphRAG] Could not resolve agent LLM for '{agent_id}': {e}")
+            return None
+
     async def _extract_concept_relations(
-        self, source: str, stored_points: List["PointStruct"], stray_cat
+        self,
+        source: str,
+        stored_points: List["PointStruct"],
+        stray_cat=None,
+        gen: str | None = None,
+        llm=None,
     ) -> None:
         tenant_id = self.agent_id
+
+        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
+        # LLM (hook path), then a self-contained resolve from the agent config
+        # (vector-db path, no stray_cat). None -> skip silently.
+        if llm is None:
+            if stray_cat is not None:
+                llm = getattr(stray_cat, "large_language_model", None)
+            if llm is None:
+                llm = await self._resolve_agent_llm()
+        if llm is None:
+            return
 
         # Join full section texts (no per-chunk truncation), up to a total limit
         texts: List[str] = []
@@ -2740,8 +3122,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if len(combined) > max_chars:
             combined = combined[:max_chars] + " [truncated]"
 
-        relations = await self._llm_extract_relations(combined, stray_cat)
-        if not relations:
+        relations = await self._llm_extract_relations(combined, llm=llm)
+        if not relations.get("concepts") and not relations.get("relations"):
             return
 
         # Every concept created from this source is provenance-linked to the
@@ -2749,36 +3131,101 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # cascade can prune it when ALL of them are gone.
         document_ids = [p.id for p in stored_points if getattr(p, "id", None)]
 
+        # The store tags every node/edge with the config generation: the
+        # recompute path (todo 12) passes its target gen explicitly, while the
+        # ingestion path (todo 9) falls back to the current config fingerprint.
         await self._store_concept_relations(
-            tenant_id, relations, source=source, document_ids=document_ids
+            tenant_id,
+            relations,
+            source=source,
+            document_ids=document_ids,
+            concept_gen=gen or self._concept_fingerprint(),
         )
         log.info(
-            f"[GraphRAG] Stored {len(relations)} concept relations for '{source}'"
+            f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
         )
 
     async def _llm_extract_relations(
-        self, text: str, stray_cat
-    ) -> List[Dict[str, str]]:
+        self, text: str, stray_cat=None, llm=None
+    ) -> Dict[str, list]:
+        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
+        # LLM. The self-contained resolve happens one level up
+        # (``_extract_concept_relations``); a None here means no LLM is
+        # available -> return empty (step 8 no-op).
+        if llm is None:
+            if stray_cat is not None:
+                llm = getattr(stray_cat, "large_language_model", None)
+        if llm is None:
+            return {"concepts": [], "relations": []}
         # Use the per-agent prompt from settings; fall back to the built-in
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
         # Prompts saved while the placeholder still existed are handled too.
-        prompt_template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_PROMPT
-        if "{text}" in prompt_template:
-            full_prompt = prompt_template.replace("{text}", text)
+        template = self._concept_relations_prompt or CONCEPT_RELATIONS_EXTRACTION_TEMPLATE
+        # RAW definition strings (comments + formatting preserved verbatim,
+        # todo 3) are interpolated into the prompt placeholders.
+        full_prompt = template.replace("{concept_definitions}", self._raw_concept_definitions).replace("{relation_definitions}", self._raw_relation_definitions)
+        if "{text}" in full_prompt:
+            full_prompt = full_prompt.replace("{text}", text)
         else:
-            full_prompt = f"{prompt_template}\n{text}"
+            full_prompt = f"{full_prompt}\n{text}"
 
-        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
-        agent_output = await stray_cat.agentic_workflow.run(
-            task=agent_input,
-            llm=stray_cat.large_language_model,
-        )
-        raw = agent_output.output
-        return self._parse_concept_relations(raw)
+        # Structured extraction via the plugin's own StructuredLLM utility
+        # (todo 1): native with_structured_output when the LLM supports it,
+        # JSON-schema prompt fallback otherwise. The dynamic Pydantic output
+        # model (todo 2) whitelist-enforces concept/relation types at
+        # validation time.
+        output_model = self._build_llm_output_model()
+        try:
+            result = await StructuredLLM().run(
+                full_prompt, llm, output_model
+            )
+            model = result.model
+            if hasattr(model, "model_dump"):
+                data = model.model_dump()
+            else:
+                data = model or {}
+            if not data.get("concepts") and not data.get("relations"):
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
+                    f"raw={result.text[:300]!r}"
+                )
+            return {
+                "concepts": data.get("concepts", []),
+                "relations": data.get("relations", []),
+            }
+        except StructuredLLMError as e:
+            log.warning(
+                f"[GraphRAG] Structured LLM extraction failed, falling back to "
+                f"lenient parsing: {e}"
+            )
+            # Lenient fallback: the parser now returns the {"concepts","relations"}
+            # dict natively (todo 5), so the result feeds straight into the store.
+            data = self._parse_concept_relations(e.raw_text)
+            if not data.get("concepts") and not data.get("relations"):
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
+                    f"raw={e.raw_text[:300]!r}"
+                )
+            return data
 
-    @staticmethod
-    def _parse_concept_relations(raw: str) -> List[Dict[str, str]]:
+    def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
+        """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
+
+        New contract: ``{"concepts": [{"type","text"}], "relations":
+        [{"type","origin","destination","text"}]}``. ``type`` values are
+        uppercased and whitelist-enforced against ``self._concept_definitions``
+        / ``self._relation_definitions``; a concept whose type is absent or not
+        whitelisted falls back to ``CONCEPT`` (A1), while a non-whitelisted
+        relation is dropped entirely.
+
+        Legacy (M18): a bare LIST of ``{subject, relation_type, object,
+        [subject_type], [object_type]}`` is normalized into the new shape, with
+        ``concepts`` derived from the unique subjects/objects.
+
+        Never raises: malformed JSON / non-dict payloads yield
+        ``{"concepts": [], "relations": []}``.
+        """
         import re
         import json
 
@@ -2791,138 +3238,780 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
+            # Lenient: pull a bare JSON array (legacy shape) out of prose.
             match = re.search(r"\[[\s\S]*\]", text)
             if match:
                 try:
                     data = json.loads(match.group())
                 except json.JSONDecodeError:
-                    return []
+                    return {"concepts": [], "relations": []}
             else:
-                return []
+                return {"concepts": [], "relations": []}
 
-        if not isinstance(data, list):
-            return []
+        # Legacy (M18): bare list of {subject, relation_type, object, ...}.
+        if isinstance(data, list):
+            valid = set(self._relation_definitions.keys())
+            relations = []
+            concepts: Dict[str, Dict[str, str]] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                s = str(item.get("subject", "")).strip()
+                o = str(item.get("object", "")).strip()
+                r = str(item.get("relation_type", "")).strip().upper()
+                if not (s and o) or r not in valid:
+                    continue
+                relations.append(
+                    {"type": r, "origin": s, "destination": o, "text": ""}
+                )
+                st = str(item.get("subject_type", "") or "").strip().upper()
+                ot = str(item.get("object_type", "") or "").strip().upper()
+                if st not in self._concept_definitions:
+                    st = "CONCEPT"
+                if ot not in self._concept_definitions:
+                    ot = "CONCEPT"
+                concepts.setdefault(
+                    s.casefold(), {"type": st, "text": s, "_norm": s.casefold()}
+                )
+                concepts.setdefault(
+                    o.casefold(), {"type": ot, "text": o, "_norm": o.casefold()}
+                )
+            return {"concepts": list(concepts.values()), "relations": relations}
 
-        valid = {
-            "IS_A", "PART_OF", "EXAMPLE_OF", "PREREQUISITE_FOR",
-            "BUILDS_UPON", "CONTRASTS_WITH", "APPLIES_TO",
-            "LEADS_TO", "EVIDENCE_FOR",
-        }
+        # New contract: {"concepts": [...], "relations": [...]}.
+        if not isinstance(data, dict):
+            return {"concepts": [], "relations": []}
 
-        result: List[Dict[str, str]] = []
-        for item in data:
+        concepts = []
+        for item in data.get("concepts", []):
             if not isinstance(item, dict):
                 continue
-            s = str(item.get("subject", "")).strip()
-            o = str(item.get("object", "")).strip()
-            r = str(item.get("relation_type", "")).strip().upper()
-            if s and o and r in valid:
-                result.append({"subject": s, "relation_type": r, "object": o})
-        return result
+            ctype = str(item.get("type", "")).strip().upper()
+            if ctype not in self._concept_definitions:
+                ctype = "CONCEPT"  # A1 fallback
+            ctext = str(item.get("text", "")).strip()
+            if not ctext:
+                continue
+            concepts.append(
+                {"type": ctype, "text": ctext, "_norm": ctext.casefold()}
+            )
+
+        relations = []
+        for item in data.get("relations", []):
+            if not isinstance(item, dict):
+                continue
+            rtype = str(item.get("type", "")).strip().upper()
+            if rtype not in self._relation_definitions:
+                continue  # drop non-whitelisted
+            origin = str(item.get("origin", "")).strip()
+            destination = str(item.get("destination", "")).strip()
+            if not (origin and destination):
+                continue  # drop relations with empty endpoints
+            relations.append(
+                {
+                    "type": rtype,
+                    "origin": origin,
+                    "destination": destination,
+                    "text": str(item.get("text", "")).strip(),
+                    "_norm_origin": origin.casefold(),
+                    "_norm_destination": destination.casefold(),
+                }
+            )
+
+        return {"concepts": concepts, "relations": relations}
+
+    # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
+
+    def _concept_fingerprint(self) -> str:
+        """Stable SHA-256 fingerprint of the effective concept-relations config.
+
+        Normalizes the PARSED definition dicts (``sort_keys=True``) and the
+        whitespace-stripped prompt, so cosmetic edits (line order, indentation,
+        trailing whitespace) do NOT produce a spurious generation change. The
+        resulting token tags every concept node/edge written by
+        ``_store_concept_relations`` (the ``concept_gen`` property) and is what
+        the save-trigger recompute (todo 12) flips to.
+        """
+        payload = (
+            "CONCEPT:" + json.dumps(self._concept_definitions, sort_keys=True)
+            + "|REL:" + json.dumps(self._relation_definitions, sort_keys=True)
+            + "|PROMPT:" + (self._concept_relations_prompt or "").strip()
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _read_concept_gen(self, tenant_id: str | None = None) -> str | None:
+        """Read the tenant's active concept-generation marker.
+
+        ``concept_gen_active`` on the tenant's Collection node is the PERSISTED
+        source of truth for which ``concept_gen`` is currently visible to the
+        retrieval gate (``_recall_entity_related``). Plain ``session.run``, no
+        transaction — EpochMixin style. Returns None when no marker exists yet
+        (no flip has ever run for this tenant).
+        """
+        tenant_id = tenant_id or self.agent_id
+        await self._ensure_connected()
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(
+                    LiteralString,
+                    "MATCH (c:Collection {tenant_id: $tenant_id}) "
+                    "RETURN c.concept_gen_active AS gen LIMIT 1",
+                ),
+                tenant_id=tenant_id,
+            )
+            record = await result.single()
+            if record is not None and record["gen"] is not None:
+                return str(record["gen"])
+            return None
+
+    async def _write_concept_gen(self, tenant_id: str, gen: str) -> None:
+        """Persist the tenant's active concept-generation marker.
+
+        ``MERGE`` guarantees the Collection node exists even when the tenant has
+        no stored documents yet (mirrors the Epoch node pattern). Plain
+        ``session.run``, no transaction.
+        """
+        await self._ensure_connected()
+        async with self._get_session() as session:
+            await session.run(
+                cast(
+                    LiteralString,
+                    "MERGE (c:Collection {tenant_id: $tenant_id}) "
+                    "SET c.concept_gen_active = $gen",
+                ),
+                tenant_id=tenant_id,
+                gen=gen,
+            )
+
+    async def _flip_concept_gen(
+        self, tenant_id: str, expected_prev_gen: str | None, new_gen: str
+    ) -> bool:
+        """Atomically deactivate every non-``new_gen`` concept tag and switch
+        the tenant's ``concept_gen_active`` marker to ``new_gen``.
+
+        All four statements run in ONE managed write transaction (capped by the
+        shared write semaphore), so the flip is all-or-nothing:
+
+        1. Gen-guard read: the current marker must still be in the expected
+           state (``expected_prev_gen``). If ``expected_prev_gen`` is a string,
+           the marker must equal it; if None, the marker must be absent/empty
+           (a ``MATCH`` for CONFLICTING markers — any row means an occupied
+           marker from a newer flip). When a newer save flipped the marker in
+           the meantime, the guard finds the conflict and raises
+           ``_ConceptGenGuardAbort``: the whole transaction rolls back and the
+           method returns False, so concurrent recompute jobs stay
+           single-flight — the persisted marker IS the lock.
+        2. Nodes: every Entity tagged with a ``concept_gen`` other than
+           ``new_gen`` gets ``concept_gen_active = false`` bookkeeping ONLY.
+           The retrieval gate never reads this boolean (Metis M1).
+        3. Edges: the same for RELATED_TO relationships.
+        4. Marker: MERGE the Collection node and SET ``concept_gen_active``.
+
+        Nodes/edges freshly written with ``concept_gen = new_gen`` keep
+        ``concept_gen_active`` UNSET, so they pass the tag-based gate. Every
+        MATCH is tenant-scoped; no other tenant's graph is touched.
+
+        Note: the ``expected_prev_gen is None`` guard uses the complement idiom
+        (match CONFLICTING markers) instead of ``IS NULL OR NOT coalesce(...)``
+        so that a tenant with NO Collection node yet still reads as "marker
+        absent" and the flip can proceed — the task's literal predicate would
+        abort on that legitimate case (a fresh tenant configuring the plugin
+        before any ingestion) and would loop forever in the recompute job.
+        """
+
+        class _ConceptGenGuardAbort(Exception):
+            pass
+
+        async def _flip(tx):
+            if expected_prev_gen is None:
+                # Guard succeeds when there is NO conflicting marker (absent
+                # marker / no Collection node yet) -> abort only on a hit.
+                result = await tx.run(
+                    cast(LiteralString, CONCEPT_FLIP_GUARD_ABSENT_QUERY),
+                    tenant_id=tenant_id,
+                )
+                guard_ok = await result.single() is None
+            else:
+                # Guard succeeds when the marker STILL equals the expected
+                # previous generation -> abort when it no longer does.
+                result = await tx.run(
+                    cast(LiteralString, CONCEPT_FLIP_GUARD_QUERY),
+                    tenant_id=tenant_id,
+                    expected_prev=expected_prev_gen,
+                )
+                guard_ok = await result.single() is not None
+
+            if not guard_ok:
+                # A newer flip won the race (or the marker is occupied) ->
+                # abort the whole transaction and report the loss.
+                raise _ConceptGenGuardAbort()
+
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_NODES_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_EDGES_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+            await tx.run(
+                cast(LiteralString, CONCEPT_FLIP_MARKER_QUERY),
+                tenant_id=tenant_id,
+                new_gen=new_gen,
+            )
+
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                try:
+                    await session.execute_write(_flip)
+                except _ConceptGenGuardAbort:
+                    return False
+        return True
+
+    async def _gc_stale_concept_nodes(self, tenant_id: str) -> None:
+        """Deferred GC of concept nodes superseded by a generation flip.
+
+        Removes Entity nodes that ``_flip_concept_gen`` marked
+        ``concept_gen_active = false`` AND that no Document MENTIONS anymore.
+        The ``NOT (e)<-[:MENTIONS]-()`` guard protects shared spaCy nodes: an
+        entity that ``_store_concept_relations`` tagged and that NER later
+        picked up keeps its MENTIONS edge and is never deleted (Metis B2).
+        Runs in one plain ``session.run`` under the write semaphore — safe to
+        schedule right after the flip, never blocks the read path.
+        """
+        await self._ensure_connected()
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                await session.run(
+                    cast(LiteralString, CONCEPT_GC_STALE_QUERY),
+                    tenant_id=tenant_id,
+                )
+
+    async def recompute_concept_relations(
+        self,
+        stray_cat,
+        source_group: str | None = None,
+        gen: str | None = None,
+    ) -> None:
+        """Re-walk the tenant's stored Documents and re-extract concept
+        relations from every source, tagging the writes with ``gen``.
+
+        Mirrors ``refresh_technology_entities`` step 1 (fetch every stored
+        Document of the tenant), groups them by ``metadata.source`` and feeds
+        each source's content to the existing ``_extract_concept_relations`` —
+        the LLM re-runs on the concatenated section texts and
+        ``_store_concept_relations`` tags the resulting nodes/edges with
+        ``gen``. After this completes, ``_flip_concept_gen`` deactivates every
+        OTHER generation. No re-ingest, no re-embed, no full wipe; every query
+        is tenant-scoped and the walk is serialized by the write semaphore.
+        """
+        if not (self._enable_knowledge_graph and self._enable_concept_relations):
+            return
+        tenant_id = self.agent_id
+        if gen is None:
+            gen = self._concept_fingerprint()
+
+        await self._ensure_connected()
+        async with self._neo4j_write_semaphore:
+            async with self._get_session() as session:
+                result = await session.run(
+                    cast(
+                        LiteralString,
+                        "MATCH (d:Document {tenant_id: $tenant_id}) "
+                        "RETURN d.id AS id, d.content AS content, d.metadata AS metadata",
+                    ),
+                    tenant_id=tenant_id,
+                )
+                docs = [record async for record in result]
+
+        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for doc in docs:
+            raw_meta = doc["metadata"]
+            try:
+                meta = (
+                    json.loads(raw_meta)
+                    if isinstance(raw_meta, str)
+                    else (raw_meta or {})
+                )
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            source = str(meta.get("source") or "unknown")
+            if source_group is not None and source != source_group:
+                continue
+            by_source.setdefault(source, []).append(
+                {
+                    "id": doc["id"],
+                    "page_content": doc["content"] or "",
+                    "metadata": meta,
+                }
+            )
+
+        for source in sorted(by_source):
+            payloads = [
+                PointStruct(
+                    id=p["id"],
+                    payload={
+                        "id": p["id"],
+                        "page_content": p["page_content"],
+                        "metadata": p["metadata"],
+                    },
+                    vector=[],
+                )
+                for p in by_source[source]
+            ]
+            await self._extract_concept_relations(source, payloads, stray_cat, gen=gen)
+
+    def _build_llm_output_model(self) -> type[BaseModel]:
+        """Dynamically build the Pydantic output model for structured LLM
+        concept/relation extraction (todo 2, mygraph-structured-llm-extraction).
+
+        The ``type`` fields are Literal unions over the configured
+        concept/relation definition keys (uppercased by ``parse_definitions``),
+        so the LLM output is whitelist-enforced at validation time. Values are
+        case-normalized (strip + upper) BEFORE Literal validation, so the LLM
+        may emit lowercase/mixed-case types. If a parsed definitions dict is
+        empty (e.g. an all-comment settings field), the built-in defaults are
+        used for the model build ONLY — the stored dicts are left untouched.
+        """
+        concept_keys = sorted(self._concept_definitions.keys()) or sorted(
+            parse_definitions(DEFAULT_CONCEPT_DEFINITIONS).keys()
+        )
+        relation_keys = sorted(self._relation_definitions.keys()) or sorted(
+            parse_definitions(DEFAULT_RELATION_DEFINITIONS).keys()
+        )
+
+        ConceptType = Annotated[Literal[*concept_keys], BeforeValidator(_upper_str)]
+        RelationType = Annotated[Literal[*relation_keys], BeforeValidator(_upper_str)]
+
+        Concept = create_model(
+            "Concept",
+            type=(ConceptType, ...),
+            text=(str, ...),
+        )
+        Relation = create_model(
+            "Relation",
+            type=(RelationType, ...),
+            origin=(str, ...),
+            destination=(str, ...),
+            text=(str, ...),
+        )
+        return create_model(
+            "ExtractionResult",
+            concepts=(List[Concept], ...),
+            relations=(List[Relation], ...),
+        )
+
+    def _resolve_concept_entity_type(self, type_str: str | None) -> Tuple[str, EntityType]:
+        """Resolve an LLM-provided concept type against the settings whitelist.
+
+        Returns (node_type, enum_for_hashing). node_type is uppercased.
+        A1: unknown/absent/unmapped types fall back to ('CONCEPT', EntityType.CONCEPT).
+        A whitelisted type that is a real EntityType enum member uses that enum;
+        a custom type not in the enum hashes with EntityType.CONCEPT (shared
+        name-space dedup preserved) while storing the custom node_type string.
+        """
+        if type_str:
+            t = type_str.strip().upper()
+            if t in self._concept_definitions:
+                try:
+                    enum = EntityType[t]
+                except KeyError:
+                    enum = EntityType.CONCEPT
+                return t, enum
+        return "CONCEPT", EntityType.CONCEPT
 
     async def _store_concept_relations(
         self,
         tenant_id: str,
-        relations: List[Dict[str, str]],
+        relations: Dict[str, list],
         source: str | None = None,
         document_ids: List[str] | None = None,
+        concept_gen: str | None = None,
     ) -> None:
-        if not relations:
+        concepts = relations.get("concepts", [])
+        rels = relations.get("relations", [])
+        if not concepts and not rels:
             return
 
         source_files = [source] if source else None
 
-        async with self._get_session() as session:
-            for rel in relations:
-                try:
-                    subject = rel["subject"]
-                    object_ = rel["object"]
-                    rel_type = rel["relation_type"]
+        # Index concepts by their normalized text (the ``_norm`` keys the
+        # parser stored) so relations can resolve origin/destination node
+        # text + type from the concept list. Fall back to casefolded text
+        # when ``_norm`` is missing.
+        concept_index: Dict[str, Dict[str, Any]] = {}
+        for c in concepts:
+            key = c.get("_norm")
+            if not key and c.get("text"):
+                key = c["text"].casefold()
+            if key:
+                concept_index[key] = c
 
-                    # Generate stable entity IDs using the same hash strategy
-                    # as the entity extractor, so concept entities have a
-                    # non-null `id` property and the frontend visualisation
-                    # can map them correctly in D3.
+        # Identity-first endpoint write: resolve the endpoint by its id first
+        # (never create a second node, never SET a taken id). Only when NO node
+        # holds the id do we fall back to a name-keyed MERGE + guarded SET id
+        # within the same statement (atomic check-then-act). Ownership rule:
+        # only nodes CREATED by this write get concept_gen-tagged; adopted
+        # nodes stay NER-owned/untagged. `types` accumulates (primary type
+        # first-wins + dedup union list); `metadata` carries the pre-merged
+        # contribution. `name` is stored fully normalized.
+        endpoint_query = """
+        OPTIONAL MATCH (n:Entity {id: $eid, tenant_id: $tenant_id})
+        FOREACH (_ IN CASE WHEN n IS NULL THEN [1] ELSE [] END |
+            MERGE (z:Entity {tenant_id: $tenant_id, name: $name})
+            ON CREATE SET
+                z.id = $eid,
+                z.concept_gen = CASE WHEN $gen IS NOT NULL THEN $gen END
+            ON MATCH SET
+                z.id = $eid
+        )
+        WITH 1 AS _keep
+        MATCH (e:Entity {id: $eid, tenant_id: $tenant_id})
+        SET e.name = $name
+        SET e.type = coalesce(e.type, $type)
+        SET e.types = CASE
+            WHEN e.types IS NULL THEN [$type]
+            WHEN $type IN e.types THEN e.types
+            ELSE e.types + $type
+        END
+        SET e.tracked_by_provenance = true
+        SET e.metadata = $metadata
+        """
+
+        async with self._get_session() as session:
+            # Concepts first: identity-first endpoint resolution so a concept
+            # whose normalized name matches an existing Entity node (e.g. a
+            # spaCy NER node) resolves to THAT node — never duplicates it.
+            for c in concepts:
+                ctext = c.get("text")
+                if not ctext:
+                    continue
+                ctype, c_enum = self._resolve_concept_entity_type(c.get("type"))
+                c_name = _normalize_entity_name(ctext)
+                c_id = EntityExtractor.get_entity_hash(c_name, c_enum, tenant_id)
+
+                async def _write_concept(tx, c_id=c_id, c_name=c_name, ctype=ctype):
+                    md_result = await tx.run(
+                        "OPTIONAL MATCH (n:Entity {id: $eid, tenant_id: $tenant_id}) "
+                        "RETURN n.metadata AS md",
+                        eid=c_id,
+                        tenant_id=tenant_id,
+                    )
+                    md_record = await md_result.single()
+                    metadata = json.dumps(_merge_entity_metadata(
+                        md_record["md"] if md_record else None,
+                        {"source_documents": document_ids or [], "confidence": 0.0},
+                    ))
+                    await tx.run(
+                        endpoint_query,
+                        eid=c_id,
+                        tenant_id=tenant_id,
+                        name=c_name,
+                        type=ctype,
+                        gen=concept_gen,
+                        metadata=metadata,
+                    )
+
+                await session.execute_write(_write_concept)
+
+            for rel in rels:
+                try:
+                    # Resolve the origin/destination node text + type from the
+                    # concepts index (via the parser's _norm keys); a relation
+                    # endpoint that is not in the concepts list falls back to
+                    # its raw text and the CONCEPT type (A1).
+                    # Strict-path relations (model_dump output) carry no
+                    # _norm_* keys, so fall back to the casefolded raw text to
+                    # resolve endpoint types from the concepts index.
+                    s_concept = concept_index.get(
+                        rel.get("_norm_origin") or rel.get("origin", "").casefold()
+                    ) or {}
+                    t_concept = concept_index.get(
+                        rel.get("_norm_destination") or rel.get("destination", "").casefold()
+                    ) or {}
+                    subject = s_concept.get("text") or rel.get("origin")
+                    object_ = t_concept.get("text") or rel.get("destination")
+                    rel_type = rel.get("type")
+                    rel_text = rel.get("text") or ""
+
+                    s_type, s_enum = self._resolve_concept_entity_type(s_concept.get("type"))
+                    o_type, o_enum = self._resolve_concept_entity_type(t_concept.get("type"))
+
+                    # Identity is the name-only hash over the FULLY normalized
+                    # subject/object text — same normalization as the stored
+                    # `name` — so concept endpoints converge on existing nodes
+                    # (spaCy NER, tech-regex, other concepts).
+                    subject_name = _normalize_entity_name(subject or "")
+                    object_name = _normalize_entity_name(object_ or "")
+                    if not subject_name or not object_name:
+                        continue
                     subject_id = EntityExtractor.get_entity_hash(
-                        subject, EntityType.CONCEPT, tenant_id
+                        subject_name, s_enum, tenant_id
                     )
                     object_id = EntityExtractor.get_entity_hash(
-                        object_, EntityType.CONCEPT, tenant_id
+                        object_name, o_enum, tenant_id
                     )
 
-                    await session.run(
-                        """
-                        MERGE (s:Entity {tenant_id: $tenant_id, name: $subject})
-                        SET s.id = coalesce(s.id, $subject_id)
-                        SET s.type = coalesce(s.type, 'CONCEPT')
-                        SET s.tracked_by_provenance = true
-                        MERGE (t:Entity {tenant_id: $tenant_id, name: $object})
-                        SET t.id = coalesce(t.id, $object_id)
-                        SET t.type = coalesce(t.type, 'CONCEPT')
-                        SET t.tracked_by_provenance = true
-                        MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
-                        SET r.weight = coalesce(r.weight, 1.0) + 0.5
-                        SET r.source_files = CASE
-                            WHEN $source_files IS NULL THEN r.source_files
-                            WHEN r.source_files IS NULL THEN $source_files
-                            ELSE [x IN r.source_files WHERE NOT x IN $source_files] + $source_files
-                        END
-                        """,
-                        tenant_id=tenant_id,
-                        subject=subject,
-                        subject_id=subject_id,
-                        object=object_,
-                        object_id=object_id,
-                        rel_type=rel_type,
-                        source_files=source_files,
-                    )
+                    async def _write_relation(tx, subject_id=subject_id, object_id=object_id):
+                        md_result = await tx.run(
+                            "OPTIONAL MATCH (s:Entity {id: $sid, tenant_id: $tenant_id}) "
+                            "OPTIONAL MATCH (t:Entity {id: $tid, tenant_id: $tenant_id}) "
+                            "RETURN s.metadata AS smd, t.metadata AS tmd",
+                            sid=subject_id,
+                            tid=object_id,
+                            tenant_id=tenant_id,
+                        )
+                        md_record = await md_result.single()
+                        s_metadata = json.dumps(_merge_entity_metadata(
+                            md_record["smd"] if md_record else None,
+                            {"source_documents": document_ids or [], "confidence": 0.0},
+                        ))
+                        t_metadata = json.dumps(_merge_entity_metadata(
+                            md_record["tmd"] if md_record else None,
+                            {"source_documents": document_ids or [], "confidence": 0.0},
+                        ))
+                        # Identity-first resolution for BOTH endpoints +
+                        # RELATED_TO edge, all in ONE transaction: adopt the
+                        # existing holder by id, fall back to a name-keyed MERGE
+                        # with a guarded SET id, accumulate types + metadata on
+                        # each resolved endpoint, and carry the relation edge.
+                        await tx.run(
+                            """
+                            OPTIONAL MATCH (n_s:Entity {id: $subject_id, tenant_id: $tenant_id})
+                            OPTIONAL MATCH (n_t:Entity {id: $object_id, tenant_id: $tenant_id})
+                            FOREACH (_ IN CASE WHEN n_s IS NULL THEN [1] ELSE [] END |
+                                MERGE (z_s:Entity {tenant_id: $tenant_id, name: $subject})
+                                ON CREATE SET
+                                    z_s.id = $subject_id,
+                                    z_s.concept_gen = CASE WHEN $s_gen IS NOT NULL THEN $s_gen END
+                                ON MATCH SET
+                                    z_s.id = $subject_id
+                            )
+                            FOREACH (_ IN CASE WHEN n_t IS NULL THEN [1] ELSE [] END |
+                                MERGE (z_t:Entity {tenant_id: $tenant_id, name: $object})
+                                ON CREATE SET
+                                    z_t.id = $object_id,
+                                    z_t.concept_gen = CASE WHEN $t_gen IS NOT NULL THEN $t_gen END
+                                ON MATCH SET
+                                    z_t.id = $object_id
+                            )
+                            WITH 1 AS _keep
+                            MATCH (s:Entity {id: $subject_id, tenant_id: $tenant_id})
+                            MATCH (t:Entity {id: $object_id, tenant_id: $tenant_id})
+                            SET s.name = $subject
+                            SET s.type = CASE
+                                WHEN $s_type IS NOT NULL THEN coalesce(s.type, $s_type)
+                                ELSE s.type END
+                            SET s.types = CASE
+                                WHEN s.types IS NULL THEN [$s_type]
+                                WHEN $s_type IN s.types THEN s.types
+                                ELSE s.types + $s_type
+                            END
+                            SET s.tracked_by_provenance = true
+                            SET s.metadata = $s_metadata
+                            SET t.name = $object
+                            SET t.type = CASE
+                                WHEN $o_type IS NOT NULL THEN coalesce(t.type, $o_type)
+                                ELSE t.type END
+                            SET t.types = CASE
+                                WHEN t.types IS NULL THEN [$o_type]
+                                WHEN $o_type IN t.types THEN t.types
+                                ELSE t.types + $o_type
+                            END
+                            SET t.tracked_by_provenance = true
+                            SET t.metadata = $t_metadata
+                            MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
+                            SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
+                            # Idempotent weight: re-running the graph phase for the
+                            # same source+gen must not mutate the edge. The old
+                            # `+ 0.5` accumulated on every re-run; the weight is
+                            # write-only (never read by recall), so first-write
+                            # behavior (1.0) is preserved and re-runs are no-ops.
+                            SET r.weight = coalesce(r.weight, 1.0)
+                            SET r.text = $rel_text
+                            SET r.source_files = CASE
+                                WHEN $source_files IS NULL THEN r.source_files
+                                WHEN r.source_files IS NULL THEN $source_files
+                                ELSE [x IN r.source_files WHERE NOT x IN $source_files] + $source_files
+                            END
+                            """,
+                            tenant_id=tenant_id,
+                            subject=subject_name,
+                            subject_id=subject_id,
+                            s_type=s_type,
+                            s_gen=concept_gen,
+                            s_metadata=s_metadata,
+                            object=object_name,
+                            object_id=object_id,
+                            o_type=o_type,
+                            t_gen=concept_gen,
+                            t_metadata=t_metadata,
+                            rel_type=rel_type,
+                            rel_text=rel_text,
+                            r_gen=concept_gen,
+                            source_files=source_files,
+                        )
+
+                    await session.execute_write(_write_relation)
 
                     # PROVENANCE edges from every producing document to both
                     # concept entities (concepts carry no MENTIONS edges, so
-                    # the provenance is what makes them deletable).
+                    # the provenance is what makes them deletable). Resolves by
+                    # the RESOLVED endpoint id, not the raw name, so the
+                    # deletion cascade always lands on the surviving node.
                     if document_ids:
                         await session.run(
                             """
                             UNWIND $doc_ids AS did
                             MATCH (d:Document {id: did, tenant_id: $tenant_id})
-                            MATCH (s:Entity {tenant_id: $tenant_id, name: $subject})
-                            MATCH (t:Entity {tenant_id: $tenant_id, name: $object})
+                            MATCH (s:Entity {id: $subject_id, tenant_id: $tenant_id})
+                            MATCH (t:Entity {id: $object_id, tenant_id: $tenant_id})
                             MERGE (d)-[:PROVENANCE]->(s)
                             MERGE (d)-[:PROVENANCE]->(t)
                             """,
                             doc_ids=document_ids,
                             tenant_id=tenant_id,
-                            subject=subject,
-                            object=object_,
+                            subject_id=subject_id,
+                            object_id=object_id,
                         )
                 except Exception as e:
                     log.warning(
                         f"[GraphRAG] Failed to store relation "
-                        f"'{rel['subject']} -[{rel['relation_type']}]-> {rel['object']}': {e}"
+                        f"'{rel.get('origin')} -[{rel.get('type')}]-> {rel.get('destination')}': {e}"
                     )
 
 
-CONCEPT_RELATIONS_EXTRACTION_PROMPT = """You are a concept extraction system for educational content. Analyse the text below and extract meaningful conceptual relationships.
+DEFAULT_CONCEPT_DEFINITIONS = """## Concept types (assign each extracted concept exactly one type)
+DEFINITION: a term or idea formally defined in the text (e.g. "Overfitting")
+ENTITY: a concrete object, actor, tool, technology, or organization (e.g. "Transformer architecture")
+PROCESS: an action, method, procedure, or mechanism unfolding over steps or time (e.g. "Backpropagation")
+PROPERTY_OR_METRIC: a measurable or qualitative attribute of another concept (e.g. "Model accuracy")
+EXAMPLE_OR_CASE: a specific instance, dataset, experiment, or case study (e.g. "ImageNet dataset")
+PRINCIPLE_OR_THEORY: a general rule, law, or theoretical framework (e.g. "Bayes' theorem")
+CONTEXT_OR_ACTOR: historical, biographical, or institutional context (e.g. "Geoffrey Hinton")"""
 
-For each pair of related concepts return a JSON object with:
-- "subject": the source concept (short noun phrase, max 3 words)
-- "relation_type": one of IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, BUILDS_UPON, CONTRASTS_WITH, APPLIES_TO, LEADS_TO, EVIDENCE_FOR
-- "object": the target concept (short noun phrase, max 3 words)
+DEFAULT_RELATION_DEFINITIONS = """## Relation types — Tier 1: pedagogical/navigational (search for and prioritize these first)
+PREREQUISITE_FOR: learning dependency (e.g. Algebra PREREQUISITE_FOR Calculus)
+BUILDS_UPON: conceptual foundation (e.g. OOP BUILDS_UPON procedural programming)
+APPLIES_TO: practical application (e.g. Bayes theorem APPLIES_TO spam filtering)
 
-IS_A = specialisation / hierarchy  (e.g. Python IS_A programming language)
-PART_OF = composition / containment  (e.g. CPU PART_OF computer)
-EXAMPLE_OF = concrete instance  (e.g. Django EXAMPLE_OF web framework)
-PREREQUISITE_FOR = learning dependency  (e.g. Algebra PREREQUISITE_FOR Calculus)
-BUILDS_UPON = conceptual foundation  (e.g. OOP BUILDS_UPON procedural programming)
-CONTRASTS_WITH = comparative distinction  (e.g. REST CONTRASTS_WITH GraphQL)
-APPLIES_TO = practical application  (e.g. Bayes theorem APPLIES_TO spam filtering)
-LEADS_TO = causal chain  (e.g. Global warming LEADS_TO sea level rise)
-EVIDENCE_FOR = supporting evidence  (e.g. Study results EVIDENCE_FOR hypothesis)
+## Relation types — Tier 2: descriptive/semantic
+IS_A: specialisation / hierarchy (e.g. Python IS_A programming language)
+PART_OF: composition / containment (e.g. CPU PART_OF computer)
+EXAMPLE_OF: concrete instance (e.g. Django EXAMPLE_OF web framework)
+CONTRASTS_WITH: comparative distinction (e.g. REST CONTRASTS_WITH GraphQL)
+CAUSES: direct causal mechanism (e.g. Overfitting CAUSES poor generalization)
+LEADS_TO: longer causal/consequential chain (e.g. Global warming LEADS_TO sea level rise)
+EVIDENCE_FOR: supporting evidence (e.g. Study results EVIDENCE_FOR hypothesis)"""
 
-Only extract relations that are explicitly stated or clearly implied in the text.
-Return ONLY a valid JSON array of objects, with no additional text. If nothing matches return [].
+CONCEPT_RELATIONS_EXTRACTION_TEMPLATE = """# Prompt main schema
+You are a concept extraction system for educational content. Analyse the text below and extract meaningful concepts and conceptual relationships that would help a student navigate the material and understand its structure. When multiple relation types could apply to the same pair, prefer PREREQUISITE_FOR or BUILDS_UPON if a learning-order or foundational dependency is present.
 
-Text:"""
+{concept_definitions}
+
+{relation_definitions}
+
+For each concept, return a JSON object with:
+- "text": short noun phrase, max 3 words
+- "type": one of the defined concept types above
+
+For each pair of related concepts, return a JSON object with:
+- "origin": the source concept (short noun phrase, max 3 words)
+- "type": one of the defined relation types above (Tier 1 or Tier 2)
+- "destination": the target concept (short noun phrase, max 3 words)
+- "text": a short sentence describing the relationship between the two concepts
+
+Only extract concepts and relations that are explicitly stated or clearly implied in the text. Do not invent concepts absent from the text.
+Return ONLY a valid JSON object with two arrays, "concepts" and "relations", and no additional text. If nothing matches return {"concepts": [], "relations": []}.
+
+Text:
+{text}"""
+
+
+async def wipe_tenant_graph_data(agent_key: str) -> None:
+    """Wipe a tenant's Neo4j graph data after a graphrag -> other switch (T24).
+
+    Reconnects with the last-known GraphRAG connection config for the agent
+    (captured in ``_connect``) and deletes the tenant's Document/Entity/
+    relations via the existing per-tenant wipe path
+    (``_drop_tenant_data_in_session``). Strictly tenant-scoped: every
+    statement is filtered by ``tenant_id``, and a missing/unknown config
+    aborts instead of guessing. Never called when the transfer failed (the
+    hook gates on ``success``).
+    """
+    config = _last_graphrag_config.get(agent_key)
+    if not config:
+        log.warning(
+            f"[GraphRAG] No recorded Neo4j config for agent '{agent_key}'; "
+            "skipping old-store wipe (nothing to reconnect with)"
+        )
+        return
+    handler = GraphRAGHandler(**config)
+    handler.agent_id = agent_key
+    try:
+        await handler._ensure_connected()
+        async with handler._get_session() as session:
+            await handler._drop_tenant_data_in_session(session)
+    finally:
+        await handler.close()
+
+
+def parse_definitions(text: str) -> Dict[str, str]:
+    definitions: Dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            log.warning(f"[GraphRAG] parse_definitions: skipping line without ':' separator: {line!r}")
+            continue
+        key, _, value = stripped.partition(":")
+        definitions[key.strip().upper()] = value.strip()
+    return definitions
+
+
+# ── Concept-generation lifecycle Cypher (todos 10/13, concurrency lifecycle) ──
+# Module-level constants so the QA harness can assert on the exact query text
+# (tenant-scoping, gate semantics, GC guard) without a live Neo4j instance. The
+# flip statements are all executed inside ONE managed write transaction.
+CONCEPT_FLIP_GUARD_QUERY = """
+MATCH (c:Collection {tenant_id: $tenant_id})
+WHERE coalesce(c.concept_gen_active, null) = $expected_prev
+RETURN c.concept_gen_active AS gen
+LIMIT 1
+"""
+# expected_prev is None: match CONFLICTING (non-empty) markers — any row means
+# a newer flip already occupied the marker, so the flip must abort. Absent
+# marker / no Collection node -> no rows -> proceed (Metis M2, complement form).
+CONCEPT_FLIP_GUARD_ABSENT_QUERY = """
+MATCH (c:Collection {tenant_id: $tenant_id})
+WHERE coalesce(c.concept_gen_active, '') <> ''
+RETURN c.concept_gen_active AS gen
+LIMIT 1
+"""
+CONCEPT_FLIP_NODES_QUERY = """
+MATCH (e:Entity {tenant_id: $tenant_id})
+WHERE e.concept_gen IS NOT NULL AND e.concept_gen <> $new_gen
+SET e.concept_gen_active = false
+"""
+CONCEPT_FLIP_EDGES_QUERY = """
+MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+WHERE r.concept_gen IS NOT NULL AND r.concept_gen <> $new_gen
+SET r.concept_gen_active = false
+"""
+CONCEPT_FLIP_MARKER_QUERY = """
+MERGE (c:Collection {tenant_id: $tenant_id})
+SET c.concept_gen_active = $new_gen
+"""
+CONCEPT_GC_STALE_QUERY = """
+MATCH (e:Entity {tenant_id: $tenant_id})
+WHERE e.concept_gen_active = false AND NOT (e)<-[:MENTIONS]-()
+DETACH DELETE e
+"""
 
 
 class Neo4jGraphRAGConfig(VectorDatabaseSettings):
@@ -2971,11 +4060,29 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
     )
     concept_relations_prompt: str = Field(
-        default=CONCEPT_RELATIONS_EXTRACTION_PROMPT,
+        default=CONCEPT_RELATIONS_EXTRACTION_TEMPLATE,
         description=(
             "Prompt template sent to the LLM to extract concept relations. "
             "The ingested document text is appended after the prompt. "
+            "May contain {concept_definitions} and {relation_definitions} placeholders. "
             "Leave empty to use the built-in default."
+        ),
+    )
+    concept_definitions: str = Field(
+        default=DEFAULT_CONCEPT_DEFINITIONS,
+        description=(
+            "One 'TYPE: definition' per line. Each key becomes an admissible "
+            "concept node type (Entity.type), uppercased; shown to the LLM via "
+            "the {concept_definitions} placeholder."
+        ),
+    )
+    relation_definitions: str = Field(
+        default=DEFAULT_RELATION_DEFINITIONS,
+        description=(
+            "One 'TYPE: definition' per line. Each key becomes an admissible "
+            "relation type (RELATED_TO.type), uppercased; interpolated into the "
+            "prompt via the {relation_definitions} placeholder. Relation "
+            "definitions may mention concept names in their example text."
         ),
     )
     enable_knowledge_graph: bool = Field(
@@ -2984,7 +4091,7 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
-        description="Enable knowledge graph features for students",
+        description="Used only by the frontend visualisation; no backend extraction/retrieval gating.",
     )
 
     # Performance

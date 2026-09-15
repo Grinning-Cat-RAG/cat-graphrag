@@ -1,4 +1,4 @@
-"""Versioned-schema decorators for the GraphRAG handler.
+"""Versioned-schema decorators for the GraphRAG handler (todo 11, P4).
 
 Import-safe: no side effects at import time (the Cat plugin loader imports
 every ``.py`` in the plugin folder).
