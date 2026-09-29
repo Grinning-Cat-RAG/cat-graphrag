@@ -500,8 +500,8 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
     symmetry with the other ops (todo 5+).
     """
-    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
-    from cat.core_plugins.ingestion_status.registry import delete_status, list_statuses
+    from cat.plugins.cat_efficient_ingestion.reembed import reembed_sources
+    from cat.plugins.cat_efficient_ingestion.registry import delete_status, list_statuses
     from cat.services.memory.models import VectorMemoryType
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -542,8 +542,8 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     ``_source_from_entry``), so their points are NOT deleted by source name —
     each pass-through is logged (``detail=url-pass-through``).
     """
-    from cat.core_plugins.efficient_ingestion.reembed import reembed_sources
-    from cat.core_plugins.ingestion_status.registry import delete_status
+    from cat.plugins.cat_efficient_ingestion.reembed import reembed_sources
+    from cat.plugins.cat_efficient_ingestion.registry import delete_status
     from cat.services.memory.models import VectorMemoryType
     from cat.utils import is_url
 
@@ -911,7 +911,7 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
     Returns a list of ``(check_name, ok)`` tuples; the caller prints the
     ``result=verify-ok|verify-fail`` summary. Never destructive.
     """
-    from cat.core_plugins.ingestion_status.registry import list_statuses
+    from cat.plugins.cat_efficient_ingestion.registry import list_statuses
     from cat.services.memory.models import VectorMemoryType
 
     tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)

@@ -174,7 +174,7 @@ async def ingestion_phase_pending(pending, source, completed_phases, cat) -> lis
     # Core helpers (feat/ingestion-phase-machine). If they are not deployed
     # yet, the phase machine is not running: no work to report.
     try:
-        from cat.core_plugins.ingestion_status.fingerprints import (
+        from cat.plugins.cat_efficient_ingestion.fingerprints import (
             build_graphrag_fingerprint,
             phase_generation,
         )
@@ -259,7 +259,7 @@ async def before_ingestion_status_completed(source, cat) -> None:
     # completed-phases diary. Registry unavailable -> skip the doc check (the
     # in-memory pending-task check above already passed).
     try:
-        from cat.core_plugins.ingestion_status.registry import get_status
+        from cat.plugins.cat_efficient_ingestion.registry import get_status
     except Exception:  # noqa: BLE001
         return
     scope = cat.id if hasattr(cat, "id") else "agent"

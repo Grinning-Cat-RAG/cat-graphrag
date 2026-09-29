@@ -6,5 +6,5 @@
   "tags": "graph, neo4j, knowledge graph, entity extraction, vector indexes",
   "thumb": "https://raw.githubusercontent.com/matteocacciola/cat-graphrag/main/thumb.png",
   "version": "0.1.0",
-  "dependencies": ["base_plugin"]
+  "dependencies": ["base_plugin", "cat-efficient-ingestion"]
 }

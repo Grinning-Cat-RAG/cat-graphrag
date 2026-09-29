@@ -491,7 +491,7 @@ def test_gate_raises_when_pending_tasks():
 
 def test_gate_raises_when_gen_not_recorded():
     from .. import main
-    from cat.core_plugins.ingestion_status import registry
+    from cat.plugins.cat_efficient_ingestion import registry
 
     handler = _make_handler()
     cat = _FakeCat(handler)
@@ -511,7 +511,7 @@ def test_gate_raises_when_gen_not_recorded():
 
 def test_gate_passes_when_clean():
     from .. import main
-    from cat.core_plugins.ingestion_status import registry
+    from cat.plugins.cat_efficient_ingestion import registry
 
     handler = _make_handler()
     cat = _FakeCat(handler)
