@@ -11,7 +11,7 @@ from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
-from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
+from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -122,7 +122,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
-        enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
         concept_definitions: str | None = None,
@@ -149,7 +148,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
-        self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
@@ -224,7 +222,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
             "connection_pool_size": self._connection_pool_size,
-            "enable_derived_graph": self._enable_derived_graph,
         }
 
     def _is_valid_vector(self, vector: List[float]) -> bool:
@@ -1100,7 +1097,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return [r["name"] for r in records]
 
     async def save_dump(self, collection_name: str, folder: str = "dormouse/"):
-        log.info(f"Save dump not implemented, use neo4j-admin dump")
+        log.info("Save dump not implemented, use neo4j-admin dump")
         pass
 
     # ========== POINT METHODS ==========
@@ -1174,15 +1171,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # The embedding property is set ONLY when the vector is valid: a node
         # stored without `embedding_{gen}` is skipped by the vector index but
         # stays reachable via the graph (entity/relation recall, keywords).
-        create_query = f"""
-        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
-        CREATE (d:Document {{
+        create_query = """
+        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
+        CREATE (d:Document {
             id: $id,
             content: $content,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
-        }})
+        })
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
@@ -3006,13 +3003,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction (gated on the
-        # enable_knowledge_graph master switch, D1). Self-contained: when no
+        # 8 — LLM-based concept relation extraction (gated on
+        # enable_concept_relations; enable_knowledge_graph is display-only).
+        # Self-contained: when no
         # stray_cat is available (vector-db path via add_points_to_tenant — the
         # plugin hooks are unreliable under the multi-worker toggle race, so
         # they cannot be the trigger), the agent LLM is resolved directly from
         # the saved agent config via _resolve_agent_llm().
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        if self._enable_concept_relations:
             try:
                 if stray_cat is not None:
                     await self._extract_concept_relations(source, stored_points, stray_cat)
@@ -3507,11 +3505,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         OTHER generation. No re-ingest, no re-embed, no full wipe; every query
         is tenant-scoped and the walk is serialized by the write semaphore.
         """
-        if not (self._enable_knowledge_graph and self._enable_concept_relations):
+        if not self._enable_concept_relations:
             return
         tenant_id = self.agent_id
         if gen is None:
-            gen = self._concept_fingerprint()
+            gen = await self._concept_fingerprint()
 
         await self._ensure_connected()
         async with self._neo4j_write_semaphore:
@@ -4051,10 +4049,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     graph_retrieval_depth: int = Field(default=2, description="Max depth for graph traversal", ge=1, le=5)
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
 
-    enable_derived_graph: bool = Field(
-        default=False,
-        description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
-    )
     enable_concept_relations: bool = Field(
         default=False,
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
@@ -4087,7 +4081,11 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_knowledge_graph: bool = Field(
         default=False,
-        description="Enable the knowledge graph feature globally",
+        description=(
+            "Display-only flag for the frontend; it does not gate backend "
+            "concept writes or retrieval. Use enable_concept_relations to "
+            "control LLM concept/relation extraction."
+        ),
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
@@ -4107,8 +4105,14 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
 
     @classmethod
     def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        # Merge stored config with model defaults so new fields (e.g.
-        # enable_derived_graph) appear in existing saved configs.
+        # ``enable_derived_graph`` is a RETIRED toggle: the document-structure
+        # graph (SourceFile/PART_OF/NEXT/HAS_SUMMARY) is now always built. The
+        # key may still be present in a saved config, so accept and IGNORE it
+        # (drop it before validation) — it has no effect on any path.
+        config = dict(config)
+        config.pop("enable_derived_graph", None)
+        # Merge stored config with model defaults so new fields appear in
+        # existing saved configs.
         config = super().parse_config(config)
         return cls(**config).model_dump()
 

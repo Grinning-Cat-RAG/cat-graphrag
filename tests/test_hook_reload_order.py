@@ -224,16 +224,14 @@ def _make_package():
     return pkg
 
 
-def _make_handler(handler_mod, *, derived_graph: bool):
+def _make_handler(handler_mod):
     """Instantiate a handler of the CURRENT (post-reload) class and stub the
     parts the hook touches."""
     handler = handler_mod.GraphRAGHandler(
         neo4j_uri="bolt://fake",
         neo4j_user="u",
         neo4j_password="p",
-        enable_derived_graph=derived_graph,
     )
-    handler._enable_derived_graph = derived_graph
     handler.agent_id = "agent_reload_test"
     handler.create_derived_graph_for_source = AsyncMock()
     return handler
@@ -265,7 +263,7 @@ def test_hook_calls_derived_graph_after_reload_order():
     # The bug condition: main's module-level binding is the PRE-reload class.
     assert main.GraphRAGHandler is not handler_mod.GraphRAGHandler
 
-    handler = _make_handler(handler_mod, derived_graph=True)
+    handler = _make_handler(handler_mod)
     cat = types.SimpleNamespace(vector_memory_handler=handler)
 
     asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
@@ -273,20 +271,6 @@ def test_hook_calls_derived_graph_after_reload_order():
     handler.create_derived_graph_for_source.assert_awaited_once_with(
         "file.txt", [], cat
     )
-
-
-def test_hook_skips_when_derived_graph_disabled():
-    """The FX-1 gate (_enable_derived_graph) still holds after the lazy-import
-    fix."""
-    main = importlib.import_module(f"{PKG}.main")
-    handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
-
-    handler = _make_handler(handler_mod, derived_graph=False)
-    cat = types.SimpleNamespace(vector_memory_handler=handler)
-
-    asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
-
-    handler.create_derived_graph_for_source.assert_not_awaited()
 
 
 def test_hook_skips_non_graphrag_handler():
@@ -427,7 +411,6 @@ def main():
 
     tests = [
         test_hook_calls_derived_graph_after_reload_order,
-        test_hook_skips_when_derived_graph_disabled,
         test_hook_skips_non_graphrag_handler,
         test_settings_hook_schedules_recompute_after_reload_order,
         test_settings_hook_skips_when_no_concept_change,
