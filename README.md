@@ -208,6 +208,8 @@ python -m spacy download en_core_web_lg
 
 If the configured model is unavailable, the extractor attempts to fall back to `en_core_web_sm`.
 
+Only standard statistical spaCy pipelines (e.g. `en_core_web_sm/lg`, `it_core_news_lg`) are supported; `*_trf` transformer pipelines are not supported and `spacy-transformers` is not a dependency.
+
 ---
 
 ## Installation
