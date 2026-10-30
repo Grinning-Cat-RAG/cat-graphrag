@@ -138,8 +138,7 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
     handler = cat.vector_memory_handler
     if not isinstance(handler, _GH):
         return
-    # The document-structure graph is ALWAYS built; the retired
-    # ``enable_derived_graph`` toggle is accepted-but-ignored in saved configs.
+    # The document-structure graph is ALWAYS built.
     # The classic callback is the ONLY graph writer when the phase path is
     # inactive; when it is active the registered phases own the work, so this
     # fire-and-forget must be a NO-OP (otherwise the graph is built twice).

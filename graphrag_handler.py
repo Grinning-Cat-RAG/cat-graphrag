@@ -4319,12 +4319,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
 
     @classmethod
     def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        # ``enable_derived_graph`` is a RETIRED toggle: the document-structure
-        # graph (SourceFile/PART_OF/NEXT/HAS_SUMMARY) is now always built. The
-        # key may still be present in a saved config, so accept and IGNORE it
-        # (drop it before validation) — it has no effect on any path.
-        config = dict(config)
-        config.pop("enable_derived_graph", None)
         # Merge stored config with model defaults so new fields appear in
         # existing saved configs.
         config = super().parse_config(config)

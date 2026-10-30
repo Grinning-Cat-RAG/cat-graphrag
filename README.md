@@ -142,7 +142,7 @@ Writes are **generation-versioned**: every concept node/edge is tagged with the 
 
 Toggles and phase markers:
 
-- The document-structure graph (`:SourceFile`, `[:PART_OF]`, `[:NEXT]`, `[:HAS_SUMMARY]`) is **always built**. The `enable_derived_graph` key is retired: saved configs that still contain it are accepted and ignored, and nothing reads derived edges.
+- The document-structure graph (`:SourceFile`, `[:PART_OF]`, `[:NEXT]`, `[:HAS_SUMMARY]`) is **always built**.
 - **`enable_concept_relations`** is the only switch for the LLM concept/relation phase; with it off, that phase still completes but does no extraction. **`enable_knowledge_graph`** is display-only: the frontend UI uses it, but it does not gate any backend write or retrieval. **`enable_student_knowledge_graph`** is display-only as well. The spaCy phase independently honours `enable_entity_extraction`.
 - **`graph_llm_extraction` marker** — SHA-256 over the parsed `concept_definitions` + `relation_definitions` + whitespace-stripped `concept_relations_prompt` + the agent-level LLM identity (`<config class name>:<model>`) + `enable_concept_relations`. Display-only toggles are excluded because they cannot change the produced concepts.
 - **`graph_spacy_extraction` marker** — SHA-256 over the normalized `spacy_models` map + whitespace-stripped `extra_technology_patterns` + `enable_entity_extraction`.
