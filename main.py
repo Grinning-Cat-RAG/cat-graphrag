@@ -361,9 +361,8 @@ async def after_vector_memory_transfer_on_agent(success: bool, cat) -> None:
     only switch that leaves a stale GraphRAG store behind is
     GraphRAG -> non-GraphRAG, and in that case the current handler is not a
     ``GraphRAGHandler``. When the new handler IS GraphRAG
-    (non-graphrag -> graphrag) the revalidation sweep + the two graph
-    extraction phases (``graph_spacy_extraction`` and ``graph_llm_extraction``)
-    own graph computation, so nothing is wiped here. NEVER wipes when
+    (non-graphrag -> graphrag) the revalidation sweep + the ``graph_building``
+    phase own graph computation, so nothing is wiped here. NEVER wipes when
     ``success`` is False.
 
     A non-GraphRAG -> non-GraphRAG switch can also reach the wipe branch, but
