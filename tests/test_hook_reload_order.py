@@ -35,7 +35,7 @@ import sys
 import types
 from unittest.mock import AsyncMock
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = "catgraphrag_reload"
 
 
@@ -246,7 +246,7 @@ def _make_settings_handler(handler_mod, *, active_gen="gen_old", new_gen="gen_ne
         neo4j_password="p",
     )
     handler.agent_id = "agent_reload_test"
-    handler._concept_fingerprint = lambda: new_gen
+    handler._concept_fingerprint = AsyncMock(return_value=new_gen)
     handler._read_concept_gen = AsyncMock(return_value=active_gen)
     return handler
 
