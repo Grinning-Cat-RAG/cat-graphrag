@@ -20,6 +20,7 @@ loader imports recursively at activation. The ENTIRE body lives under
 
 if __name__ == "__main__":
     import asyncio
+    import os
     import sys
 
 

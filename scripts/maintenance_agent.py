@@ -28,7 +28,14 @@ Usage (inside the Cat container):
 Exit codes:
     0 = all agents/ops ok (and verify ok when --verify)
     1 = partial failure (some agent/op failed, or a --verify check failed)
-    2 = aborted (dry-run plan printed, or --yes missing for a destructive step)
+    2 = aborted (dry-run plan printed, --yes missing for a destructive step,
+        or an op needs the efficient ingestion plugin EffING and it is not
+        importable as ``cat.core_plugins.cat_efficient_ingestion``)
+
+``--reembed``, ``--reingest`` and ``--verify`` require the extracted EffING
+plugin (``reembed``/``registry`` modules). Its imports are lazy and guarded:
+when it is absent the CLI still starts (``--help`` works) and those ops abort
+with a clear message and exit code 2 instead of raising a traceback.
 
 Every op requires --yes: --reembed deletes the status docs per source,
 --reingest additionally deletes the source's points and re-ingests, and
@@ -46,7 +53,29 @@ import importlib.util
 import json
 import sys
 import types  # noqa: F401  (used by the --graph LLM part in a later todo)
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NoReturn, NotRequired, TypedDict
+
+_EFFING_MODULE = "cat.core_plugins.cat_efficient_ingestion"
+
+
+def _abort_missing_effing(exc: ImportError) -> NoReturn:
+    """Report the absent EffING dependency and abort (exit code 2, no traceback).
+
+    EffING was extracted to ``cat.core_plugins.cat_efficient_ingestion``; the
+    ops that drive its phase machine cannot run without it. Callers wrap their
+    lazy ``cat.core_plugins.cat_efficient_ingestion.*`` imports in
+    ``try/except ImportError`` and delegate here, so the module itself stays
+    import-safe and ``--help`` keeps working when the plugin is absent.
+    """
+    print(
+        "[maintenance] ABORTED: required optional dependency "
+        f"'{_EFFING_MODULE}' is not importable ({exc}). "
+        "--reembed, --reingest and --verify need the efficient ingestion "
+        "plugin (EffING); install/enable it and retry.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 
 # Destructive steps per op — what `--yes` confirms. `--reembed` deletes the
 # status docs per source (forces the embedding phase, Metis #9); `--reingest`
@@ -447,16 +476,15 @@ async def _bootstrap_agent(agent_id: str) -> tuple[object, object | None, str | 
 
     # GraphRAG detection: the vector-db setting entry named after the config
     # class (same semantics as main.py:137). The --graph op additionally
-    # requires enable_knowledge_graph AND enable_concept_relations (D1: the
-    # knowledge-graph flag is the master switch for LLM concept extraction);
-    # the per-op skip is decided in _run_agent.
+    # requires enable_concept_relations (the only concept-write gate;
+    # enable_knowledge_graph is display-only); the per-op skip is decided in
+    # _run_agent.
     from cat.db.cruds import settings as crud_settings
 
     entry = await crud_settings.get_setting_by_name(agent_id, "Neo4jGraphRAGConfig")
     handler._graphrag_detected = entry is not None
-    kg = bool((entry or {}).get("value", {}).get("enable_knowledge_graph", False))
     cr = bool((entry or {}).get("value", {}).get("enable_concept_relations", False))
-    handler._concept_relations_enabled = bool(kg and cr)
+    handler._concept_relations_enabled = cr
 
     return (ccat, handler, None)
 
@@ -500,8 +528,14 @@ async def _op_reembed(ccat, handler, collection: str) -> bool:
     (``detail=file-missing``, Metis #10). ``handler`` is accepted for signature
     symmetry with the other ops (todo 5+).
     """
-    from cat.plugins.cat_efficient_ingestion.reembed import reembed_sources
-    from cat.plugins.cat_efficient_ingestion.registry import delete_status, list_statuses
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
+        from cat.core_plugins.cat_efficient_ingestion.registry import (
+            delete_status,
+            list_statuses,
+        )
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
 
     agent_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -542,8 +576,11 @@ async def _op_reingest(ccat, handler, collection: str) -> bool:
     ``_source_from_entry``), so their points are NOT deleted by source name —
     each pass-through is logged (``detail=url-pass-through``).
     """
-    from cat.plugins.cat_efficient_ingestion.reembed import reembed_sources
-    from cat.plugins.cat_efficient_ingestion.registry import delete_status
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.reembed import reembed_sources
+        from cat.core_plugins.cat_efficient_ingestion.registry import delete_status
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
     from cat.utils import is_url
 
@@ -800,7 +837,7 @@ async def _op_graph_part_b(ccat, handler) -> bool:
     stray_duck = types.SimpleNamespace(large_language_model=ccat.large_language_model)
 
     for attempt in range(1, 4):
-        gen = handler._concept_fingerprint()
+        gen = await handler._concept_fingerprint()
         active = await handler._read_concept_gen(tenant_id)
         await handler.recompute_concept_relations(stray_duck, gen=gen)
         flipped = await handler._flip_concept_gen(
@@ -833,8 +870,7 @@ async def _run_agent(agent_id: str, ops: list[str], collection: str = "declarati
     concept relations with the latest-wins flip, ``_op_graph_part_b``). Skip
     reasons: ``handler-not-graphrag`` (no GraphRAG handler) and
     ``graphrag-not-enabled`` (the ``--graph`` op requires the
-    ``Neo4jGraphRAGConfig`` setting with ``enable_knowledge_graph`` AND
-    ``enable_concept_relations``).
+    ``Neo4jGraphRAGConfig`` setting with ``enable_concept_relations``).
     Returns True when every op succeeded or was skipped, False otherwise.
     """
     ccat, handler, reason = await _bootstrap_agent(agent_id)
@@ -911,7 +947,10 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
     Returns a list of ``(check_name, ok)`` tuples; the caller prints the
     ``result=verify-ok|verify-fail`` summary. Never destructive.
     """
-    from cat.plugins.cat_efficient_ingestion.registry import list_statuses
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.registry import list_statuses
+    except ImportError as exc:
+        _abort_missing_effing(exc)
     from cat.services.memory.models import VectorMemoryType
 
     tenant_id = getattr(ccat, "agent_key", None) or getattr(ccat, "_id", None)
@@ -972,7 +1011,7 @@ async def _verify_agent(ccat, handler, collection: str, gen: str | None = None) 
         "MATCH (c:Collection {tenant_id: $tenant_id}) "
         "RETURN c.concept_gen_active AS n LIMIT 1"
     )
-    checks.append(("concept-gen-active", active_gen == handler._concept_fingerprint()))
+    checks.append(("concept-gen-active", active_gen == await handler._concept_fingerprint()))
 
     # 5. no orphan entities (no MENTIONS/PROVENANCE) — count == 0.
     orphans = await _scalar(
