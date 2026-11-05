@@ -33,7 +33,20 @@ import re
 import sys
 import types
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The plugin folder name contains a dot/hyphen, so the scripts register the
+# repo root under this synthetic package and import the plugin modules from
+# it: a bare ``python tests/<file>.py`` run then resolves the same modules the
+# Cat loader would, without a relative import from ``__main__``.
+PKG = "catgraphrag_verstest"
+
+
+def _plugin(name):
+    import importlib
+
+    return importlib.import_module(f"{PKG}.{name}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +439,7 @@ class _FakeDriver:
 
 def _make_handler(graph):
     """Build a GraphRAGHandler wired to the fake graph."""
-    from .. import graphrag_handler
+    graphrag_handler = _plugin("graphrag_handler")
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -490,7 +503,7 @@ def test_versioned_names_suffixes():
 
 
 def test_ensure_version_probes_rebuilds_and_runs_once():
-    from .. import versioning
+    versioning = _plugin("versioning")
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"
@@ -515,7 +528,7 @@ def test_ensure_version_probes_rebuilds_and_runs_once():
 
 
 def test_retry_on_generation_change_reruns_whole_fn_once():
-    from .. import versioning
+    versioning = _plugin("versioning")
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"
@@ -590,7 +603,7 @@ def test_decorated_paths_use_plain_session_run_no_execute_write():
 
 
 def test_recall_tenant_memory_from_embedding_retries_whole_orchestration():
-    from .. import versioning
+    versioning = _plugin("versioning")
 
     graph = _FakeGraph()
     graph.epochs["agent_test"] = "v1"

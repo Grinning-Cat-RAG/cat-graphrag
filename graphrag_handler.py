@@ -11,7 +11,7 @@ from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
-from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
+from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -122,7 +122,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
-        enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
         concept_definitions: str | None = None,
@@ -149,7 +148,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
-        self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
@@ -224,13 +222,75 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
             "connection_pool_size": self._connection_pool_size,
-            "enable_derived_graph": self._enable_derived_graph,
         }
 
     def _is_valid_vector(self, vector: List[float]) -> bool:
         """Check if a vector has non-zero and finite L2-norm."""
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
+
+    @staticmethod
+    def _is_empty_mapping(vector) -> bool:
+        """Whether the point carries EffING's ``vector={}`` empty mapping.
+
+        The staging pass writes ``vector={}`` (a truthy-type but empty
+        ``dict``), NOT a numeric zero-norm vector: ``_store_empty_vectors``
+        builds ``PointStruct(..., vector={})``. The classic core never does
+        this — ``RabbitHole.store_documents`` always writes the list returned
+        by ``embedder.embed_documents`` (a zero-norm *list* on a fallback), and
+        the multimodal image hook either embeds the image or drops it. So an
+        empty mapping can only come from the two-phase machine.
+        """
+        return isinstance(vector, dict) and not vector
+
+    async def _is_empty_vector_staging_pass(
+        self, source: Optional[str], metadata: Dict | None, vector=None
+    ) -> bool:
+        """Whether this write belongs to EffING's empty-vector staging pass.
+
+        The efficient engine stores every chunk TWICE: once in the
+        ``parsing_chunking`` phase with ``vector={}`` (``_store_empty_vectors``)
+        and again in the ``embedding`` phase with real vectors (or
+        payload-only for images). Graph extraction is vector-independent, so
+        it must run on the second pass only.
+
+        The discriminator is the CONJUNCTION of two signals:
+
+        1. the point carries the empty mapping ``vector={}`` (see
+           :meth:`_is_empty_mapping`) — written ONLY by EffING's staging pass;
+           and
+        2. the source's recorded phase is ``parsing_chunking`` — EffING sets
+           it before ``_run_parsing_phase`` (``set_phase``), and its
+           ``embedding`` pass (which may legitimately still carry ``{}`` for a
+           payload-only image) is a different phase.
+
+        The ``resume_owner`` lease is deliberately NOT used: the host never
+        clears it on a terminal status (only ``resume_created``), and the core
+        ingestion rewrites ``phase=parsing_chunking`` for EVERY ingestion, so a
+        classic re-ingest after an EffING ingest inherited
+        ``resume_owner``+``parsing_chunking`` and the graph was silently
+        skipped. The empty mapping is an intrinsic property of the write and
+        cannot fire on the classic path (always a list, zero-norm included).
+
+        Vector VALIDITY is still not the discriminator: a legitimate
+        payload-only / zero-norm vector (list) MUST build the graph.
+
+        No status doc / no empty mapping (classic path, direct writes) means
+        "not a staging pass": build the graph, exactly as before.
+        """
+        if not source or not self._is_empty_mapping(vector):
+            return False
+        try:
+            from cat.core_plugins.cat_efficient_ingestion import registry
+
+            chat_id = (metadata or {}).get("chat_id")
+            scope = str(chat_id) if chat_id else "agent"
+            doc = await registry.get_status(self.agent_id, scope, source)
+        except Exception:  # noqa: BLE001 - never let the discriminator break a write
+            return False
+        if not doc:
+            return False
+        return doc.get("phase") == registry.PHASE_PARSING_CHUNKING
 
     @staticmethod
     def _next_generation(gen: str) -> str:
@@ -1100,7 +1160,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return [r["name"] for r in records]
 
     async def save_dump(self, collection_name: str, folder: str = "dormouse/"):
-        log.info(f"Save dump not implemented, use neo4j-admin dump")
+        log.info("Save dump not implemented, use neo4j-admin dump")
         pass
 
     # ========== POINT METHODS ==========
@@ -1112,6 +1172,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector: Iterable,
         metadata: Dict = None,
         id_point: str | None = None,
+        skip_graph: bool = False,
         **kwargs,
     ) -> PointStruct | None:
         """
@@ -1174,15 +1235,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # The embedding property is set ONLY when the vector is valid: a node
         # stored without `embedding_{gen}` is skipped by the vector index but
         # stays reachable via the graph (entity/relation recall, keywords).
-        create_query = f"""
-        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
-        CREATE (d:Document {{
+        create_query = """
+        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
+        CREATE (d:Document {
             id: $id,
             content: $content,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
-        }})
+        })
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
@@ -1220,8 +1281,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     embedding=vector_list,
                 )
 
-        # Start entity extraction in the background
-        if self._enable_entity_extraction and self._entity_extractor:
+        # Start entity extraction in the background — on every point EXCEPT the
+        # empty-vector staging pass. The efficient engine stores every chunk
+        # twice: first with EMPTY vectors (``_store_empty_vectors``, the
+        # parsing_chunking phase), then again with the real vectors after the
+        # embedding phase deletes and re-adds the points. Extraction is
+        # vector-independent, so without this gate it runs on BOTH passes and
+        # duplicates the whole NER/linking graph work per document.
+        #
+        # The gate is the PASS, not vector validity: a legitimate payload-only
+        # document (zero/empty vector, e.g. an image under a non-multimodal
+        # embedder) MUST still build the graph. ``skip_graph`` is set by
+        # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
+        # recorded ingestion phase); a direct/classic write defaults to False.
+        if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
             task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
@@ -1312,19 +1385,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 result[collection_name] = points
         return result
 
-    async def run_graph_building_phase(self, source: str, cat=None) -> Dict[str, Any]:
-        """Deterministic, awaited graph-building phase for one source (T22).
+    async def run_spacy_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited spaCy graph phase for one source (T5).
 
-        Runs the graph work the old ``after_rabbithole_stored_documents`` hook
-        fired-and-forgot, but inline and awaited:
+        The NER + link + similarity work the old ``after_rabbithole_stored_documents``
+        hook fired-and-forgot, but inline and awaited:
 
         1. joins the source's background NER/similarity tasks
            (``drain_source_tasks``);
-        2. re-runs ``_create_similarity_relationships`` for the source's
-           stored points (needs valid vectors — that is why the embedding
-           phase must precede);
-        3. runs the LLM concept-relations step (``_extract_concept_relations``)
-           for the source.
+        2. re-runs ``_extract_and_link_entities`` AWAITED for the source's
+           stored points (the NER + link that today runs in background);
+        3. re-runs ``_create_similarity_relationships`` for the source's
+           stored points with valid vectors (needs valid vectors — that is
+           why the embedding phase must precede).
 
         Returns ``{"status": "done"}`` on success and
         ``{"status": "not_ready", "retry_after": <s>}`` when the source's
@@ -1346,7 +1419,46 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if vector and self._is_valid_vector(vector):
                     await self._create_similarity_relationships(p.id, vector, collection_name)
 
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        # NER + link, awaited (mirrors the background spawner's guard).
+        if self._enable_entity_extraction and self._entity_extractor:
+            for p in all_points:
+                payload = getattr(p, "payload", None) or {}
+                content = payload.get("page_content", "")
+                if content:
+                    await self._extract_and_link_entities(
+                        p.id, content, payload.get("metadata", {})
+                    )
+
+        return {"status": "done"}
+
+    async def run_llm_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited LLM graph phase for one source (T5).
+
+        Runs ONLY the LLM concept-relations step (``_extract_concept_relations``)
+        for the source's stored points, gated on ``_enable_concept_relations``.
+        ``enable_knowledge_graph`` is display-only (UI) and does not gate.
+        Independent from the spaCy phase:
+        it consumes ONLY the stored chunks + LLM + definitions/prompt, NOT the
+        spaCy entities, so it can run in any order relative to
+        ``run_spacy_extraction_phase``.
+
+        Returns ``{"status": "done"}`` on success and
+        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
+        points are not yet in the store. Exceptions propagate (the core maps
+        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
+        so re-running after a retry never duplicates data.
+        """
+        await self.drain_source_tasks(source)
+
+        by_collection = await self.get_source_points_by_collection(source)
+        if not by_collection:
+            return {"status": "not_ready", "retry_after": 5}
+
+        all_points: List[Record] = []
+        for collection_name, points in by_collection.items():
+            all_points.extend(points)
+
+        if self._enable_concept_relations:
             await self._extract_concept_relations(source, all_points, stray_cat=cat)
 
         return {"status": "done"}
@@ -2096,16 +2208,42 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         await self._ensure_connected()
 
         operation_id = random.randint(1, 100000)
+
+        # Discriminate the EMPTY-VECTOR STAGING PASS, not vector validity.
+        # The staging pass (``parsing_chunking``) writes every point with the
+        # empty mapping ``vector={}`` and must not build any graph; the
+        # ``embedding`` pass writes the same points with real vectors OR
+        # payload-only and owns the graph. The phase read is cached per source
+        # (one registry read per unique source/chat scope, not per point); the
+        # empty-mapping signal is per point and cannot appear on the classic
+        # path (see ``_is_empty_mapping``), so a stale ``resume_owner`` lease
+        # can never turn a classic re-ingest into a false staging pass.
+        staging_cache: Dict[tuple, bool] = {}
+        staging_flags: List[bool] = []
         for point in points:
+            meta = (point.payload or {}).get("metadata", {}) or {}
+            key = (meta.get("source"), meta.get("chat_id"), self._is_empty_mapping(point.vector))
+            if key not in staging_cache:
+                staging_cache[key] = await self._is_empty_vector_staging_pass(
+                    meta.get("source"), meta, point.vector
+                )
+            staging_flags.append(staging_cache[key])
+
+        for point, is_staging in zip(points, staging_flags):
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
+                skip_graph=is_staging,
             )
 
-        if self._enable_derived_graph:
+        # Derived graph (SourceFile / NEXT / Section / ... and, in step 8, the
+        # LLM concept-relation extraction) follows the SAME pass discriminator:
+        # skipped only when the whole batch is the empty-vector staging pass.
+        batch_is_staging = bool(points) and all(staging_flags)
+        if not batch_is_staging:
             sources: Dict[str, List[PointStruct]] = {}
             for p in points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
@@ -2457,7 +2595,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         active_gen = await self._read_concept_gen(self.agent_id)
         if active_gen is None:
-            active_gen = self._concept_fingerprint()
+            active_gen = await self._concept_fingerprint()
         return await self._run_cached(
             f"recall_entity_related:{depth}",
             self._generation,
@@ -2833,10 +2971,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         profiles gracefully — only creates structure that the available metadata
         supports.
 
-        Always created (require only source; chunk_index is used when present,
-        otherwise derived from the arrival order of the points):
+        Always created (require only source; ordering uses start_index when the
+        chunker provides it, falling back to chunk_index, and finally to the
+        arrival order of the points):
           - :SourceFile node + [:PART_OF] from each document
-          - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
+          - [:NEXT] edges between consecutive chunks (ordered by start_index,
+            then chunk_index)
 
         Created when chunker provides rich metadata:
           - :Section / :Paragraph labels on documents with chunk_level
@@ -2864,6 +3004,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": ci,
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -2882,6 +3023,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": len(regular_points),
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -2889,7 +3031,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if not regular_points:
                 return
 
-        regular_points.sort(key=lambda x: x["chunk_index"])
+        regular_points.sort(
+            key=lambda x: x["start_index"]
+            if x.get("start_index") is not None
+            else x["chunk_index"]
+        )
         point_ids = [rp["id"] for rp in regular_points]
 
         async with self._get_session() as session:
@@ -3006,13 +3152,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction (gated on the
-        # enable_knowledge_graph master switch, D1). Self-contained: when no
+        # 8 — LLM-based concept relation extraction (gated on
+        # enable_concept_relations; enable_knowledge_graph is display-only).
+        # Self-contained: when no
         # stray_cat is available (vector-db path via add_points_to_tenant — the
         # plugin hooks are unreliable under the multi-worker toggle race, so
         # they cannot be the trigger), the agent LLM is resolved directly from
         # the saved agent config via _resolve_agent_llm().
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        if self._enable_concept_relations:
             try:
                 if stray_cat is not None:
                     await self._extract_concept_relations(source, stored_points, stray_cat)
@@ -3139,7 +3286,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             relations,
             source=source,
             document_ids=document_ids,
-            concept_gen=gen or self._concept_fingerprint(),
+            concept_gen=gen or await self._concept_fingerprint(),
         )
         log.info(
             f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
@@ -3322,20 +3469,85 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
 
-    def _concept_fingerprint(self) -> str:
+    def _spacy_fingerprint(self) -> str:
+        """Stable SHA-256 fingerprint of the effective spaCy extraction config.
+
+        Normalizes the model map (``sort_keys=True``) and the whitespace-
+        stripped technology terminology (``extra_technology_patterns``), so
+        cosmetic edits (line order, indentation, trailing whitespace) do NOT
+        produce a spurious generation change — mirroring
+        ``_concept_fingerprint``. ``enable_entity_extraction`` is included
+        because it gates the per-point extraction (turning it off leaves no
+        spaCy entities at all), so it is material for the phase. The resulting
+        token is the material marker for the ``graph_spacy_extraction`` phase.
+        """
+        payload = (
+            "MODELS:" + json.dumps(self._spacy_models, sort_keys=True)
+            + "|PATTERNS:"
+            + json.dumps(
+                [p.strip() for p in (self._extra_technology_patterns or [])],
+                sort_keys=True,
+            )
+            + "|ENTITY_EXTRACTION:"
+            + json.dumps(bool(self._enable_entity_extraction))
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _resolve_agent_llm_identity(self) -> str:
+        """Stable, secret-free identifier of the agent's configured LLM.
+
+        Resolved the same way the extraction phase resolves its LLM: the
+        agent-scoped ``llm`` service setting (``ServiceProvider`` /
+        ``_resolve_agent_llm`` read the same category). The identifier is
+        ``<config class name>:<model>`` — never a client object and never
+        credentials; a missing/default/dumb LLM collapses to a stable sentinel
+        so the fingerprint stays deterministic. Cached per handler instance.
+        """
+        cached = getattr(self, "_llm_identity", None)
+        if cached is not None:
+            return cached
+
+        identity = "none"
+        agent_id = getattr(self, "agent_id", None)
+        if agent_id:
+            try:
+                # lazy import (plugin import-safe rule)
+                from cat.db.cruds import settings as crud_settings
+
+                saved = await crud_settings.get_settings_by_category(agent_id, "llm")
+                if saved:
+                    name = str(saved.get("name") or "")
+                    value = saved.get("value") or {}
+                    model = value.get("model") if isinstance(value, dict) else None
+                    if name and name != "LLMDefaultConfig":
+                        identity = f"{name}:{model or ''}"
+                    else:
+                        identity = "default"
+            except Exception:  # noqa: BLE001
+                identity = "unknown"
+
+        self._llm_identity = identity
+        return identity
+
+    async def _concept_fingerprint(self) -> str:
         """Stable SHA-256 fingerprint of the effective concept-relations config.
 
-        Normalizes the PARSED definition dicts (``sort_keys=True``) and the
-        whitespace-stripped prompt, so cosmetic edits (line order, indentation,
-        trailing whitespace) do NOT produce a spurious generation change. The
-        resulting token tags every concept node/edge written by
-        ``_store_concept_relations`` (the ``concept_gen`` property) and is what
-        the save-trigger recompute (todo 12) flips to.
+        Normalizes the PARSED definition dicts (``sort_keys=True``), the
+        whitespace-stripped prompt, the agent-level LLM identity and the
+        ``enable_concept_relations`` toggle, so cosmetic edits do NOT produce a
+        spurious generation change. The LLM identity is material because it
+        actually produces the concepts; the toggle is material because it
+        gates the whole extraction. The resulting token tags every concept
+        node/edge written by ``_store_concept_relations`` (the ``concept_gen``
+        property) and is what the save-trigger recompute (todo 12) flips to.
         """
         payload = (
             "CONCEPT:" + json.dumps(self._concept_definitions, sort_keys=True)
             + "|REL:" + json.dumps(self._relation_definitions, sort_keys=True)
             + "|PROMPT:" + (self._concept_relations_prompt or "").strip()
+            + "|LLM:" + await self._resolve_agent_llm_identity()
+            + "|CONCEPT_RELATIONS:"
+            + json.dumps(bool(self._enable_concept_relations))
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -3507,11 +3719,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         OTHER generation. No re-ingest, no re-embed, no full wipe; every query
         is tenant-scoped and the walk is serialized by the write semaphore.
         """
-        if not (self._enable_knowledge_graph and self._enable_concept_relations):
+        if not self._enable_concept_relations:
             return
         tenant_id = self.agent_id
         if gen is None:
-            gen = self._concept_fingerprint()
+            gen = await self._concept_fingerprint()
 
         await self._ensure_connected()
         async with self._neo4j_write_semaphore:
@@ -4051,10 +4263,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     graph_retrieval_depth: int = Field(default=2, description="Max depth for graph traversal", ge=1, le=5)
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
 
-    enable_derived_graph: bool = Field(
-        default=False,
-        description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
-    )
     enable_concept_relations: bool = Field(
         default=False,
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
@@ -4087,7 +4295,11 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_knowledge_graph: bool = Field(
         default=False,
-        description="Enable the knowledge graph feature globally",
+        description=(
+            "Display-only flag for the frontend; it does not gate backend "
+            "concept writes or retrieval. Use enable_concept_relations to "
+            "control LLM concept/relation extraction."
+        ),
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
@@ -4107,8 +4319,8 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
 
     @classmethod
     def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        # Merge stored config with model defaults so new fields (e.g.
-        # enable_derived_graph) appear in existing saved configs.
+        # Merge stored config with model defaults so new fields appear in
+        # existing saved configs.
         config = super().parse_config(config)
         return cls(**config).model_dump()
 

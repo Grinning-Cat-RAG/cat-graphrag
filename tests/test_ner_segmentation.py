@@ -33,7 +33,20 @@ import sys
 import types
 from contextlib import contextmanager
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The plugin folder name contains a dot/hyphen, so the scripts register the
+# repo root under this synthetic package and import the plugin modules from
+# it: a bare ``python tests/<file>.py`` run then resolves the same modules the
+# Cat loader would, without a relative import from ``__main__``.
+PKG = "cat_graphrag_segtest"
+
+
+def _plugin(name):
+    import importlib
+
+    return importlib.import_module(f"{PKG}.{name}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +468,11 @@ if __name__ == "__main__":
     _pkg.__path__ = [REPO_ROOT]
     sys.modules["cat_graphrag_segtest"] = _pkg
 
-    from .. import entity_extractor  # noqa: E402
-    from ..constants import SPACY_PIPE_BATCH_SIZE  # noqa: E402
-    from ..entity_extractor import EntityExtractor, _segment_text  # noqa: E402
-    from ..models import EntityType, ExtractedEntity  # noqa: E402
+    entity_extractor = _plugin("entity_extractor")  # noqa: E402
+    SPACY_PIPE_BATCH_SIZE = _plugin("constants").SPACY_PIPE_BATCH_SIZE  # noqa: E402
+    _ee = _plugin("entity_extractor")
+    EntityExtractor, _segment_text = _ee.EntityExtractor, _ee._segment_text  # noqa: E402
+    _models = _plugin("models")
+    EntityType, ExtractedEntity = _models.EntityType, _models.ExtractedEntity  # noqa: E402
 
     main()

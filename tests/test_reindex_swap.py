@@ -31,7 +31,19 @@ import sys
 import types
 from contextlib import asynccontextmanager
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The plugin folder name contains a dot/hyphen, so the scripts register the
+# repo root under this synthetic package and import the plugin modules from it
+# (no relative import from ``__main__``).
+PKG = "catgraphrag_swaptest"
+
+
+def _plugin(name):
+    import importlib
+
+    return importlib.import_module(f"{PKG}.{name}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +445,7 @@ class _FakeEmbedder:
 
 def _make_handler(graph):
     """Build a GraphRAGHandler wired to the fake graph."""
-    from .. import graphrag_handler
+    graphrag_handler = _plugin("graphrag_handler")
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",

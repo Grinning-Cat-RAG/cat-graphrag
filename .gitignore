@@ -213,3 +213,7 @@ marimo/_lsp/
 __marimo__/
 
 .idea
+
+# runtime artifacts written by the plugin loader
+.requirements_hash
+.install.lock

@@ -30,7 +30,20 @@ import os
 import sys
 import types
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The plugin folder name contains a dot/hyphen, so the scripts register the
+# repo root under this synthetic package and import the plugin modules from
+# it: a bare ``python tests/<file>.py`` run then resolves the same modules the
+# Cat loader would, without a relative import from ``__main__``.
+PKG = "catgraphrag_tertest"
+
+
+def _plugin(name):
+    import importlib
+
+    return importlib.import_module(f"{PKG}.{name}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +439,7 @@ class _FakeDriver:
 
 def _make_handler(graph, patterns):
     """Build a GraphRAGHandler wired to the fake graph with the given patterns."""
-    from .. import graphrag_handler
+    graphrag_handler = _plugin("graphrag_handler")
 
     handler = graphrag_handler.GraphRAGHandler(
         neo4j_uri="bolt://fake",
@@ -441,8 +454,8 @@ def _make_handler(graph, patterns):
 
 def _hash(term, tenant="agent_test"):
     """Entity hash for a TECHNOLOGY term (mirrors EntityExtractor.get_entity_hash)."""
-    from .. import entity_extractor
-    from ..models import EntityType
+    entity_extractor = _plugin("entity_extractor")
+    EntityType = _plugin("models").EntityType
 
     return entity_extractor.EntityExtractor.get_entity_hash(
         term, EntityType.TECHNOLOGY, tenant
@@ -455,7 +468,7 @@ def _hash(term, tenant="agent_test"):
 
 
 def test_hook_ignores_other_vector_databases():
-    from .. import main as main_mod
+    main_mod = _plugin("main")
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -477,7 +490,7 @@ def test_hook_ignores_other_vector_databases():
 
 
 def test_hook_ignores_unchanged_patterns():
-    from .. import main as main_mod
+    main_mod = _plugin("main")
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [r"\b(MyTool)\b"])
@@ -502,7 +515,7 @@ def test_hook_ignores_unchanged_patterns():
 
 
 def test_hook_rebuilds_extractor_on_pattern_change():
-    from .. import main as main_mod
+    main_mod = _plugin("main")
 
     graph = _FakeGraph()
     handler = _make_handler(graph, [])
