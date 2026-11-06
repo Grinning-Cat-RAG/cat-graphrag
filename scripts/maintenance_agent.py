@@ -1406,17 +1406,19 @@ async def _graph_walk_batch(handler, batch: list[dict[str, Any]], collection: st
 async def _graph_phase_ids(ccat) -> list[str]:
     """The graph phases THIS plugin registers with EffING (never hardcoded).
 
-    Reads the same ``ingestion_phase_specs`` accumulator the plugin registers
-    at activation, so adding/renaming a graph phase updates the ``--graph``
-    invalidation automatically. Returns ``[]`` when the plugin module (or
-    EffING) is unavailable.
+    Reads the plugin's own ``graph_phase_specs()`` (the declarations behind
+    the ``ingestion_phase_specs`` hook), so adding/renaming a graph phase
+    updates the ``--graph`` invalidation automatically. Unlike the hook, it is
+    not gated on EffING being active for the agent: entries written while it
+    was active must be dropped even if it is off now. Returns ``[]`` when the
+    plugin module (or EffING) is unavailable.
     """
     plugin_id = _resolve_plugin_id()
     if plugin_id is None:
         return []
     try:
         plugin_main = importlib.import_module(f"cat.plugins.{plugin_id}.main")
-        specs = plugin_main.ingestion_phase_specs([], ccat)
+        specs = plugin_main.graph_phase_specs()
     except Exception:  # noqa: BLE001 - invalidation must not abort the wipe
         return []
     return [spec.id for spec in specs if getattr(spec, "id", None)]

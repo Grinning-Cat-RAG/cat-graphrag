@@ -212,56 +212,124 @@ async def _resolved_system_ingestion_config_name(cat) -> "str | None":
     return (saved or {}).get("name")
 
 
+#: Plugin id of EffING. It is installed as a regular plugin under
+#: ``cat/plugins``, so it can be active on some agents and off on others.
+_EFFICIENT_INGESTION_PLUGIN_ID = "cat_efficient_ingestion"
+
+#: Last system ingestion engine name read successfully (process-wide: the
+#: setting is system-level). Reused when a later read fails.
+_LAST_ENGINE_NAME: Dict[str, Any] = {}
+
+
+def _effing_active_on(manager) -> bool:
+    """Whether EffING is among the ACTIVE plugins of ``manager``.
+
+    Installed is not enough: a plugin under ``cat/plugins`` runs its hooks only
+    on the managers it was activated on. A missing manager counts as inactive.
+    """
+    active = getattr(manager, "active_plugins", None)
+    return isinstance(active, (list, tuple, set)) and _EFFICIENT_INGESTION_PLUGIN_ID in active
+
+
 async def _phase_path_active(cat) -> bool:
-    """Whether the EffING phase path owns graph building for this ingest.
+    """Whether the EffING phase path owns graph building for this agent.
 
-    Single source of truth for the two ingestion modes. The phase path is
-    active **iff**:
+    Single source of truth for the two ingestion modes: it decides both which
+    mechanism writes the graph (``after_rabbithole_stored_documents``) and
+    whether the two graph phases are registered with EffING
+    (``ingestion_phase_specs`` / ``ingestion_phase_objects``), so the two can
+    never run together for the same agent. The phase path is active **iff**
+    all three hold:
 
-    ==========================  ======================  =============
-    EffING installed/loadable   SYSTEM ``ingestion``    phase path
-    ==========================  ======================  =============
-    no                          core engine             inactive
-    no                          efficient engine        inactive (WARNING logged)
-    yes                         core engine             inactive
-    yes                         efficient engine        active
-    ==========================  ======================  =============
+    - the SYSTEM-level ``ingestion`` engine is ``EfficientIngestionConfiguration``;
+    - EffING is active on the system plugin manager (``cat.lizard``), where the
+      core resolves the ingestion engine — otherwise the core falls back to
+      its own engine, which runs no phases;
+    - EffING is active on THIS agent's plugin manager;
+    - ``cat.plugins.cat_efficient_ingestion.phases`` can be imported (else the
+      phases cannot be registered; logged as a WARNING).
 
-    In every other case the classic path runs (``after_rabbithole_stored_documents``
-    -> ``create_derived_graph_for_source``). The phase hooks are still REGISTERED
-    whenever EffING is importable; this helper only decides which mechanism
-    writes the graph, so the two can never run together and neither is dead.
+    Otherwise the classic path runs for this agent. EffING being off on some
+    agents is a normal setup, so it is not logged as a warning. If reading the
+    engine fails, the last successfully read engine is reused; with none read
+    yet, the classic path runs.
     """
     try:
         name = await _resolved_system_ingestion_config_name(cat)
+        _LAST_ENGINE_NAME["name"] = name
     except Exception as exc:  # noqa: BLE001
+        if "name" not in _LAST_ENGINE_NAME:
+            log.warning(
+                f"[GraphRAG] Could not resolve the system ingestion engine "
+                f"({exc!r}); using the classic path."
+            )
+            return False
+        # EffING probes the registration hooks many times per ingestion: a
+        # transient read error must not drop the graph phases mid-way.
+        name = _LAST_ENGINE_NAME["name"]
         log.warning(
             f"[GraphRAG] Could not resolve the system ingestion engine "
-            f"({exc!r}); using the classic path."
+            f"({exc!r}); using the last known one ({name!r})."
         )
-        return False
 
     if name != _EFFICIENT_INGESTION_CONFIG_NAME:
         return False
 
+    lizard = getattr(cat, "lizard", None)
+    if not _effing_active_on(getattr(lizard, "plugin_manager", None)):
+        log.debug(
+            "[GraphRAG] Efficient ingestion engine selected but EffING is not "
+            "active on the system plugin manager; using the classic path."
+        )
+        return False
+    if not _effing_active_on(getattr(cat, "plugin_manager", None)):
+        log.debug(
+            f"[GraphRAG] EffING is not active for agent "
+            f"{getattr(cat, 'agent_key', '?')!r}; using the classic path."
+        )
+        return False
     try:
-        import cat.plugins.cat_efficient_ingestion  # noqa: F401
+        import cat.plugins.cat_efficient_ingestion.phases  # noqa: F401
     except Exception as exc:  # noqa: BLE001
-        # The efficient engine is selected but its plugin is not importable
-        # under the expected id: the graph phases are not registered either,
-        # so say it instead of degrading silently.
+        # Active but not importable under the expected path: the graph phases
+        # cannot be registered, so the classic path must build the graph.
         log.warning(
-            f"[GraphRAG] System ingestion engine is {name} but "
-            f"'cat.plugins.cat_efficient_ingestion' is not importable "
+            f"[GraphRAG] EffING is active but "
+            f"'cat.plugins.cat_efficient_ingestion' cannot be imported "
             f"({exc!r}); using the classic path."
         )
         return False
-
     return True
 
 
+def graph_phase_specs() -> list:
+    """The two graph ``PhaseSpec`` declarations, regardless of any gate.
+
+    ``[]`` when EffING's ``PhaseSpec`` cannot be imported. The registration
+    hook adds them only where the phase path is active; the maintenance CLI
+    reads them unconditionally (its ``--graph`` invalidation must drop diary
+    entries written while EffING was active, even if it is off now).
+    """
+    try:
+        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
+    except ImportError:
+        return []
+    return [
+        PhaseSpec(
+            "graph_spacy_extraction",
+            settings_category=None,
+            depends_on=("parsing_chunking", "embedding"),
+        ),
+        PhaseSpec(
+            "graph_llm_extraction",
+            settings_category=None,
+            depends_on=("parsing_chunking", "embedding"),
+        ),
+    ]
+
+
 @hook(priority=10)
-def ingestion_phase_specs(specs, cat) -> list:
+async def ingestion_phase_specs(specs, cat) -> list:
     """Register the two graph phases with the EffING phase machine (T5).
 
     ACCUMULATOR convention: EffING threads ``specs`` through every registrant
@@ -269,29 +337,13 @@ def ingestion_phase_specs(specs, cat) -> list:
     the material marker IS the settings fingerprint (``_spacy_fingerprint`` /
     ``_concept_fingerprint``), so the settings fast-path is skipped. Both
     phases depend on ``parsing_chunking`` + ``embedding`` (the graph work
-    needs the stored chunks AND valid vectors). Lazy import (FX-9 style) in a
-    try/except keeps this module import-safe when EffING is not deployed.
+    needs the stored chunks AND valid vectors). Abstains (accumulator returned
+    unchanged) where ``_phase_path_active`` is False — e.g. EffING off for
+    this agent — because there the classic callback builds the graph.
     """
-    try:
-        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
-    except ImportError:
-        PhaseSpec = None
-    if PhaseSpec is None:
+    if not await _phase_path_active(cat):
         return specs
-    specs.append(
-        PhaseSpec(
-            "graph_spacy_extraction",
-            settings_category=None,
-            depends_on=("parsing_chunking", "embedding"),
-        )
-    )
-    specs.append(
-        PhaseSpec(
-            "graph_llm_extraction",
-            settings_category=None,
-            depends_on=("parsing_chunking", "embedding"),
-        )
-    )
+    specs.extend(graph_phase_specs())
     return specs
 
 
@@ -305,7 +357,7 @@ def _phases_module():
 
 
 @hook(priority=10)
-def ingestion_phase_objects(cat=None) -> list:
+async def ingestion_phase_objects(cat=None) -> list:
     """Contribute the two graph phases as ``IngestionPhase`` instances.
 
     Class path (phase-contract v2): EffING merges these instances BEFORE the
@@ -315,8 +367,12 @@ def ingestion_phase_objects(cat=None) -> list:
     as the compatibility adapter and for hosts that still call them directly.
     Lazy import keeps ``main.py`` import-safe when the class module is
     unavailable, and returns an empty list so the legacy specs remain the
-    fallback (never a crash at activation).
+    fallback (never a crash at activation). Returns ``[]`` too where
+    ``_phase_path_active`` is False (e.g. EffING off for this agent): there
+    the classic callback builds the graph, so EffING must not run the phases.
     """
+    if cat is None or not await _phase_path_active(cat):
+        return []
     phases = _phases_module()
     if phases is None:
         return []

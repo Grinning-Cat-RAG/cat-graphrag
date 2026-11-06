@@ -9,8 +9,9 @@ helpers they drive (``run_spacy_extraction_phase``,
 - ``ingestion_phase_specs`` appends the two PhaseSpecs
   (``graph_spacy_extraction`` / ``graph_llm_extraction``, both depending on
   ``parsing_chunking`` + ``embedding``, ``settings_category=None``) and
-  returns the accumulator unchanged when EffING is not importable OR when
-  the ``phases`` import itself raises (T7);
+  returns the accumulator unchanged when EffING is not importable, when the
+  ``phases`` import itself raises (T7) or when EffING is not active for the
+  agent; the maintenance CLI reads the phase ids without that gate;
 - ``ingestion_phase_settings_marker`` returns ``_spacy_fingerprint`` for
   ``graph_spacy_extraction``, ``_concept_fingerprint`` for
   ``graph_llm_extraction``, None otherwise;
@@ -28,9 +29,11 @@ helpers they drive (``run_spacy_extraction_phase``,
 - ``after_rabbithole_stored_documents`` is a NO-OP when the phase path is
   active and keeps the classic ``create_derived_graph_for_source`` behavior
   otherwise;
-- ``_phase_path_active`` is True exactly when EffING is importable AND the
-  SYSTEM-level ``ingestion`` selection resolves to the efficient engine
-  (truth table: uninstalled / installed-core-engine / installed-efficient);
+- ``_phase_path_active`` is True exactly when the SYSTEM-level ``ingestion``
+  selection is the efficient engine AND EffING is active on the system
+  plugin manager AND on the agent's one; where it is False the graph phases
+  are not registered (``ingestion_phase_specs`` / ``ingestion_phase_objects``
+  abstain) and the classic callback builds the graph;
 - the spaCy entity batch write keeps ``REMOVE e.concept_gen,
   e.concept_gen_active`` — the shared Entity-node contract stays internal
   to the plugin (T7 shared-schema guard);
@@ -139,7 +142,10 @@ def _install_cat_stub():
     ingestion_factory = types.ModuleType("cat.services.factory.ingestion")
 
     async def resolved_config_name(lizard):
-        return _RESOLVED_INGESTION["name"]
+        name = _RESOLVED_INGESTION["name"]
+        if isinstance(name, Exception):  # simulate a failed settings read
+            raise name
+        return name
 
     ingestion_factory.resolved_config_name = resolved_config_name
     sys.modules["cat.services.factory.ingestion"] = ingestion_factory
@@ -243,8 +249,9 @@ def _install_effing_stub():
     """Stub the EffING phase-machine contract the hooks import lazily.
 
     ``PhaseSpec`` is a recording fake (id / settings_category / depends_on);
-    ``cat.plugins.cat_efficient_ingestion`` importable is one half of the
-    ``_phase_path_active`` gate (the other is the system ingestion selection).
+    ``cat.plugins.cat_efficient_ingestion.phases`` importable is one of the
+    ``_phase_path_active`` conditions (with the system ingestion selection and
+    EffING being active on the system and agent plugin managers).
     """
     plugins = types.ModuleType("cat.plugins")
     plugins.__path__ = []
@@ -281,12 +288,30 @@ def _install_stubs():
 # ---------------------------------------------------------------------------
 
 
-class _FakeCat:
-    """Minimal stand-in for CheshireCat: no ``id`` (agent-scoped), handler set."""
+_EFFING_ID = "cat_efficient_ingestion"
 
-    def __init__(self, handler):
+
+class _FakeManager:
+    """Plugin manager stand-in: only ``active_plugins`` is read by the gate."""
+
+    def __init__(self, active):
+        self.active_plugins = list(active)
+
+
+class _FakeCat:
+    """Minimal stand-in for CheshireCat: no ``id`` (agent-scoped), handler set.
+
+    EffING is active on both the agent's and the system (lizard) plugin
+    manager unless told otherwise.
+    """
+
+    def __init__(self, handler, agent_effing=True, system_effing=True):
         self.vector_memory_handler = handler
         self.agent_key = "agent_test"
+        self.plugin_manager = _FakeManager([_EFFING_ID] if agent_effing else [])
+        self.lizard = types.SimpleNamespace(
+            plugin_manager=_FakeManager([_EFFING_ID] if system_effing else [])
+        )
 
 
 class _FakePoint:
@@ -325,7 +350,7 @@ def test_specs_registers_two_graph_phases():
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    specs = main.ingestion_phase_specs([], cat)
+    specs = asyncio.run(main.ingestion_phase_specs([], cat))
     assert len(specs) == 2, f"expected two PhaseSpecs, got {specs}"
     by_id = {s.id: s for s in specs}
     assert set(by_id) == {"graph_spacy_extraction", "graph_llm_extraction"}, (
@@ -346,7 +371,7 @@ def test_specs_preserves_prior_accumulator_entries():
     handler = _make_handler()
     cat = _FakeCat(handler)
     accumulator = [object()]  # opaque prior entry from another plugin
-    specs = main.ingestion_phase_specs(accumulator, cat)
+    specs = asyncio.run(main.ingestion_phase_specs(accumulator, cat))
     assert specs[0] is accumulator[0], "prior accumulator entries must be preserved"
     assert len(specs) == 3, f"got {len(specs)}"
 
@@ -360,13 +385,61 @@ def test_specs_returns_accumulator_when_effing_absent():
     saved_phases = sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
     try:
         accumulator = [object()]
-        specs = main.ingestion_phase_specs(accumulator, cat)
+        specs = asyncio.run(main.ingestion_phase_specs(accumulator, cat))
         assert specs is accumulator, "must return the accumulator unchanged when EffING is absent"
     finally:
         if saved is not None:
             sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
         if saved_phases is not None:
             sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved_phases
+
+
+def test_specs_abstain_when_effing_not_active_for_agent():
+    """EffING installed and selected, but NOT active on this agent: the graph
+    phases must not be registered for it, otherwise EffING would run them
+    while the classic callback also builds the graph."""
+    from catgraphrag_phase import main
+
+    cat = _FakeCat(_make_handler(), agent_effing=False)
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    accumulator = [object()]
+    specs = asyncio.run(main.ingestion_phase_specs(accumulator, cat))
+    assert specs is accumulator and len(specs) == 1, f"got {specs}"
+
+
+def test_objects_abstain_when_effing_not_active_for_agent():
+    from catgraphrag_phase import main
+
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    active = asyncio.run(main.ingestion_phase_objects(cat=_FakeCat(_make_handler())))
+    assert [p.id for p in active] == ["graph_spacy_extraction", "graph_llm_extraction"], active
+    inactive = asyncio.run(
+        main.ingestion_phase_objects(cat=_FakeCat(_make_handler(), agent_effing=False))
+    )
+    assert inactive == [], f"got {inactive}"
+    assert asyncio.run(main.ingestion_phase_objects(cat=None)) == []
+
+
+def test_cli_graph_phase_ids_ignore_agent_gate():
+    """The maintenance CLI's ``--graph`` invalidation needs the graph phase ids
+    even for an agent where EffING is off now: diary entries written while it
+    was on must still be dropped after a wipe."""
+    import importlib
+    import importlib.util
+    from catgraphrag_phase import main
+
+    spec = importlib.util.spec_from_file_location(
+        "graphrag_maintenance_cli_gate",
+        os.path.join(REPO_ROOT, "scripts", "maintenance_agent.py"),
+    )
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    cat = _FakeCat(_make_handler(), agent_effing=False, system_effing=False)
+    with patch.object(cli, "_resolve_plugin_id", return_value="cat_graphrag"), \
+            patch.object(importlib, "import_module", return_value=main):
+        ids = asyncio.run(cli._graph_phase_ids(cat))
+    assert ids == ["graph_spacy_extraction", "graph_llm_extraction"], f"got {ids}"
 
 
 def test_specs_returns_accumulator_when_phases_import_raises():
@@ -387,7 +460,7 @@ def test_specs_returns_accumulator_when_phases_import_raises():
     )
     try:
         accumulator = [object()]
-        specs = main.ingestion_phase_specs(accumulator, cat)
+        specs = asyncio.run(main.ingestion_phase_specs(accumulator, cat))
         assert specs is accumulator, (
             "must return the accumulator unchanged when the PhaseSpec import raises"
         )
@@ -735,20 +808,17 @@ def test_rabbithole_hook_noop_when_phase_path_active():
         create.assert_not_awaited()
 
 
-def test_rabbithole_hook_keeps_classic_path_when_effing_absent():
-    """Without EffING importable, the classic fire-and-forget must run once."""
+def test_rabbithole_hook_keeps_classic_path_when_effing_off_for_agent():
+    """EffING selected but not active for this agent: the classic
+    fire-and-forget must run once (the graph is never left unbuilt)."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
-    cat = _FakeCat(handler)
-    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
-    try:
-        with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
-            asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
-            create.assert_awaited_once_with("file.pdf", [], cat)
-    finally:
-        if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+    cat = _FakeCat(handler, agent_effing=False)
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+        asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+        create.assert_awaited_once_with("file.pdf", [], cat)
 
 
 def test_rabbithole_hook_keeps_classic_path_with_core_engine():
@@ -767,32 +837,87 @@ def test_rabbithole_hook_keeps_classic_path_with_core_engine():
         _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
 
 
-def test_phase_path_active_truth_table():
-    """uninstalled -> False; installed+core engine -> False; installed+efficient -> True."""
+def test_active_but_unimportable_effing_falls_back_to_classic():
+    """EffING listed as active on both managers but its module does not
+    import under ``cat.plugins`` (broken install / wrong path): the graph
+    phases cannot be registered, so the classic path must build the graph,
+    and the misconfiguration is logged as a WARNING."""
     from catgraphrag_phase import main
 
     handler = _make_handler()
     cat = _FakeCat(handler)
-    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion", None)
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion.phases", None)
     _StubLog.warnings.clear()
     try:
-        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
         assert asyncio.run(main._phase_path_active(cat)) is False
-        # The efficient engine is selected but not importable: never silent.
         assert any("cat_efficient_ingestion" in w for w in _StubLog.warnings), _StubLog.warnings
-        _StubLog.warnings.clear()
-        _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
-        assert asyncio.run(main._phase_path_active(cat)) is False
-        assert _StubLog.warnings == [], _StubLog.warnings
+        with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+            asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+            create.assert_awaited_once_with("file.pdf", [], cat)
     finally:
         if saved is not None:
-            sys.modules["cat.plugins.cat_efficient_ingestion"] = saved
+            sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = saved
+        _StubLog.warnings.clear()
 
-    _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
-    assert asyncio.run(main._phase_path_active(cat)) is False
 
+def test_engine_read_error_keeps_last_known_engine():
+    """A transient failure reading the system ingestion setting must not flip
+    the decision mid-ingestion (registration probes run many times): the last
+    successfully read engine is reused. With nothing read yet, the classic
+    path runs."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    cat = _FakeCat(handler)
+    main._LAST_ENGINE_NAME.clear()
+    _RESOLVED_INGESTION["name"] = RuntimeError("redis down")
+    try:
+        assert asyncio.run(main._phase_path_active(cat)) is False, "nothing known yet"
+
+        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+        assert asyncio.run(main._phase_path_active(cat)) is True
+
+        _RESOLVED_INGESTION["name"] = RuntimeError("redis down")
+        assert asyncio.run(main._phase_path_active(cat)) is True
+        specs = asyncio.run(main.ingestion_phase_specs([], cat))
+        assert len(specs) == 2, f"phases must stay registered, got {specs}"
+        with patch.object(type(handler), "create_derived_graph_for_source", new=AsyncMock()) as create:
+            asyncio.run(main.after_rabbithole_stored_documents("file.pdf", [], cat))
+            create.assert_not_awaited()
+    finally:
+        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+        main._LAST_ENGINE_NAME.clear()
+
+
+def test_phase_path_active_truth_table():
+    """Phases iff efficient engine selected AND EffING active on the system
+    manager (the engine resolves there) AND on this agent's manager."""
+    from catgraphrag_phase import main
+
+    handler = _make_handler()
+    _StubLog.warnings.clear()
+    cases = [
+        # (engine, system_effing, agent_effing, expected)
+        ("BaseIngestionConfiguration", True, True, False),
+        ("BaseIngestionConfiguration", False, False, False),
+        ("EfficientIngestionConfiguration", True, False, False),
+        ("EfficientIngestionConfiguration", False, True, False),
+        ("EfficientIngestionConfiguration", False, False, False),
+        ("EfficientIngestionConfiguration", True, True, True),
+    ]
+    for engine, system_on, agent_on, expected in cases:
+        _RESOLVED_INGESTION["name"] = engine
+        cat = _FakeCat(handler, agent_effing=agent_on, system_effing=system_on)
+        got = asyncio.run(main._phase_path_active(cat))
+        assert got is expected, f"{(engine, system_on, agent_on)}: got {got}"
+    # EffING off on some agents is a normal setup, not a warning.
+    assert _StubLog.warnings == [], _StubLog.warnings
+
+    # A caller without plugin managers (no lizard / no agent manager).
     _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
-    assert asyncio.run(main._phase_path_active(cat)) is True
+    bare = types.SimpleNamespace(vector_memory_handler=handler, agent_key="agent_test")
+    assert asyncio.run(main._phase_path_active(bare)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1205,9 @@ def main():
         test_specs_preserves_prior_accumulator_entries,
         test_specs_returns_accumulator_when_effing_absent,
         test_specs_returns_accumulator_when_phases_import_raises,
+        test_specs_abstain_when_effing_not_active_for_agent,
+        test_objects_abstain_when_effing_not_active_for_agent,
+        test_cli_graph_phase_ids_ignore_agent_gate,
         test_marker_returns_spacy_fingerprint,
         test_marker_returns_concept_fingerprint,
         test_marker_returns_none_for_unknown_phase,
@@ -1100,7 +1228,9 @@ def main():
         test_gate_raises_when_has_pending_source_tasks_true,
         test_gate_does_not_import_core_registry,
         test_rabbithole_hook_noop_when_phase_path_active,
-        test_rabbithole_hook_keeps_classic_path_when_effing_absent,
+        test_rabbithole_hook_keeps_classic_path_when_effing_off_for_agent,
+        test_active_but_unimportable_effing_falls_back_to_classic,
+        test_engine_read_error_keeps_last_known_engine,
         test_rabbithole_hook_keeps_classic_path_with_core_engine,
         test_phase_path_active_truth_table,
         test_transfer_cleanup_noop_on_failure,

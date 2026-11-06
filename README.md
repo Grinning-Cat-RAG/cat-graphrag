@@ -105,19 +105,20 @@ Results found by both graph and vector phases receive a boost during reranking.
 
 ## Ingestion modes: classic vs efficient phase machine
 
-The plugin can build the graph in two mutually exclusive ways, decided per ingestion by `_phase_path_active(cat)`:
+The plugin can build the graph in two mutually exclusive ways, decided per agent by `_phase_path_active(cat)`:
 
-| [`cat_efficient_ingestion`](https://github.com/DEH-RAG/cat-efficient-ingestion) installed | SYSTEM-level `ingestion` engine | Path used |
-|---|---|---|
-| no | any | **classic** |
-| yes | core engine | **classic** |
-| yes | `EfficientIngestionConfiguration` | **phase machine** |
+| SYSTEM-level `ingestion` engine | [`cat_efficient_ingestion`](https://github.com/DEH-RAG/cat-efficient-ingestion) active on the system plugin manager | EffING active on this agent | Path used |
+|---|---|---|---|
+| core engine | any | any | **classic** |
+| `EfficientIngestionConfiguration` | no | any | **classic** |
+| `EfficientIngestionConfiguration` | yes | no | **classic** |
+| `EfficientIngestionConfiguration` | yes | yes | **phase machine** |
 
-The `ingestion` engine is one of only two system-level services in Cat (the other is `embedder`), so the decision is read against the system settings, never the agent's. When the phase machine is active, the classic `after_rabbithole_stored_documents` callback becomes a no-op, so graph work never runs twice; when it is inactive, the classic callback is the only writer.
+EffING is installed under `cat/plugins` as a regular plugin, so being installed is not enough: it must be active, both on the system plugin manager (where the core resolves the `ingestion` engine, one of only two system-level services together with `embedder`) and on the agent, and importable as `cat.plugins.cat_efficient_ingestion` (otherwise a warning is logged and the classic path runs). If reading the engine setting fails, the last value read successfully is reused, so the decision does not flip in the middle of an ingestion. The same decision gates the phase registration: where the phase machine is inactive the graph phases are not registered with EffING and the classic `after_rabbithole_stored_documents` callback is the only writer; where it is active that callback is a no-op. Graph work therefore never runs twice and is never skipped.
 
 ### Phase registration (EffING)
 
-The plugin registers **exactly two** phases through the `ingestion_phase_specs` accumulator, in this order:
+Where the phase machine is active (see above), the plugin registers **exactly two** phases through the `ingestion_phase_specs` accumulator, in this order:
 
 - **`graph_spacy_extraction`** — spaCy NER + entity linking + similarity edges.
 - **`graph_llm_extraction`** — LLM concept/relation extraction.
@@ -179,7 +180,7 @@ Only two services are **system-level** in Cat; everything else is **per-agent**:
 
 ### EffING dependency
 
-`plugin.json` declares `cat_efficient_ingestion` as a dependency, so the Cat installs this plugin only next to it (EffING is installed as a regular plugin in `cat/plugins/cat_efficient_ingestion`, and this plugin imports it as `cat.plugins.cat_efficient_ingestion`: EffING's `isinstance` checks only accept phase classes imported through the same module path it was loaded from). The code itself stays import-safe without it: when the system ingestion engine is not EffING's, the classic path runs unchanged; when EffING's engine is selected but the plugin cannot be imported, a warning is logged and the classic path runs.
+`plugin.json` declares `cat_efficient_ingestion` as a dependency, so the Cat installs this plugin only next to it (EffING is installed as a regular plugin in `cat/plugins/cat_efficient_ingestion`, and this plugin imports it as `cat.plugins.cat_efficient_ingestion`: EffING's `isinstance` checks only accept phase classes imported through the same module path it was loaded from). The code itself stays import-safe without it: when the system ingestion engine is not EffING's, or EffING is not active for the agent, the classic path runs unchanged; when EffING is active but `cat.plugins.cat_efficient_ingestion` cannot be imported, a warning is logged and the classic path runs.
 
 ## Requirements
 
