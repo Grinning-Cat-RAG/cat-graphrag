@@ -98,14 +98,21 @@ async def rabbithole_ingestion_processing(source, cat) -> None:
     """Inject the embedder on the hook BOTH ingestion engines emit.
 
     The classic RabbitHole fires this right before parsing/embedding; the
-    efficient engine (EffING, ``cat/core_plugins/cat_efficient_ingestion``)
+    efficient engine (EffING, ``cat/plugins/cat_efficient_ingestion``)
     fires it too and NEVER fires ``before_rabbithole_stores_documents``. Without
     this hook the handler would run its extraction phases with no embedder under
     EffING, silently skipping entity embeddings. Idempotent (see
     ``_inject_embedder``), so on the classic flow — which emits both hooks — the
     second injection changes nothing.
+
+    It also tells the handler whether the EffING phase path owns the LLM
+    concept step for this ingestion (see ``_concepts_owned_by_phase``), so the
+    embedding-time derived graph does not repeat ``graph_llm_extraction``.
     """
     await _inject_embedder(cat)
+    handler = _graphrag_handler(cat)
+    if handler is not None:
+        handler._concepts_owned_by_phase = await _phase_path_active(cat)
 
 
 @hook(priority=10)
@@ -156,7 +163,7 @@ async def after_rabbithole_stored_documents(source: str, stored_points: List[Poi
 # ========== INGESTION PHASE MACHINE (EffING registration contract) ==========
 #
 # The EffING phase machine (deployed as
-# ``cat.core_plugins.cat_efficient_ingestion``)
+# ``cat.plugins.cat_efficient_ingestion``)
 # drives the phase-aware ingestion lifecycle. Plugins REGISTER their phases
 # (``ingestion_phase_specs``), provide the material marker for each
 # (``ingestion_phase_settings_marker``), and execute them
@@ -221,7 +228,8 @@ async def _phase_path_active(cat) -> bool:
     ==========================  ======================  =============
     EffING installed/loadable   SYSTEM ``ingestion``    phase path
     ==========================  ======================  =============
-    no                          any                     inactive
+    no                          core engine             inactive
+    no                          efficient engine        inactive (WARNING logged)
     yes                         core engine             inactive
     yes                         efficient engine        active
     ==========================  ======================  =============
@@ -232,11 +240,6 @@ async def _phase_path_active(cat) -> bool:
     writes the graph, so the two can never run together and neither is dead.
     """
     try:
-        import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
-    except Exception:  # noqa: BLE001
-        return False
-
-    try:
         name = await _resolved_system_ingestion_config_name(cat)
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -245,7 +248,23 @@ async def _phase_path_active(cat) -> bool:
         )
         return False
 
-    return name == _EFFICIENT_INGESTION_CONFIG_NAME
+    if name != _EFFICIENT_INGESTION_CONFIG_NAME:
+        return False
+
+    try:
+        import cat.plugins.cat_efficient_ingestion  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        # The efficient engine is selected but its plugin is not importable
+        # under the expected id: the graph phases are not registered either,
+        # so say it instead of degrading silently.
+        log.warning(
+            f"[GraphRAG] System ingestion engine is {name} but "
+            f"'cat.plugins.cat_efficient_ingestion' is not importable "
+            f"({exc!r}); using the classic path."
+        )
+        return False
+
+    return True
 
 
 @hook(priority=10)
@@ -261,7 +280,7 @@ def ingestion_phase_specs(specs, cat) -> list:
     try/except keeps this module import-safe when EffING is not deployed.
     """
     try:
-        from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
+        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
     except ImportError:
         PhaseSpec = None
     if PhaseSpec is None:
@@ -359,8 +378,9 @@ async def ingestion_phase_purge(phase, source, cat) -> Any:
     entities/relations/provenance of THIS source are removed
     (``GraphRAGHandler.purge_source_graph_artifacts``); chunk Documents and
     every other source are untouched. Both graph phases derive from the same
-    graph, so either phase's purge removes the source's graph artifacts (the
-    re-run rebuilds them).
+    graph, so either phase's purge removes the source's graph artifacts; the
+    delete therefore also drops the sibling graph phase's diary entry, so
+    EffING re-runs BOTH and they rebuild it.
 
     Returns ``None`` for non-graph phases (hook abstention) and a truthy
     status dict otherwise. When GraphRAG is not the active handler there is

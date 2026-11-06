@@ -22,11 +22,16 @@ loader imports recursively at activation. The ENTIRE body lives under
 ``if __name__ == "__main__":`` so importing the file executes zero code.
 Run it as a plain script from the host repository:
 
-    cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat-graphrag.my/test_maintenance_exit_summary.py
+    cd ../grinning-cat-core
+    EFFING_DIR=/path/to/cat-efficient-ingestion MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. .venv/bin/python /path/to/cat-graphrag/tests/test_maintenance_exit_summary.py
 """
 
 if __name__ == "__main__":
+    # Real EffING: deployed in the container, or EFFING_DIR on the host.
+    from effing_checkout import ensure_effing_importable
+
+    ensure_effing_importable()
+
     import asyncio
     import contextlib
     import importlib.util
@@ -37,7 +42,7 @@ if __name__ == "__main__":
     from unittest.mock import patch
 
     def _load_maintenance_agent():
-        path = Path(__file__).with_name("maintenance_agent.py")
+        path = Path(__file__).resolve().parent.parent / "scripts" / "maintenance_agent.py"
         spec = importlib.util.spec_from_file_location(
             "maintenance_agent_exit_summary", path
         )

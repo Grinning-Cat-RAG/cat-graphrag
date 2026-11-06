@@ -476,6 +476,27 @@ def test_derived_graph_calls_llm_without_stray_cat():
     assert kwargs.get("llm") is fake_llm
 
 
+def test_derived_graph_defers_llm_to_phase_when_phase_owns_concepts():
+    """EffING phase path (the handler is told so at ingestion start): the
+    vector-db path (no stray_cat, i.e. add_points_to_tenant during the
+    embedding phase) must NOT run step 8 — ``graph_llm_extraction`` owns it,
+    otherwise every source pays the LLM call twice."""
+    handler = _make_handler(kg=False, cr=True)
+    handler._concepts_owned_by_phase = True
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract, patch.object(
+        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
+    ) as resolve:
+        asyncio.run(handler.create_derived_graph_for_source(
+            "file.pdf", _stored_points()
+        ))
+
+    resolve.assert_not_awaited()
+    extract.assert_not_awaited()
+
+
 def test_derived_graph_skips_llm_without_stray_cat_when_cr_off():
     """CR off, NO stray_cat: step 8 must NOT resolve the LLM and must NOT call
     _extract_concept_relations."""
@@ -542,6 +563,7 @@ def main():
         test_recompute_returns_early_when_cr_off,
         test_derived_graph_calls_llm_without_stray_cat,
         test_derived_graph_skips_llm_without_stray_cat_when_cr_off,
+        test_derived_graph_defers_llm_to_phase_when_phase_owns_concepts,
         test_student_flag_changes_nothing,
     ]
     for test in tests:

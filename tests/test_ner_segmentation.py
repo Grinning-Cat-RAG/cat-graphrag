@@ -1,6 +1,6 @@
 """Standalone verification for the segmented spaCy NER path.
 
-Runnable with:  python test_ner_segmentation.py
+Runnable with:  python tests/test_ner_segmentation.py
 
 Pure-stdlib, plain asserts, no pytest and no model loading. The plugin's
 ``entity_extractor`` is imported through an in-memory package whose

@@ -1,6 +1,6 @@
 """Standalone verification for the versioned schema machinery (todo 11, P4).
 
-Runnable with:  python test_versioned_schema.py
+Runnable with:  python tests/test_versioned_schema.py
 
 Pure-stdlib, plain asserts, no pytest and no model loading. The plugin modules
 (``graphrag_handler``, ``epoch``, ``versioning``) are imported through an

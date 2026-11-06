@@ -18,8 +18,8 @@ test lives inside ``if __name__ == "__main__":``. ``cat.db.crud`` is replaced
 with an in-memory fake, so it uses no Redis and no network at all.
 Run it as a plain script from the host repository:
 
-    cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat-graphrag.my/test_ingestion_safety_fixes.py
+    cd ../grinning-cat-core
+    EFFING_DIR=/path/to/cat-efficient-ingestion MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. .venv/bin/python /path/to/cat-graphrag/tests/test_ingestion_safety_fixes.py
 """
 
 if __name__ == "__main__":
@@ -30,8 +30,19 @@ if __name__ == "__main__":
     import types
     import uuid
 
-    import maintenance_agent
-    from cat.core_plugins.cat_efficient_ingestion import resume
+    import importlib.util
+    from pathlib import Path
+
+    # Real EffING: deployed in the container, or EFFING_DIR on the host.
+    from effing_checkout import ensure_effing_importable
+
+    ensure_effing_importable()
+
+    _cli = Path(__file__).resolve().parent.parent / "scripts" / "maintenance_agent.py"
+    _spec = importlib.util.spec_from_file_location("maintenance_agent", _cli)
+    maintenance_agent = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(maintenance_agent)
+    from cat.plugins.cat_efficient_ingestion import resume
     from cat.db import crud
 
     class FakeCrud:

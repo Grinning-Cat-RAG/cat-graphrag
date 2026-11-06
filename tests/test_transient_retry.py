@@ -17,7 +17,7 @@ loaded, so it needs no Cat install, no Neo4j and no network.
 
 Run as a plain script:
 
-    python test_transient_retry.py
+    python tests/test_transient_retry.py
 """
 
 if __name__ == "__main__":

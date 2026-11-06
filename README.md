@@ -69,7 +69,7 @@ At runtime it provides:
 
 - a custom vector database handler: `GraphRAGHandler`
 - a settings model: `Neo4jGraphRAGConfig`, registered through `factory_allowed_vector_databases`
-- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the optional EffING phase registration (`ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `before_ingestion_status_completed`)
+- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the EffING phase registration (`ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `before_ingestion_status_completed`)
 - a query hook that captures the raw user message before memory recall
 - maintenance hooks: boot-time provenance reconciliation, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
 
@@ -136,7 +136,7 @@ Three per-agent settings drive it:
 - **`relation_definitions`** — one `TYPE: definition` per line; each key becomes an admissible relation type and is interpolated into `{relation_definitions}`.
 - **`concept_relations_prompt`** — the prompt template; the document text is appended after it. Empty falls back to the built-in default.
 
-Each structured LLM call is bounded by a wall-clock deadline, `CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS` (default `180` seconds; invalid/non-positive values fall back to the default), and runs with streaming disabled and reasoning turned off (`stream=False` plus an OpenRouter `reasoning: {"enabled": false}` override via `extra_body`, applied per call only — the agent's LLM config is never changed). A stalled streaming socket therefore becomes `not_ready` on the first attempt (the phase's 300 s not-ready budget governs retries) and then `error` naming the timeout, never an unbounded `processing` phase.
+Each structured LLM call is bounded by a wall-clock deadline, `CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS` (default `180` seconds; invalid/non-positive values fall back to the default), and runs with streaming disabled (`stream=False`); when the LLM's base URL is OpenRouter, reasoning is also turned off through a `reasoning: {"enabled": false}` override in `extra_body` (other providers reject that field, so they never receive it). Both apply per call only — the agent's LLM config is never changed. A stalled streaming socket therefore becomes `not_ready` on the first attempt (the phase's 300 s not-ready budget governs retries) and then `error` naming the timeout, never an unbounded `processing` phase.
 
 The fingerprint also includes the **agent-level LLM identity** (`<config class name>:<model>`, resolved from the agent's `llm` category) and the `enable_concept_relations` toggle, because both change what the phase produces. `enable_student_knowledge_graph` and the display-only `enable_knowledge_graph` are deliberately excluded. `_concept_fingerprint` is SHA-256 over the parsed definitions + the whitespace-stripped prompt + the LLM identity + the toggle. When any material input changes, the fingerprint changes; the next ingestion recomputes concept extraction, and a save-triggered recompute re-runs it for existing documents.
 
@@ -177,9 +177,9 @@ Only two services are **system-level** in Cat; everything else is **per-agent**:
 | vector store (`Neo4jGraphRAGConfig` / `GraphRAGHandler`) | per-agent | |
 | concept definitions / relation definitions / prompt / `enable_concept_relations` / agent `llm` | per-agent | drive `_concept_fingerprint` |
 
-### Optional dependency
+### EffING dependency
 
-`cat_efficient_ingestion` is **optional**. Without it the plugin runs the classic path unchanged; the phase hooks are import-safe and no-op when EffING is absent. Deploying EffING and selecting its engine enables the phase path; no plugin reconfiguration beyond that is needed.
+`plugin.json` declares `cat_efficient_ingestion` as a dependency, so the Cat installs this plugin only next to it (EffING is installed as a regular plugin in `cat/plugins/cat_efficient_ingestion`, and this plugin imports it as `cat.plugins.cat_efficient_ingestion`: EffING's `isinstance` checks only accept phase classes imported through the same module path it was loaded from). The code itself stays import-safe without it: when the system ingestion engine is not EffING's, the classic path runs unchanged; when EffING's engine is selected but the plugin cannot be imported, a warning is logged and the classic path runs.
 
 ## Requirements
 
@@ -423,7 +423,7 @@ A few things are worth knowing before production use:
 | `plugin.json` | Plugin metadata for Grinning Cat |
 | `pyproject.toml` | Python dependencies |
 | `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
-| `scripts/` | `maintenance_agent.py`, `cleanup_null_vectors.py` and `fix_leaked_card_metadata.py` utilities |
+| `scripts/` | `maintenance_agent.py` and `cleanup_null_vectors.py` utilities |
 
 ### Maintenance CLI
 
@@ -435,19 +435,19 @@ explicit id is the only way to target a protected/`__*__` agent) or `--all`
 
 ```bash
 # Re-embed only (chunk reuse) for one agent
-docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --reembed --yes
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --reembed --yes
 
 # Re-ingest from scratch (points-first wipe, then re-parse + re-embed)
-docker exec cheshire_cat_core python /app/maintenance_agent.py --all --reingest --yes
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --reingest --yes
 
 # Resume ONLY the failed phases (keeps complete phases, no purge/re-parse/re-embed)
-docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --resume-failed --yes
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --resume-failed --yes
 
 # Rebuild the GraphRAG graph (wipe-then-rebuild)
-docker exec cheshire_cat_core python /app/maintenance_agent.py --agent <id> --graph --yes
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --graph --yes
 
 # Show the resolved plan without touching anything (exits 2)
-docker exec cheshire_cat_core python /app/maintenance_agent.py --all --resume-failed --dry-run
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --resume-failed --dry-run
 ```
 
 Safety contract: the default mode is **dry-run** — it prints the resolved plan
@@ -477,25 +477,6 @@ deletes it in a `finally` (success or failure). While the marker exists the
 EffING periodic sweep skips that agent, so the app never steals/retries rows
 the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
 never blocks the sweep forever.
-
-Run the coordination harness as a plain script (it is import-safe, no Redis):
-
-```bash
-uv run python test_ingestion_safety_fixes.py
-```
-
-### Removing leaked card metadata
-
-Old catalogue-card round-trips left `full_card` / `is_catalogue_card` on real
-prose chunks. Extraction ignores those flags (content decides), but the stale
-metadata still makes source-chunk counts under-report. This utility rewrites the
-affected chunks in place, no re-parse and no re-embed (dry-run by default, exit
-2; `--yes` performs the write):
-
-```bash
-python scripts/fix_leaked_card_metadata.py --dry-run
-python scripts/fix_leaked_card_metadata.py --yes
-```
 
 ---
 

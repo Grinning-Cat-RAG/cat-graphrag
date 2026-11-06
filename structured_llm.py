@@ -1,4 +1,4 @@
-"""Structured LLM extraction utility, ported into cat-graphrag.my.
+"""Structured LLM extraction utility, ported into cat-graphrag.
 
 Import-safe port of the ``StructuredLLM`` class from the MyCAT reference on branch
 ``feat/structured-output`` (commit ``0594ba167eb8a1c008f51254c3d8672b6d35c143``).

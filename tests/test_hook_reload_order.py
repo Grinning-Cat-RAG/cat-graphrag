@@ -21,7 +21,7 @@ graphrag_handler), asserts the stale-binding bug condition holds, then calls
 the hook with a class-B handler and asserts ``create_derived_graph_for_source``
 IS awaited — proving the lazy import resolves the current class.
 
-Runnable:  python test_hook_reload_order.py
+Runnable:  python tests/test_hook_reload_order.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, langchain_core, spacy, langdetect, pydantic, neo4j)
 are stubbed in sys.modules *before* the plugin modules are imported (same

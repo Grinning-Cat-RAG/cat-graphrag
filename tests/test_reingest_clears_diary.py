@@ -9,8 +9,8 @@ asserts the op sequencing with a fake crud/handler (no real store, no Redis).
 
 Run from the host repository (the plugin is importable by file path):
 
-    cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat-graphrag.my/test_reingest_clears_diary.py
+    cd ../grinning-cat-core
+    EFFING_DIR=/path/to/cat-efficient-ingestion MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. .venv/bin/python /path/to/cat-graphrag/tests/test_reingest_clears_diary.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -18,6 +18,11 @@ loader imports recursively at activation. The ENTIRE body lives under
 """
 
 if __name__ == "__main__":
+    # Real EffING: deployed in the container, or EFFING_DIR on the host.
+    from effing_checkout import ensure_effing_importable
+
+    ensure_effing_importable()
+
     import asyncio
     import importlib.util
     import sys
@@ -26,7 +31,7 @@ if __name__ == "__main__":
     from unittest.mock import patch
 
     def _load_maintenance_agent():
-        path = Path(__file__).with_name("maintenance_agent.py")
+        path = Path(__file__).resolve().parent.parent / "scripts" / "maintenance_agent.py"
         spec = importlib.util.spec_from_file_location("maintenance_agent_under_test", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -36,8 +41,8 @@ if __name__ == "__main__":
         return types.SimpleNamespace(name=name, metadata={}, path=name)
 
     async def test_reingest_clears_diary_for_wiped_source():
-        import cat.core_plugins.cat_efficient_ingestion.reembed as effing_reembed
-        import cat.core_plugins.cat_efficient_ingestion.registry as effing_registry
+        import cat.plugins.cat_efficient_ingestion.reembed as effing_reembed
+        import cat.plugins.cat_efficient_ingestion.registry as effing_registry
         from cat.services.memory.models import VectorMemoryType
 
         maintenance_agent = _load_maintenance_agent()

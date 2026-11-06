@@ -159,8 +159,11 @@ async def acquire_tenant_write_lock(
         # Lock ordering: taken AFTER the per-source lock held by the caller
         # (EffING holds ``ingestion-source:<agent>:<source>`` before invoking
         # the handler); never the reverse. See the module docstring.
-        locks: Dict[str, asyncio.Lock] = getattr(handler, "_local_write_locks", None) or {}
-        if not hasattr(handler, "_local_write_locks"):
+        # ``is None``, not truthiness: the handler initialises an EMPTY dict,
+        # which must be reused — a fresh dict per call would never serialise.
+        locks: Optional[Dict[str, asyncio.Lock]] = getattr(handler, "_local_write_locks", None)
+        if locks is None:
+            locks = {}
             try:
                 handler._local_write_locks = locks
             except Exception:  # pragma: no cover - exotic handler objects

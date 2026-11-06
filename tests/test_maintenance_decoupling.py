@@ -6,11 +6,13 @@ Regression test: the maintenance CLI decouples ENGINE-level ops from GraphRAG.
 engine-level; the graph phases no-op when the active handler is not
 GraphRAG). Only ``--graph`` requires the ``GraphRAGHandler`` and must report
 ``skip reason=handler-not-graphrag`` otherwise. The re-embed preflight must
-still block ``--reingest`` before any destructive wipe.
+still block ``--reingest`` before any destructive wipe (needs the real EffING:
+deployed in the container, or ``EFFING_DIR`` on the host).
 
-Run INSIDE the container (like the other plugin tests):
+Run from ``grinning-cat-core`` with ``EFFING_DIR`` set (no container needed):
 
-    docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/tests/test_maintenance_decoupling.py
+    EFFING_DIR=/path/to/cat-efficient-ingestion MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. \
+        .venv/bin/python /path/to/cat-graphrag/tests/test_maintenance_decoupling.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -18,13 +20,26 @@ loader imports recursively at activation. The ENTIRE body lives under
 """
 
 if __name__ == "__main__":
+    # Real EffING: deployed in the container, or EFFING_DIR on the host.
+    from effing_checkout import ensure_effing_importable
+
+    ensure_effing_importable()
+
     import asyncio
     import io
     import sys
     from contextlib import redirect_stdout
     from types import SimpleNamespace
 
-    import cat.plugins.cat_graphrag.maintenance_agent as m
+    import importlib.util
+    from pathlib import Path
+
+    # Load the CLI by file path: no deployed plugin or container needed (the
+    # CLI keeps every ``cat`` import inside functions).
+    _cli = Path(__file__).resolve().parent.parent / "scripts" / "maintenance_agent.py"
+    _spec = importlib.util.spec_from_file_location("maintenance_agent_under_test", _cli)
+    m = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(m)
 
 
     def _fail(msg: str) -> None:
@@ -85,8 +100,10 @@ if __name__ == "__main__":
             _fail(f"--reingest on a non-GraphRAG agent failed: {out!r}")
         if len(calls) != 1:
             _fail(f"--reingest helper calls={len(calls)}, expected 1: {out!r}")
-        if "op=reingest result=ok" not in out:
-            _fail(f"--reingest did not report ok: {out!r}")
+        # The ``result=ok`` line is printed by ``_op_reingest`` itself (from the
+        # real per-source phase outcome), which this case replaces.
+        if "result=fail" in out:
+            _fail(f"--reingest reported a failure: {out!r}")
         print("PASS (a): --reingest planned+executed for non-GraphRAG agent")
 
 
@@ -124,7 +141,7 @@ if __name__ == "__main__":
         from cat.services.memory.models import VectorMemoryType
 
         # 1. The real preflight refuses an unusable re-embed path.
-        import cat.core_plugins.cat_efficient_ingestion.reembed as reembed
+        import cat.plugins.cat_efficient_ingestion.reembed as reembed
 
         orig_rh = reembed._resolve_rabbit_hole
 

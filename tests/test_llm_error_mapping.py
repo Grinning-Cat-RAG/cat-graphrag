@@ -38,7 +38,7 @@ test lives inside ``if __name__ == "__main__":``. External dependencies are
 stubbed in ``sys.modules`` before the plugin module is loaded. Run it as a
 plain script:
 
-    python test_llm_error_mapping.py
+    python tests/test_llm_error_mapping.py
 """
 
 if __name__ == "__main__":
@@ -50,7 +50,7 @@ if __name__ == "__main__":
     import types
     from unittest.mock import AsyncMock, patch
 
-    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PKG = "catgraphrag_llmtest"
 
     # ------------------------------------------------------------------
@@ -556,7 +556,7 @@ if __name__ == "__main__":
         )
         disabled.agent_id = "agent_test"
 
-        with patch.object(type(disabled), "drain_source_tasks", new=AsyncMock()), \
+        with patch.object(type(disabled), "_drain_source_tasks_counted", new=AsyncMock()), \
              patch.object(
                  type(disabled),
                  "get_source_points_by_collection",
@@ -766,8 +766,8 @@ if __name__ == "__main__":
 
         with patch.object(
             type(handler),
-            "drain_source_tasks",
-            new=AsyncMock(return_value=False),
+            "_drain_source_tasks_counted",
+            new=AsyncMock(return_value=None),
         ), patch.object(
             type(handler),
             "get_source_points_by_collection",
@@ -801,8 +801,8 @@ if __name__ == "__main__":
 
         with patch.object(
             type(handler),
-            "drain_source_tasks",
-            new=AsyncMock(return_value=False),
+            "_drain_source_tasks_counted",
+            new=AsyncMock(return_value=None),
         ), patch.object(
             type(handler),
             "get_source_points_by_collection",
@@ -845,7 +845,7 @@ if __name__ == "__main__":
         )
 
         with patch.object(
-            type(handler), "drain_source_tasks", new=AsyncMock()
+            type(handler), "_drain_source_tasks_counted", new=AsyncMock()
         ), patch.object(
             type(handler),
             "get_source_points_by_collection",
@@ -889,7 +889,7 @@ if __name__ == "__main__":
         ]
 
         with patch.object(
-            type(handler), "drain_source_tasks", new=AsyncMock()
+            type(handler), "_drain_source_tasks_counted", new=AsyncMock()
         ), patch.object(
             type(handler),
             "get_source_points_by_collection",

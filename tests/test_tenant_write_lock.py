@@ -340,6 +340,35 @@ if __name__ == "__main__":
             f"(e) PASS  delete path serialised against write, order={handler.order}"
         )
 
+    # ── (f) in-process fallback: a pre-initialised EMPTY dict still serialises ──
+    async def test_f_fallback_with_empty_lock_dict_serialises():
+        """The real handler initialises ``_local_write_locks = {}``; an empty
+        dict must be reused, not replaced by a fresh one on every call."""
+        reset()
+        handler = _Handler("tenant-f")
+        saved = twl.distributed_lock
+        twl.distributed_lock = None
+        order = []
+        try:
+            async def writer(n):
+                async with twl.acquire_tenant_write_lock(handler, "tenant-f", f"w{n}"):
+                    order.append(f"enter-{n}")
+                    await asyncio.sleep(0.05)
+                    order.append(f"exit-{n}")
+
+            await asyncio.gather(writer(1), writer(2))
+        finally:
+            twl.distributed_lock = saved
+        _check(
+            order[0].startswith("enter") and order[1].startswith("exit"),
+            f"(f) fallback writers overlapped: {order}",
+        )
+        _check(
+            "tenant-f" in handler._local_write_locks,
+            f"(f) fallback lock not stored on the handler: {handler._local_write_locks}",
+        )
+        print(f"(f) PASS  fallback lock serialises with a pre-initialised dict, order={order}")
+
     # ── Runner ────────────────────────────────────────────────────────────
     async def _run_all():
         await test_a_same_tenant_never_overlaps()
@@ -347,6 +376,7 @@ if __name__ == "__main__":
         await test_c_reentrant_call_acquires_once()
         await test_d_timeout_raises_and_blocks_write()
         await test_e_delete_serialises_against_write()
+        await test_f_fallback_with_empty_lock_dict_serialises()
 
     asyncio.run(_run_all())
-    print("\nALL 5 TENANT WRITE LOCK TESTS PASSED")
+    print("\nALL 6 TENANT WRITE LOCK TESTS PASSED")

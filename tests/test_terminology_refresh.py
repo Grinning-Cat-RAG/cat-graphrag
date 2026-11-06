@@ -1,6 +1,6 @@
 """Standalone verification for the per-agent terminology refresh (todo 10).
 
-Runnable with:  python test_terminology_refresh.py
+Runnable with:  python tests/test_terminology_refresh.py
 
 Pure-stdlib, plain asserts, no pytest and no model loading. The plugin modules
 (``main``, ``graphrag_handler``, ``entity_extractor``, ``models``) are imported

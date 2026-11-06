@@ -1,6 +1,6 @@
 """Standalone verification for the seamless re-embed swap (todo 12, P4).
 
-Runnable with:  python test_reindex_swap.py
+Runnable with:  python tests/test_reindex_swap.py
 
 Pure-stdlib, plain asserts, no pytest and no model loading. The plugin modules
 (``graphrag_handler``, ``epoch``, ``versioning``) are imported through an

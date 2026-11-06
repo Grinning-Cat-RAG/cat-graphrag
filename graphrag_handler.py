@@ -104,16 +104,33 @@ def _supports_extra_body(llm: Any) -> bool:
     return "extra_body" in (getattr(type(llm), "model_fields", None) or {})
 
 
+#: Name prefix of the background similarity tasks (see ``add_point_to_tenant``).
+_SIMILARITY_TASK_PREFIX = "graphrag-similarity:"
+
+
+def _is_openrouter(llm: Any) -> bool:
+    """Whether ``llm`` targets OpenRouter, the only API that knows ``reasoning``.
+
+    A plain OpenAI-compatible endpoint rejects unknown request arguments, so
+    the override is sent only when the base URL is OpenRouter's.
+    """
+    for attr in ("openai_api_base", "base_url", "api_base"):
+        value = getattr(llm, attr, None)
+        if value and "openrouter.ai" in str(value).lower():
+            return True
+    return False
+
+
 def _extraction_call_kwargs(llm: Any) -> Dict[str, Any]:
     """Per-call kwargs for the extraction invocation (never mutate ``llm``)."""
     kwargs: Dict[str, Any] = {"stream": False}
-    if _supports_extra_body(llm):
+    if _supports_extra_body(llm) and _is_openrouter(llm):
         kwargs["extra_body"] = {"reasoning": dict(EXTRACTION_REASONING_OVERRIDE)}
     return kwargs
 
 
 class _NonStreamingStructuredLLM:
-    """Per-call view: no streaming, no reasoning, for ONE extraction call.
+    """Per-call view: no streaming (and, on OpenRouter, no reasoning) for ONE extraction call.
 
     The LangChain idiom ``llm.bind(streaming=False)`` does NOT survive the
     native structured path: a ``RunnableBinding`` forwards
@@ -124,9 +141,11 @@ class _NonStreamingStructuredLLM:
     ``bind`` fallback for models whose ``with_structured_output`` rejects extra
     kwargs.
 
-    It also sends an OpenRouter ``reasoning`` override through ``extra_body``:
-    the extraction model reasons at effort ``high`` by default, spending most of
-    its output on hidden tokens. The agent's global LLM/config is never mutated.
+    When the base URL is OpenRouter (``_is_openrouter``) it also sends the
+    ``reasoning`` override through ``extra_body``: the extraction model reasons
+    at effort ``high`` by default, spending most of its output on hidden
+    tokens. Other providers reject that field and never receive it. The agent's
+    global LLM/config is never mutated.
     """
 
     #: Exposed so a caller/test can assert streaming is off for this view.
@@ -164,7 +183,7 @@ class _NonStreamingStructuredLLM:
 
 
 def _without_streaming(llm: Any) -> Any:
-    """Return a no-streaming/no-reasoning view of ``llm`` for the structured call."""
+    """Return a no-streaming view of ``llm`` for the structured call (no reasoning on OpenRouter)."""
     if hasattr(llm, "with_structured_output"):
         return _NonStreamingStructuredLLM(llm)
     try:
@@ -296,11 +315,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # extraction succeeds (or terminally fails) so a later re-ingestion
         # starts a fresh budget.
         self._concept_attempts: Dict[str, int] = {}
-        # Per-source (entities, relations) counts of the last drained
-        # background batch. ``drain_source_tasks`` returns a bool (existing
-        # contract), so the phase reads the real product counts from here for
-        # its ``processed`` telemetry.
-        self._last_drain_counts: Dict[str, tuple[int, int]] = {}
+        # True while the EffING phase path is active (set by the plugin's
+        # ``rabbithole_ingestion_processing`` hook at every ingestion start):
+        # ``graph_llm_extraction`` then owns the LLM concept step, so the
+        # vector-db derived graph (``add_points_to_tenant``) must not repeat it.
+        # The engine selection is system-level, so one flag per handler holds.
+        self._concepts_owned_by_phase: bool = False
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
@@ -442,7 +462,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not source or not self._is_empty_mapping(vector):
             return False
         try:
-            from cat.core_plugins.cat_efficient_ingestion import registry
+            from cat.plugins.cat_efficient_ingestion import registry
 
             chat_id = (metadata or {}).get("chat_id")
             scope = str(chat_id) if chat_id else "agent"
@@ -1521,10 +1541,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # meaningless (or failing) vector-similarity edges.
         if vector_valid:
             # Same detached-context rule as entity extraction above.
+            # Named so ``_drain_source_tasks_counted`` can tell a similarity
+            # failure (no extraction product lost) from an extraction failure.
             sim_task = asyncio.create_task(
                 detached_write_task(
                     self._create_similarity_relationships(point_id, vector_list, collection_name)
-                )
+                ),
+                name=f"{_SIMILARITY_TASK_PREFIX}{point_id}",
             )
             self._pending_entity_tasks.append(sim_task)
             self._track_source_task((metadata or {}).get("source"), sim_task)
@@ -1593,34 +1616,55 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Extraction tasks are lock-free and run in parallel; their results are
         accumulated here and flushed through ``_write_source_graph`` in ONE
         transaction per source. Similarity tasks (which do write) are joined in
-        the same gather but return ``None`` and are ignored here.
+        the same gather; their result is ignored and their failure is only
+        logged (the spaCy phase re-runs similarity anyway).
 
-        Returns ``True`` when a graph write was performed, so the phase can
-        skip a redundant re-extraction after a completed background batch.
-        Failures are logged, never raised (the deterministic phase re-runs the
-        same steps awaited).
+        Returns ``True`` only when the COMPLETE batch was written, so the phase
+        can skip a redundant re-extraction. When any EXTRACTION task failed or
+        was cancelled, the partial batch is still written (best effort for the
+        classic path) but ``False`` is returned, so the deterministic phase
+        re-extracts every chunk awaited. Task failures are logged; an error of
+        the graph write itself propagates to the caller.
+        """
+        return await self._drain_source_tasks_counted(source) is not None
+
+    async def _drain_source_tasks_counted(
+        self, source: str
+    ) -> Optional[Tuple[int, int]]:
+        """``drain_source_tasks`` returning ``(entities, relations)`` written.
+
+        ``None`` means "no complete batch was written" (same cases where the
+        public method returns ``False``). The spaCy phase uses the counts as its
+        ``processed`` telemetry; no per-source state is kept on the handler.
         """
         tasks = self._pending_source_tasks.pop(source, [])
         if not tasks:
-            return False
+            return None
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         entities: List[Dict] = []
         mentions: List[Dict] = []
         relations: List[Dict] = []
-        for r in results:
-            if isinstance(r, Exception):
-                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r}")
+        failed = 0
+        for task, r in zip(tasks, results):
+            # BaseException: a cancelled task yields CancelledError, which is
+            # not an Exception but still loses that chunk's result.
+            if isinstance(r, BaseException):
+                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r!r}")
+                get_name = getattr(task, "get_name", None)
+                is_similarity = callable(get_name) and str(get_name()).startswith(
+                    _SIMILARITY_TASK_PREFIX
+                )
+                if not is_similarity:
+                    failed += 1
             elif isinstance(r, dict) and "entities" in r:
                 entities.extend(r.get("entities") or [])
                 mentions.extend(r.get("mentions") or [])
                 relations.extend(r.get("relations") or [])
 
-        self._last_drain_counts[source] = (len(entities), len(relations))
-
         if not entities and not relations:
-            return False
+            return None
 
         await self._write_source_graph(
             entities,
@@ -1628,7 +1672,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             relations,
             operation=f"write source graph for '{source}'",
         )
-        return True
+        if failed:
+            return None
+        return len(entities), len(relations)
 
     async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
         """Fetch all stored points of one source, grouped by collection.
@@ -1658,10 +1704,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         hook fired-and-forgot, but inline and awaited:
 
         1. joins the source's background NER/similarity tasks
-           (``drain_source_tasks``), which flushes the accumulated extraction
-           in ONE graph transaction (or sequential batches above the guard);
-        2. when no background batch was available (e.g. a phase retry after a
-           restart), extracts every stored chunk CONCURRENTLY (spaCy is
+           (``_drain_source_tasks_counted``), which flushes the accumulated
+           extraction in ONE graph transaction (or sequential batches above
+           the guard);
+        2. when no complete background batch was available (e.g. a phase
+           retry after a restart, or a failed/cancelled chunk task), extracts
+           every stored chunk CONCURRENTLY (spaCy is
            CPU-bound, no Neo4j locks) and writes the source's graph in ONE
            transaction — never one concurrent transaction per chunk;
         3. re-runs ``_create_similarity_relationships`` for the source's
@@ -1677,7 +1725,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         are idempotent MERGEs, so re-running after a retry never duplicates
         data.
         """
-        flushed = await self.drain_source_tasks(source)
+        drained = await self._drain_source_tasks_counted(source)
 
         by_collection = await self.get_source_points_by_collection(source)
         if not by_collection:
@@ -1695,8 +1743,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # skip the redundant re-extraction. Otherwise extract every chunk
         # CONCURRENTLY and write the source graph in ONE transaction.
         processed: Optional[int] = None
-        if flushed:
-            entity_count, relation_count = self._last_drain_counts.get(source, (0, 0))
+        if drained is not None:
+            entity_count, relation_count = drained
             processed = entity_count + relation_count
         elif self._enable_entity_extraction and self._entity_extractor:
             content_points = [
@@ -1786,9 +1834,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         re-runs the phase.
         All writes are idempotent MERGEs, so re-running after a retry never
         duplicates data.
-        """
-        await self.drain_source_tasks(source)
 
+        It never joins the source's background spaCy tasks: that batch belongs
+        to ``run_spacy_extraction_phase``, and writing it here would record a
+        spaCy write failure as an LLM-phase error.
+        """
         by_collection = await self.get_source_points_by_collection(source)
         if not by_collection:
             return {"status": "not_ready", "retry_after": 5}
@@ -2880,7 +2930,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
           2. delete SIMILAR_TO_* edges touching this source's Documents;
           3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
              that existed only because of it;
-          4. drop the source's SourceFile node.
+
+        The source's SourceFile node (document structure, built during the
+        embedding phase) is kept: it is removed with the source's points.
 
         Returns the number of Document nodes that belonged to the source (0 is
         a valid "nothing was derived" result, not an error).
@@ -3020,15 +3072,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 ).consume()
 
             await delete_in_batches(related_ids, _strip_related)
-
-            await session.run(
-                """
-                MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
-                DETACH DELETE sf
-                """,
-                tenant_id=tenant_id,
-                source=source,
-            )
+            # The SourceFile node (document structure) is NOT a graph-phase
+            # product: the embedding phase builds it, and EffING does not
+            # re-run embedding when it recovers a graph phase. It goes away
+            # with the source's points (both point deletes prune orphan SourceFiles).
         log.info(
             f"[GraphRAG] Purged graph artifacts for source '{source}' "
             f"({doc_count} document(s), tenant {tenant_id})"
@@ -3974,7 +4021,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # plugin hooks are unreliable under the multi-worker toggle race, so
         # they cannot be the trigger), the agent LLM is resolved directly from
         # the saved agent config via _resolve_agent_llm().
-        if self._enable_concept_relations:
+        # On the vector-db path (no stray_cat) under the EffING phase path the
+        # ``graph_llm_extraction`` phase owns this step: running it here too
+        # would call the LLM twice per source.
+        defer_to_phase = stray_cat is None and self._concepts_owned_by_phase
+        if self._enable_concept_relations and not defer_to_phase:
             try:
                 if stray_cat is not None:
                     outcome = await self._extract_concept_relations(
@@ -4398,10 +4449,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Wall-clock deadline: streaming responses have no overall
             # deadline, so the await itself must be bounded or a stalled
             # socket keeps the phase ``processing`` forever. The structured
-            # call also runs with streaming disabled and reasoning turned off
-            # for this call only (``_without_streaming``): the model defaults
-            # to effort ``high``, and hidden reasoning tokens dominated the
-            # latency while the extraction only needs the final JSON.
+            # call also runs with streaming disabled for this call only
+            # (``_without_streaming``) and, on OpenRouter, with reasoning
+            # turned off: the model defaults to effort ``high``, and hidden
+            # reasoning tokens dominated the latency while the extraction only
+            # needs the final JSON.
             result = await asyncio.wait_for(
                 StructuredLLM().run(
                     full_prompt, _without_streaming(llm), output_model
@@ -4554,9 +4606,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ``_store_concept_relations`` skips a concept with a blank ``text`` and a
         relation with a blank ``origin``/``destination``; the output model only
         rejects a blank concept text/endpoint (a blank relation ``text`` is
-        allowed). Everything removed here is subtractively counted by
-        ``_count_dropped_items``, so the returned product is truthful: ``done``
-        means at least one storable item and zero dropped ones.
+        allowed). When SOME items survive, the removed ones are counted by
+        ``_count_dropped_items`` and the extraction is a partial ``error``.
+        When NONE survives, the product is a valid empty one (``done`` with the
+        ``empty-extraction`` warning): blank-only items are how the model says
+        it found nothing.
 
         A blank relation ``text`` is dropped HERE even though the store would
         still write the edge: the model must not reject the whole payload for

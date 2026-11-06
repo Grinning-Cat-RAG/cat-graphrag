@@ -21,7 +21,7 @@ test lives inside ``if __name__ == "__main__":``. External dependencies are
 stubbed in ``sys.modules`` before the plugin module is loaded. Run it as a
 plain script:
 
-    python test_llm_call_deadline.py
+    python tests/test_llm_call_deadline.py
 """
 
 if __name__ == "__main__":
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     import types
     from unittest.mock import patch
 
-    REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PKG = "catgraphrag_deadlinetest"
     ENV = "CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS"
 
@@ -231,6 +231,7 @@ if __name__ == "__main__":
         # ChatOpenAI exposes ``extra_body`` as a pydantic field; the plugin only
         # sends the OpenRouter reasoning override to models that accept it.
         model_fields = {"extra_body": None, "reasoning": None}
+        openai_api_base = "https://openrouter.ai/api/v1"
 
         def __init__(self):
             self.structured_kwargs = None
@@ -253,6 +254,7 @@ if __name__ == "__main__":
         extra_body = None
         reasoning = None
         model_fields = {"extra_body": None, "reasoning": None}
+        openai_api_base = "https://openrouter.ai/api/v1"
 
         def __init__(self):
             self.bind_kwargs = None
@@ -415,6 +417,23 @@ if __name__ == "__main__":
         assert llm.extra_body is None, "global LLM extra_body was mutated"
         print("PASS (f) fallback call disables streaming + reasoning, LLM untouched")
 
+    async def test_g_reasoning_override_only_for_openrouter():
+        """The ``reasoning`` body field is OpenRouter's: a plain OpenAI-compatible
+        endpoint rejects unknown request arguments, so it must not receive it.
+        Streaming stays disabled for every provider."""
+        for base in ("https://api.openai.com/v1", None):
+            llm = _StreamingLLM()
+            llm.openai_api_base = base
+            view = graphrag_handler._without_streaming(llm)
+            view.with_structured_output(object)
+            assert llm.structured_kwargs.get("stream") is False, llm.structured_kwargs
+            assert "extra_body" not in llm.structured_kwargs, (base, llm.structured_kwargs)
+            plain = _NonNativeLLM()
+            plain.openai_api_base = base
+            bound = graphrag_handler._without_streaming(plain)
+            assert "extra_body" not in bound.bind_kwargs, (base, bound.bind_kwargs)
+        print("PASS (g) reasoning override sent only to OpenRouter endpoints")
+
     async def _main():
         await test_a_never_returning_llm_is_not_ready()
         await test_b_budget_exhausted_is_error_naming_timeout()
@@ -422,10 +441,11 @@ if __name__ == "__main__":
         await test_d_deadline_bounded_by_env()
         await test_e_structured_call_disables_streaming_and_reasoning()
         await test_f_fallback_call_disables_reasoning()
+        await test_g_reasoning_override_only_for_openrouter()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK LLM call deadline (six tests)")
+    print("OK LLM call deadline (seven tests)")

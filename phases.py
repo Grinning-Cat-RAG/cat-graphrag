@@ -26,11 +26,11 @@ import json
 from typing import Any
 
 try:
-    from cat.core_plugins.cat_efficient_ingestion.phases import (
+    from cat.plugins.cat_efficient_ingestion.phases import (
         IngestionPhase,
         PhaseResult,
     )
-    from cat.core_plugins.cat_efficient_ingestion.phase_tag_resolver import own_tag
+    from cat.plugins.cat_efficient_ingestion.phase_tag_resolver import own_tag
 except Exception:  # noqa: BLE001 - EffING may be absent; keep the module import-safe
     from abc import ABC, abstractmethod
     from dataclasses import dataclass
@@ -159,14 +159,24 @@ class _GraphPhase(IngestionPhase):
 
         Delegates to ``purge_source_graph_artifacts``: PROVENANCE/MENTIONS and
         SIMILAR_TO edges of the source's Documents, the source's contribution
-        to RELATED_TO ``source_files``, entities left orphaned by that removal
-        and the source's SourceFile node. Chunk Documents, other sources and
-        other tenants are untouched. Re-running it is a no-op.
+        to RELATED_TO ``source_files`` and entities left orphaned by that
+        removal. Chunk Documents, the document-structure graph (owned by the
+        embedding phase), other sources and other tenants are untouched.
+        Re-running it is a no-op.
+
+        Both graph phases write ONE shared graph (entities, PROVENANCE,
+        RELATED_TO), so the purge also removes the SIBLING phase's product.
+        EffING's recovery re-runs only the abandoned phase and the later ones,
+        so the sibling's diary entry is dropped here as well: both phases then
+        re-run instead of the sibling staying ``complete`` over a deleted
+        graph. A failure to do so raises, so EffING retries the delete.
         """
-        handler = graphrag_handler(cat if cat is not None else self._cat)
+        cat = cat if cat is not None else self._cat
+        handler = graphrag_handler(cat)
         if handler is None:
             return
         await handler.purge_source_graph_artifacts(source)
+        await _requeue_sibling_phase(self.id, handler, source, cat)
 
     async def _fingerprint(self, handler) -> str:
         raise NotImplementedError
@@ -194,6 +204,31 @@ class _GraphPhase(IngestionPhase):
             return await super().tag(settings)
         marker = await self._fingerprint(handler)
         return own_tag(self.id, marker)
+
+
+async def _requeue_sibling_phase(phase_id: str, handler, source: str, cat) -> None:
+    """Drop the OTHER graph phase's diary entry for ``source`` (see ``delete``).
+
+    The scope is the one EffING's delete orchestrator publishes; without it the
+    same fallback EffING uses applies (a caller with an ``id`` is chat-scoped,
+    otherwise agent-scoped). Without EffING there is no diary to fix.
+    """
+    sibling = next(pid for pid in _PHASE_CLASSES if pid != phase_id)
+    try:
+        from cat.plugins.cat_efficient_ingestion.registry import reset_phase_entries
+    except ImportError:
+        return
+    scope = None
+    try:
+        from cat.plugins.cat_efficient_ingestion.phases import _DELETE_SCOPE
+
+        scope = _DELETE_SCOPE.get()
+    except ImportError:
+        pass
+    if scope is None:
+        caller_id = getattr(cat, "id", None)
+        scope = str(caller_id) if caller_id else "agent"
+    await reset_phase_entries(handler.agent_id, scope, source, [sibling])
 
 
 class GraphSpacyPhase(_GraphPhase):

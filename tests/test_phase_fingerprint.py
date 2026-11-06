@@ -17,8 +17,8 @@ plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
 and importing this file executes zero code. Run it as a plain script from the
 host checkout:
 
-    cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat-graphrag.my/tests/test_phase_fingerprint.py
+    cd ../grinning-cat-core
+    .venv/bin/python /path/to/cat-graphrag/tests/test_phase_fingerprint.py
 """
 
 if __name__ == "__main__":
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     from pathlib import Path
     from unittest.mock import patch
 
-    PLUGIN_DIR = Path("/root/git/plugins/cat-graphrag.my")
+    PLUGIN_DIR = Path(__file__).resolve().parent.parent
     PACKAGE = "_mygraph_fingerprint"
 
     def _load_handler_module():

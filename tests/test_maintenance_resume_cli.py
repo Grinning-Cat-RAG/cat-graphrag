@@ -18,14 +18,16 @@ Covered:
   (f) ``--all`` vs ``--agent`` scoping (protect system/``__*__`` unless
       explicitly named) and repeatable ``--agent``.
 
-Run it as a plain script (inside the Cat container, where EffING is deployed):
+Run it inside the Cat container (EffING deployed):
 
-    docker exec dev-grinning-cat-core-1 python \\
-        /app/cat/plugins/cat_graphrag/test_maintenance_resume_cli.py
+    docker exec <cat-container> python \\
+        /app/cat/plugins/cat_graphrag/tests/test_maintenance_resume_cli.py
 
-or from the host repository with the container's python, e.g.:
+or from the host, pointing EFFING_DIR at a checkout of cat-efficient-ingestion:
 
-    docker exec dev-grinning-cat-core-1 python - < test_maintenance_resume_cli.py
+    cd ../grinning-cat-core
+    EFFING_DIR=/path/to/cat-efficient-ingestion MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. \\
+        .venv/bin/python /path/to/cat-graphrag/tests/test_maintenance_resume_cli.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -33,6 +35,11 @@ loader imports recursively at activation. The ENTIRE body lives under
 """
 
 if __name__ == "__main__":
+    # Real EffING: deployed in the container, or EFFING_DIR on the host.
+    from effing_checkout import ensure_effing_importable
+
+    ensure_effing_importable()
+
     import asyncio
     import contextlib
     import importlib.util
@@ -43,7 +50,7 @@ if __name__ == "__main__":
     from unittest.mock import patch
 
     def _load_maintenance_agent():
-        path = Path(__file__).with_name("maintenance_agent.py")
+        path = Path(__file__).resolve().parent.parent / "scripts" / "maintenance_agent.py"
         spec = importlib.util.spec_from_file_location(
             "maintenance_agent_resume_under_test", path
         )
@@ -114,9 +121,9 @@ if __name__ == "__main__":
             return self.docs[source]
 
     def _patch_op(store, behaviors):
-        import cat.core_plugins.cat_efficient_ingestion.reembed as effing_reembed
-        import cat.core_plugins.cat_efficient_ingestion.registry as effing_registry
-        import cat.core_plugins.cat_efficient_ingestion.resume as effing_resume
+        import cat.plugins.cat_efficient_ingestion.reembed as effing_reembed
+        import cat.plugins.cat_efficient_ingestion.registry as effing_registry
+        import cat.plugins.cat_efficient_ingestion.resume as effing_resume
 
         async def fake_reembed(ccat, collection, sources, stale_after=None):
             store.reembed_calls.append(

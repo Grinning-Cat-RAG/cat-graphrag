@@ -20,7 +20,7 @@ The Cat plugin loader imports every ``.py`` under a plugin folder at
 activation, so the whole file is inert on import: every import, class and test
 lives inside ``if __name__ == "__main__":``. Run it as a plain script:
 
-    python test_phase_abc_migration.py
+    python tests/test_phase_abc_migration.py
 """
 
 if __name__ == "__main__":
@@ -51,14 +51,14 @@ if __name__ == "__main__":
         """A faithful minimal EffING phase contract (ABC + resolver)."""
 
         for name in (
-            "cat.core_plugins",
-            "cat.core_plugins.cat_efficient_ingestion",
+            "cat.plugins",
+            "cat.plugins.cat_efficient_ingestion",
         ):
             mod = types.ModuleType(name)
             mod.__path__ = []
             sys.modules[name] = mod
 
-        phases = types.ModuleType("cat.core_plugins.cat_efficient_ingestion.phases")
+        phases = types.ModuleType("cat.plugins.cat_efficient_ingestion.phases")
 
         @dataclass(frozen=True)
         class PhaseResult:
@@ -108,7 +108,7 @@ if __name__ == "__main__":
                 ...
 
             async def tag(self, settings=None):
-                from cat.core_plugins.cat_efficient_ingestion.phase_tag_resolver import (
+                from cat.plugins.cat_efficient_ingestion.phase_tag_resolver import (
                     own_tag,
                 )
 
@@ -116,13 +116,36 @@ if __name__ == "__main__":
 
         phases.IngestionPhase = IngestionPhase
         phases.PhaseResult = PhaseResult
+        # Same contract as EffING's phases._DELETE_SCOPE: the delete
+        # orchestrator publishes the source's scope ("agent" or a chat id).
+        import contextvars
+
+        phases._DELETE_SCOPE = contextvars.ContextVar(
+            "effing_delete_scope", default=None
+        )
         sys.modules[phases.__name__] = phases
+
+        # registry.reset_phase_entries: drops diary entries -> phases re-run.
+        registry = types.ModuleType("cat.plugins.cat_efficient_ingestion.registry")
+        registry.reset_calls = []
+        registry.fail_with = None
+
+        async def reset_phase_entries(agent_id, scope, source, phases_to_reset):
+            if registry.fail_with is not None:
+                raise registry.fail_with
+            registry.reset_calls.append(
+                (agent_id, scope, source, sorted(phases_to_reset))
+            )
+            return {}
+
+        registry.reset_phase_entries = reset_phase_entries
+        sys.modules[registry.__name__] = registry
 
         import hashlib
         import json
 
         resolver = types.ModuleType(
-            "cat.core_plugins.cat_efficient_ingestion.phase_tag_resolver"
+            "cat.plugins.cat_efficient_ingestion.phase_tag_resolver"
         )
 
         def own_tag(kind, value):
@@ -140,6 +163,7 @@ if __name__ == "__main__":
         """A GraphRAG handler stand-in: only the phase-facing surface."""
 
         def __init__(self, spacy_marker="spacy-v1", concept_marker="concept-v1"):
+            self.agent_id = "agent-x"
             self.spacy_marker = spacy_marker
             self.concept_marker = concept_marker
             self.artifacts = {"file.pdf": {"entity:A"}, "other.pdf": {"entity:B"}}
@@ -177,7 +201,7 @@ if __name__ == "__main__":
     _IngestionPhase, _PhaseResult, _own_tag = _install_effing_stub()
 
     _pkg = types.ModuleType("catgraphrag_phase")
-    _pkg.__path__ = [__import__("os").path.dirname(__import__("os").path.abspath(__file__))]
+    _pkg.__path__ = [__import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.abspath(__file__)))]
     sys.modules["catgraphrag_phase"] = _pkg
 
     from catgraphrag_phase import phases
@@ -384,6 +408,72 @@ if __name__ == "__main__":
         )
         print("PASS (h) a phase with warnings is complete and not retried")
 
+    async def test_i_delete_requeues_the_sibling_graph_phase():
+        """Both graph phases write ONE shared graph (entities, PROVENANCE,
+        RELATED_TO), so purging it for one phase destroys the other's product.
+        EffING's recovery re-runs only the abandoned phase and the LATER ones
+        (reembed._recover_abandoned_phases): the sibling's diary entry must be
+        dropped too, or it stays ``complete`` over a deleted graph."""
+        registry = sys.modules["cat.plugins.cat_efficient_ingestion.registry"]
+        effing_phases = sys.modules["cat.plugins.cat_efficient_ingestion.phases"]
+        handler = FakeGraphHandler()
+        cat = FakeCat(handler)
+
+        registry.reset_calls.clear()
+        token = effing_phases._DELETE_SCOPE.set("agent")
+        try:
+            await phases.GraphConceptPhase(cat).delete("file.pdf", cat)
+            await phases.GraphSpacyPhase(cat).delete("file.pdf", cat)
+        finally:
+            effing_phases._DELETE_SCOPE.reset(token)
+        assert registry.reset_calls == [
+            ("agent-x", "agent", "file.pdf", ["graph_spacy_extraction"]),
+            ("agent-x", "agent", "file.pdf", ["graph_llm_extraction"]),
+        ], registry.reset_calls
+
+        # Without a published scope: a chat-scoped caller (StrayCat.id) is
+        # chat-scoped, otherwise agent-scoped (EffING's own fallback).
+        registry.reset_calls.clear()
+        chat_cat = FakeCat(handler)
+        chat_cat.id = "chat-7"
+        await phases.GraphConceptPhase(chat_cat).delete("file.pdf", chat_cat)
+        assert registry.reset_calls[-1][1] == "chat-7", registry.reset_calls
+        await phases.GraphConceptPhase(cat).delete("file.pdf", cat)
+        assert registry.reset_calls[-1][1] == "agent", registry.reset_calls
+        print("PASS (i) a graph-phase delete re-queues the sibling graph phase")
+
+    async def test_j_requeue_failure_fails_the_delete():
+        """If the sibling cannot be re-queued, delete() must raise: EffING then
+        leaves the entry processing and retries next pass, instead of
+        resetting only this phase over a graph the sibling still claims."""
+        registry = sys.modules["cat.plugins.cat_efficient_ingestion.registry"]
+        handler = FakeGraphHandler()
+        cat = FakeCat(handler)
+        registry.fail_with = RuntimeError("redis down")
+        try:
+            try:
+                await phases.GraphSpacyPhase(cat).delete("file.pdf", cat)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("delete() swallowed the re-queue failure")
+        finally:
+            registry.fail_with = None
+        print("PASS (j) a failed sibling re-queue fails the delete")
+
+    async def test_k_delete_without_effing_registry_still_purges():
+        """No EffING registry importable means no diary to fix: the purge
+        still runs and delete() does not raise."""
+        saved = sys.modules.pop("cat.plugins.cat_efficient_ingestion.registry")
+        try:
+            handler = FakeGraphHandler()
+            cat = FakeCat(handler)
+            await phases.GraphSpacyPhase(cat).delete("file.pdf", cat)
+            handler.purge_source_graph_artifacts.assert_awaited_once_with("file.pdf")
+        finally:
+            sys.modules["cat.plugins.cat_efficient_ingestion.registry"] = saved
+        print("PASS (k) delete without the EffING registry still purges")
+
     async def _main():
         await test_a_vector_only_agent_is_skipped()
         await test_b_delete_source_scoped_and_idempotent()
@@ -393,10 +483,13 @@ if __name__ == "__main__":
         await test_f_phase_for_accepts_spec_or_id()
         await test_g_concept_phase_declares_llm_budget()
         await test_h_warning_phase_is_complete_not_retried()
+        await test_i_delete_requeues_the_sibling_graph_phase()
+        await test_j_requeue_failure_fails_the_delete()
+        await test_k_delete_without_effing_registry_still_purges()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK phase ABC migration (eight tests)")
+    print("OK phase ABC migration (eleven tests)")

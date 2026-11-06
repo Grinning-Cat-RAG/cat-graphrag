@@ -66,7 +66,10 @@ if __name__ == "__main__":
     def static_audit():
         offenders = []
         for path in sorted(pathlib.Path(REPO_ROOT).rglob("*.py")):
-            if ".git" in path.parts or "__pycache__" in path.parts:
+            # Plugin sources only: hidden dirs (.git, a local .venv, tool
+            # caches) hold third-party code that may even vanish mid-walk.
+            rel_parts = path.relative_to(REPO_ROOT).parts
+            if "__pycache__" in rel_parts or any(p.startswith(".") for p in rel_parts):
                 continue
             for start_line, text in _iter_cypher_strings(path):
                 for offset, line in enumerate(text.splitlines()):

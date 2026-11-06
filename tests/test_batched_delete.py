@@ -383,11 +383,28 @@ if __name__ == "__main__":
             f"larger values rejected"
         )
 
+    async def test_f_phase_purge_keeps_the_source_structure():
+        """A graph-phase purge removes only what the graph phases derived. The
+        ``SourceFile`` node (document structure: PART_OF/NEXT/HAS_SUMMARY) is
+        built by the EMBEDDING phase, which EffING does not re-run when it
+        recovers a graph phase, so the purge must leave it in place."""
+        store = _Store()
+        store.seed(docs=3, related=2, entities=2, similar=1, source="file.pdf")
+        handler = _make_handler(store)
+
+        await handler.purge_source_graph_artifacts("file.pdf")
+
+        assert "file.pdf" in store.sourcefiles, "phase purge deleted the SourceFile"
+        assert store.txns["sourcefile"] == 0, store.txns
+        assert len(store.docs) == 3, "phase purge must never delete chunk Documents"
+        print("(f) PASS  phase purge keeps the SourceFile and the chunk Documents")
+
     async def _run_async():
         await test_a_large_source_is_deleted_in_multiple_transactions()
         await test_b_second_delete_is_a_noop()
         await test_c_lock_is_acquired_once_for_the_whole_delete()
         await test_d_small_source_uses_one_document_transaction()
+        await test_f_phase_purge_keeps_the_source_structure()
 
     def main():
         asyncio.run(_run_async())
