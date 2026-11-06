@@ -454,8 +454,8 @@ class _FakeLLM:
 
 
 def test_derived_graph_calls_llm_without_stray_cat():
-    """Display flag off + CR on, NO stray_cat (vector-db path, e.g.
-    add_points_to_tenant): step 8 must resolve the agent LLM via
+    """Display flag off + CR on, NO stray_cat (a caller that owns step 8 but
+    has no cat, e.g. a recompute): step 8 must resolve the agent LLM via
     _resolve_agent_llm and call _extract_concept_relations."""
     handler = _make_handler(kg=False, cr=True)
     fake_llm = _FakeLLM()
@@ -476,13 +476,10 @@ def test_derived_graph_calls_llm_without_stray_cat():
     assert kwargs.get("llm") is fake_llm
 
 
-def test_derived_graph_defers_llm_to_phase_when_phase_owns_concepts():
-    """EffING phase path (the handler is told so at ingestion start): the
-    vector-db path (no stray_cat, i.e. add_points_to_tenant during the
-    embedding phase) must NOT run step 8 — ``graph_llm_extraction`` owns it,
-    otherwise every source pays the LLM call twice."""
+def test_derived_graph_run_concepts_false_skips_llm():
+    """``run_concepts=False`` builds the structure graph but never resolves or
+    calls the LLM: the caller declares that another path owns step 8."""
     handler = _make_handler(kg=False, cr=True)
-    handler._concepts_owned_by_phase = True
 
     with patch.object(
         type(handler), "_extract_concept_relations", new=AsyncMock()
@@ -490,8 +487,40 @@ def test_derived_graph_defers_llm_to_phase_when_phase_owns_concepts():
         type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
     ) as resolve:
         asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points()
+            "file.pdf", _stored_points(), run_concepts=False
         ))
+
+    resolve.assert_not_awaited()
+    extract.assert_not_awaited()
+
+
+def test_add_points_to_tenant_never_runs_llm_step():
+    """``add_points_to_tenant`` is a storage call on EVERY path (classic
+    RabbitHole, EffING embedding phase, resume/revalidation sweeps): the LLM
+    step has exactly one owner per path (the classic hook, the
+    ``graph_llm_extraction`` phase, ``--graph`` part B), so a fresh handler
+    storing a real-vector batch must not call the LLM."""
+    handler = _make_handler(kg=False, cr=True)
+    points = []
+    for i in range(2):
+        p = _Point(f"doc{i}", chunk_index=i)
+        p.payload["metadata"]["source"] = "file.pdf"
+        p.payload["page_content"] = f"text {i}"
+        p.vector = [0.1, 0.2, 0.3]
+        points.append(p)
+
+    with patch.object(
+        type(handler), "_extract_concept_relations", new=AsyncMock()
+    ) as extract, patch.object(
+        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
+    ) as resolve, patch.object(
+        type(handler), "add_point_to_tenant", new=AsyncMock()
+    ), patch.object(
+        type(handler), "_is_empty_vector_staging_pass", new=AsyncMock(return_value=False)
+    ), patch.object(
+        _plugin("graphrag_handler"), "UpdateResult", lambda **kwargs: kwargs
+    ):
+        asyncio.run(handler.add_points_to_tenant("declarative", points))
 
     resolve.assert_not_awaited()
     extract.assert_not_awaited()
@@ -563,7 +592,8 @@ def main():
         test_recompute_returns_early_when_cr_off,
         test_derived_graph_calls_llm_without_stray_cat,
         test_derived_graph_skips_llm_without_stray_cat_when_cr_off,
-        test_derived_graph_defers_llm_to_phase_when_phase_owns_concepts,
+        test_derived_graph_run_concepts_false_skips_llm,
+        test_add_points_to_tenant_never_runs_llm_step,
         test_student_flag_changes_nothing,
     ]
     for test in tests:

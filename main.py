@@ -104,15 +104,8 @@ async def rabbithole_ingestion_processing(source, cat) -> None:
     EffING, silently skipping entity embeddings. Idempotent (see
     ``_inject_embedder``), so on the classic flow — which emits both hooks — the
     second injection changes nothing.
-
-    It also tells the handler whether the EffING phase path owns the LLM
-    concept step for this ingestion (see ``_concepts_owned_by_phase``), so the
-    embedding-time derived graph does not repeat ``graph_llm_extraction``.
     """
     await _inject_embedder(cat)
-    handler = _graphrag_handler(cat)
-    if handler is not None:
-        handler._concepts_owned_by_phase = await _phase_path_active(cat)
 
 
 @hook(priority=10)

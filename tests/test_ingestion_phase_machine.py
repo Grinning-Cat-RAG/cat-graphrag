@@ -767,26 +767,6 @@ def test_rabbithole_hook_keeps_classic_path_with_core_engine():
         _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
 
 
-def test_ingestion_start_tells_handler_who_owns_concepts():
-    """``rabbithole_ingestion_processing`` records on the handler whether the
-    phase path is active, so the embedding-time derived graph leaves the LLM
-    step to ``graph_llm_extraction`` (no double LLM call per source)."""
-    from catgraphrag_phase import main
-
-    handler = _make_handler()
-    cat = _FakeCat(handler)
-    with patch.object(main, "_inject_embedder", new=AsyncMock()):
-        _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
-        asyncio.run(main.rabbithole_ingestion_processing("file.pdf", cat))
-        assert handler._concepts_owned_by_phase is True
-        _RESOLVED_INGESTION["name"] = "BaseIngestionConfiguration"
-        try:
-            asyncio.run(main.rabbithole_ingestion_processing("file.pdf", cat))
-        finally:
-            _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
-        assert handler._concepts_owned_by_phase is False
-
-
 def test_phase_path_active_truth_table():
     """uninstalled -> False; installed+core engine -> False; installed+efficient -> True."""
     from catgraphrag_phase import main
@@ -1123,7 +1103,6 @@ def main():
         test_rabbithole_hook_keeps_classic_path_when_effing_absent,
         test_rabbithole_hook_keeps_classic_path_with_core_engine,
         test_phase_path_active_truth_table,
-        test_ingestion_start_tells_handler_who_owns_concepts,
         test_transfer_cleanup_noop_on_failure,
         test_transfer_cleanup_noop_when_new_handler_is_graphrag,
         test_transfer_cleanup_wipes_on_success_when_new_handler_not_graphrag,

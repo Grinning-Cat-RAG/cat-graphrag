@@ -1461,9 +1461,9 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
          as ``recompute_concept_relations``), grouped by ``metadata.source``;
       A2 re-walk — per doc, ``_extract_and_link_entities`` +
          ``_create_similarity_relationships`` INLINE (Metis #8);
-      A3 derived — per source, ``create_derived_graph_for_source`` WITHOUT
-         ``stray_cat`` (Metis #6: passing it would double-run the LLM part B
-         and inflate ``RELATED_TO.weight`` by +0.5 per run); warns when a
+      A3 derived — per source, ``create_derived_graph_for_source`` with
+         ``run_concepts=False``: the LLM concept step is part B's, running it
+         here too would call the LLM twice per source; warns when a
          point lacks ``chunk_index`` (derived structure not rebuildable,
          Metis #5);
       A4 gen re-check — per batch, re-read the Epoch token; on drift from
@@ -1554,7 +1554,10 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
             )
             for d in src_docs
         ]
-        await handler.create_derived_graph_for_source(source, points)
+        # Structure only: the LLM concept step is part B's.
+        await handler.create_derived_graph_for_source(
+            source, points, run_concepts=False
+        )
 
     return True
 

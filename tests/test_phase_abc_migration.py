@@ -299,7 +299,9 @@ if __name__ == "__main__":
 
         Diary writes, staleness, locks, retries and status derivation all
         belong to EffING; the plugin only declares + executes + cleans up.
-        Guard the module source so a future edit cannot reintroduce them.
+        The ONE allowed diary write is the sibling reset in ``delete``
+        (``reset_phase_entries``, see test (i)); guard the module source so a
+        future edit cannot reintroduce anything else.
         """
         import inspect
 
@@ -309,9 +311,16 @@ if __name__ == "__main__":
             "should_abandon",
             "distributed_lock",
             "derive_source_status",
+            "set_status(",
+            " set_phase(",
+            ".set_phase(",
+            "crud.",
         )
         found = [name for name in forbidden if name in source]
         assert not found, f"phase module re-implements protocol logic: {found}"
+        assert source.count("reset_phase_entries(") == 1, (
+            "the sibling reset in delete() must be the module's only diary write"
+        )
         print("PASS (e) phase module contains no diary/state/lock/retry protocol")
 
     async def test_f_phase_for_accepts_spec_or_id():

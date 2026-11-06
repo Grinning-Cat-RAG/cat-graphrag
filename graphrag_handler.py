@@ -315,12 +315,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # extraction succeeds (or terminally fails) so a later re-ingestion
         # starts a fresh budget.
         self._concept_attempts: Dict[str, int] = {}
-        # True while the EffING phase path is active (set by the plugin's
-        # ``rabbithole_ingestion_processing`` hook at every ingestion start):
-        # ``graph_llm_extraction`` then owns the LLM concept step, so the
-        # vector-db derived graph (``add_points_to_tenant``) must not repeat it.
-        # The engine selection is system-level, so one flag per handler holds.
-        self._concepts_owned_by_phase: bool = False
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
@@ -2714,9 +2708,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 point_index=index,
             )
 
-        # Derived graph (SourceFile / NEXT / Section / ... and, in step 8, the
-        # LLM concept-relation extraction) follows the SAME pass discriminator:
-        # skipped only when the whole batch is the empty-vector staging pass.
+        # Derived structure graph (SourceFile / NEXT / Section / ...) follows
+        # the SAME pass discriminator: skipped only when the whole batch is the
+        # empty-vector staging pass. The LLM concept step is NOT run here.
         batch_is_staging = bool(points) and all(staging_flags)
         if not batch_is_staging:
             sources: Dict[str, List[PointStruct]] = {}
@@ -2726,7 +2720,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if src:
                     sources.setdefault(src, []).append(p)
             for source, src_points in sources.items():
-                await self.create_derived_graph_for_source(source, src_points)
+                # Structure only: the LLM step has one owner per path (classic
+                # hook / EffING phase / --graph part B); running it here too
+                # called the LLM twice per source on every engine.
+                await self.create_derived_graph_for_source(
+                    source, src_points, run_concepts=False
+                )
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
@@ -3820,12 +3819,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         source: str,
         stored_points: List[PointStruct],
         stray_cat=None,
+        run_concepts: bool = True,
     ) -> None:
         """
         Create derived graph nodes and relations after all documents for a
-        source have been ingested.  Handles chunkers with different metadata
-        profiles gracefully — only creates structure that the available metadata
-        supports.
+        source have been ingested.
+
+        ``run_concepts=False`` builds the structure only (steps 1-7) and skips
+        the LLM concept step 8: the caller declares that another path owns it
+        (``add_points_to_tenant`` on every engine, ``--graph`` part A3).
+
+        Handles chunkers with different metadata profiles gracefully — only
+        creates structure that the available metadata supports.
 
         Always created (require only source; ordering uses start_index when the
         chunker provides it, falling back to chunk_index, and finally to the
@@ -4016,25 +4021,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         # 8 — LLM-based concept relation extraction (gated on
         # enable_concept_relations; enable_knowledge_graph is display-only).
-        # Self-contained: when no
-        # stray_cat is available (vector-db path via add_points_to_tenant — the
-        # plugin hooks are unreliable under the multi-worker toggle race, so
-        # they cannot be the trigger), the agent LLM is resolved directly from
-        # the saved agent config via _resolve_agent_llm().
-        # On the vector-db path (no stray_cat) under the EffING phase path the
-        # ``graph_llm_extraction`` phase owns this step: running it here too
-        # would call the LLM twice per source.
-        defer_to_phase = stray_cat is None and self._concepts_owned_by_phase
-        if self._enable_concept_relations and not defer_to_phase:
+        # ONE owner per path: the classic ``after_rabbithole_stored_documents``
+        # hook, the EffING ``graph_llm_extraction`` phase, ``--graph`` part B.
+        # Storage-only callers pass run_concepts=False. Without a stray_cat the
+        # agent LLM is resolved from the saved agent config.
+        if run_concepts and self._enable_concept_relations:
             try:
                 if stray_cat is not None:
                     outcome = await self._extract_concept_relations(
                         source, stored_points, stray_cat
                     )
                 else:
-                    # Vector-db path (no stray_cat): resolve the agent LLM
-                    # explicitly so a missing LLM is a configuration ERROR,
-                    # never a silent no-op.
+                    # No stray_cat: resolve the agent LLM explicitly so a
+                    # missing LLM is a configuration ERROR, never a silent no-op.
                     llm = await self._resolve_agent_llm()
                     if llm is not None:
                         outcome = await self._extract_concept_relations(
@@ -4057,9 +4056,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def _resolve_agent_llm(self) -> Optional[Any]:
         """Resolve the agent's configured LLM without a ``StrayCat`` reference.
 
-        Self-contained vector-db path: step 8 of ``create_derived_graph_for_source``
-        also runs from ``add_points_to_tenant``, where no ``stray_cat`` is passed
-        and the plugin hooks are unreliable (multi-worker toggle race). The LLM
+        Used when the LLM concept step runs without a ``stray_cat`` (e.g. the
+        concept recompute and the EffING phase body). The LLM
         is resolved through the official ``ServiceProvider`` against the agent's
         saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
         any configured LLM class works (not just the probe's OpenRouterLLM).
@@ -4227,7 +4225,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
         # LLM (hook path), then a self-contained resolve from the agent config
-        # (vector-db path, no stray_cat). A missing/default LLM is a
+        # (no stray_cat). A missing/default LLM is a
         # CONFIGURATION error, never a silent no-op.
         if llm is None:
             if stray_cat is not None:

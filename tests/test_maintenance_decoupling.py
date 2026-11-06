@@ -230,12 +230,47 @@ if __name__ == "__main__":
         print("PASS (d): --reingest for a GraphRAG agent is unchanged")
 
 
+    async def _case_graph_part_a_leaves_llm_to_part_b() -> None:
+        """--graph part A3 rebuilds the document structure only: the LLM step
+        belongs to part B, so A3 must not run it a second time per source."""
+        from unittest.mock import AsyncMock
+
+        handler = SimpleNamespace(
+            _walk_gen="v1",
+            _read_generation=AsyncMock(return_value="v1"),
+            create_derived_graph_for_source=AsyncMock(),
+        )
+        docs = [
+            {"id": "d1", "content": "a", "metadata": {"source": "f.pdf", "chunk_index": 0}},
+        ]
+        names = ("_graph_wipe", "_reset_graph_phase_entries", "_graph_fetch_docs", "_graph_walk_batch")
+        orig = tuple(getattr(m, n) for n in names)
+        m._graph_wipe = AsyncMock()
+        m._reset_graph_phase_entries = AsyncMock()
+        m._graph_fetch_docs = AsyncMock(return_value=docs)
+        m._graph_walk_batch = AsyncMock()
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ok = await m._op_graph_part_a(FakeCcat(), handler, "declarative")
+        finally:
+            for n, v in zip(names, orig):
+                setattr(m, n, v)
+        if not ok:
+            _fail(f"part A failed: {buf.getvalue()!r}")
+        call = handler.create_derived_graph_for_source.await_args
+        if call is None or call.kwargs.get("run_concepts") is not False:
+            _fail(f"part A3 did not disable the LLM step: {call!r}")
+        print("PASS (e): --graph part A3 leaves the LLM step to part B")
+
+
     async def _main() -> int:
         try:
             await _case_reingest_non_graphrag()
             await _case_graph_non_graphrag_skipped()
             await _case_preflight_blocks()
             await _case_reingest_graphrag_unchanged()
+            await _case_graph_part_a_leaves_llm_to_part_b()
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - report and fail

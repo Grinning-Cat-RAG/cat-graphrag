@@ -14,9 +14,12 @@ imported lazily (FX-9: the plugin loader reloads ``main.py`` before
 ``graphrag_handler.py``, so a module-level binding would compare against the
 PRE-reload class and every ``isinstance`` guard would fail).
 
-``delete`` is source-scoped and idempotent: it only removes the graph
-artefacts derived from the given source (``purge_source_graph_artifacts``),
-never the chunk Documents, other sources or other tenants.
+``delete`` is source-scoped and idempotent: it removes the graph artefacts
+derived from the given source (``purge_source_graph_artifacts``), never the
+chunk Documents, the document structure, other sources or other tenants. Its
+ONE write to EffING's diary is intentional: the purge also removes the sibling
+graph phase's product, so the sibling's entry is dropped too
+(``reset_phase_entries``) and EffING re-runs both phases.
 """
 
 from __future__ import annotations

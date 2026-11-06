@@ -69,7 +69,7 @@ At runtime it provides:
 
 - a custom vector database handler: `GraphRAGHandler`
 - a settings model: `Neo4jGraphRAGConfig`, registered through `factory_allowed_vector_databases`
-- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the EffING phase registration (`ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `before_ingestion_status_completed`)
+- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the EffING phase registration (`ingestion_phase_objects`, `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `ingestion_phase_purge` — which also re-queues the sibling graph phase —, `before_ingestion_status_completed`)
 - a query hook that captures the raw user message before memory recall
 - maintenance hooks: boot-time provenance reconciliation, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
 
