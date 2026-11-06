@@ -11,7 +11,7 @@ plugin registry once, lazily, and be idempotent.
 
 Run INSIDE the container (like test_backfill_duplicates.py):
 
-    docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/test_maintenance_lizard_bootstrap.py
+    docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/tests/test_maintenance_lizard_bootstrap.py
 
 IMPORT-SAFETY: this file lives in the plugin folder, which the Cat plugin
 loader imports recursively at activation. The ENTIRE body lives under
@@ -30,7 +30,7 @@ if __name__ == "__main__":
 
     async def _check() -> int:
         from cat.looking_glass.bill_the_lizard import BillTheLizard
-        from cat.plugins.cat_graphrag.maintenance_agent import _ensure_lizard_booted
+        from cat.plugins.cat_graphrag.scripts.maintenance_agent import _ensure_lizard_booted
 
         # Fresh process: the lizard must NOT be bootstrapped yet, so the empty
         # registry is the state the bug reproduced in.

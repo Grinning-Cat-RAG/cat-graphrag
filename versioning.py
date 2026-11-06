@@ -13,10 +13,79 @@ Two decorators implement the converged detect-and-rerun-once design:
   changed mid-run, re-initialise the versioned names and re-run the whole
   function once (max 2 attempts total; a second mismatch raises
   ``RuntimeError``). No transactions.
+
+``with_transient_retry`` retries a write operation ONLY on Neo4j
+``TransientError`` (deadlock / lock / leader / termination), with bounded
+exponential backoff and jitter.
 """
 
+import asyncio
 import functools
-from typing import Any, Callable
+import random
+from typing import Any, Awaitable, Callable
+
+from cat.log import log
+
+# Only transient failures are retried. ``TransientError`` covers the lock /
+# leader / termination family (``DeadlockDetected``, ``LockClientStopped``,
+# ``LeaderSwitch``, ``Termination``); anything else must propagate untouched.
+# The guarded alias keeps this module importable by the standalone harnesses
+# whose neo4j stub only defines ``Neo4jError``; the empty-tuple fallback
+# matches nothing, so an unresolved class never causes retry-everything.
+_TRANSIENT_ERROR_TYPES: tuple[type[BaseException], ...]
+try:  # pragma: no cover - the fallback only matters for those test stubs
+    from neo4j.exceptions import TransientError as _TransientError
+    _TRANSIENT_ERROR_TYPES = (_TransientError,)
+except ImportError:  # pragma: no cover
+    _TRANSIENT_ERROR_TYPES = ()
+
+# Upper bound for a single backoff sleep, independent of the attempt number.
+_MAX_RETRY_DELAY = 1.0
+
+
+def _retry_delay(attempt: int, base_delay: float, max_delay: float) -> float:
+    """Exponential backoff for ``attempt`` (1-based) with jitter, capped.
+
+    The cap is applied AFTER jitter so the returned delay is always
+    ``0 < delay <= max_delay`` regardless of attempt or jitter draw.
+    """
+    raw = base_delay * (2 ** (attempt - 1))
+    return min(max_delay, raw * (0.5 + random.random()))
+
+
+async def with_transient_retry(
+    coro_factory: Callable[[], Awaitable[Any]],
+    *,
+    attempts: int = 4,
+    base_delay: float = 0.05,
+    max_delay: float = _MAX_RETRY_DELAY,
+    operation: str = "Neo4j write",
+) -> Any:
+    """Run ``coro_factory()`` retrying ONLY Neo4j transient errors.
+
+    A deadlock/lock/leader/termination failure is transient: retry with
+    exponential backoff + jitter up to ``attempts`` total tries, logging one
+    WARNING per retry. When the attempts are exhausted, or for any
+    non-transient error, the ORIGINAL exception is re-raised (never swallowed).
+
+    ``coro_factory`` must be a zero-argument callable returning a FRESH
+    awaitable, so every attempt starts a new coroutine.
+    """
+    if attempts < 1:
+        attempts = 1
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except _TRANSIENT_ERROR_TYPES as exc:
+            if attempt >= attempts:
+                raise
+            delay = _retry_delay(attempt, base_delay, max_delay)
+            log.warning(
+                f"[GraphRAG] Transient Neo4j error during {operation} "
+                f"(attempt {attempt}/{attempts}): {exc}; retrying in {delay:.3f}s"
+            )
+            await asyncio.sleep(delay)
 
 
 def ensure_version(fn: Callable[..., Any]) -> Callable[..., Any]:

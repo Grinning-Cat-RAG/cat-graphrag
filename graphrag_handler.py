@@ -1,5 +1,6 @@
 import random
 import math
+import os
 import uuid
 import json
 import re
@@ -11,7 +12,7 @@ from neo4j.exceptions import Neo4jError
 from langchain_core.documents import Document as LangChainDocument
 from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
-from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings, AgenticWorkflowTask
+from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
 from cat.services.memory.models import (
     DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
 )
@@ -26,11 +27,22 @@ try:
 except ImportError:
     distributed_lock = None
 
+from .batched_delete import delete_in_batches
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
 from .models import EntityType
+from .source_graph_writer import (
+    GRAPH_WRITE_BATCH_MAX_ITEMS,
+    write_source_graph,
+)
 from .structured_llm import StructuredLLM, StructuredLLMError
-from .versioning import ensure_version, retry_on_generation_change
+from .tenant_write_lock import (
+    TenantWriteLockTimeout,
+    acquire_tenant_write_lock,
+    detached_write_task,
+    tenant_write_locked,
+)
+from .versioning import ensure_version, retry_on_generation_change, with_transient_retry
 
 # Last-known GraphRAG connection config per agent, captured in ``_connect``
 # whenever a handler connects. Used by the old-store cleanup on vector-memory
@@ -39,6 +51,152 @@ from .versioning import ensure_version, retry_on_generation_change
 # the wipe must reconnect with the params the handler last used. Import-safe:
 # plain module-level dict, no side effects.
 _last_graphrag_config: Dict[str, Dict[str, Any]] = {}
+
+
+#: Default wall-clock deadline (seconds) for ONE structured LLM call. A
+#: streaming response has no overall deadline, so the phase must bound the
+#: await itself; without it a stalled socket keeps the phase ``processing``
+#: forever and the not-ready budget never gets a chance to run.
+LLM_CALL_TIMEOUT_DEFAULT_SECONDS = 180.0
+
+
+def llm_call_timeout_seconds() -> float:
+    """Wall-clock deadline for one structured LLM extraction call.
+
+    ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS`` overrides the 180 s default.
+    Invalid (non-numeric, non-finite or non-positive) values fall back to the
+    default, the same validation the plugin's other budgets apply.
+    """
+    raw = os.environ.get("CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS")
+    if raw is None:
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            f"[GraphRAG] Invalid CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS={raw!r}; "
+            f"using default {LLM_CALL_TIMEOUT_DEFAULT_SECONDS:.0f}s"
+        )
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        log.warning(
+            f"[GraphRAG] Non-positive/non-finite "
+            f"CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS={value}; "
+            f"using default {LLM_CALL_TIMEOUT_DEFAULT_SECONDS:.0f}s"
+        )
+        return LLM_CALL_TIMEOUT_DEFAULT_SECONDS
+    return value
+
+
+#: Reasoning override applied to the structured extraction call ONLY.
+#:
+#: ``~deepseek/deepseek-flash-latest`` is a reasoning model whose alias defaults
+#: to reasoning enabled at effort ``high``. A real extraction generated ~6.6k
+#: hidden reasoning tokens — 79 % of the output — which made latency 23–93 s and
+#: occasionally pushed one call past the 180 s deadline. Disabling reasoning for
+#: this one call removes those tokens; concept/relation extraction only needs the
+#: final JSON, not a chain of thought. The agent's global LLM is never mutated.
+EXTRACTION_REASONING_OVERRIDE: Dict[str, Any] = {"enabled": False}
+
+
+def _supports_extra_body(llm: Any) -> bool:
+    """Whether ``llm`` accepts a per-call ``extra_body`` (ChatOpenAI/OpenRouter)."""
+    return "extra_body" in (getattr(type(llm), "model_fields", None) or {})
+
+
+#: Name prefix of the background similarity tasks (see ``add_point_to_tenant``).
+_SIMILARITY_TASK_PREFIX = "graphrag-similarity:"
+
+
+def _is_openrouter(llm: Any) -> bool:
+    """Whether ``llm`` targets OpenRouter, the only API that knows ``reasoning``.
+
+    A plain OpenAI-compatible endpoint rejects unknown request arguments, so
+    the override is sent only when the base URL is OpenRouter's.
+    """
+    for attr in ("openai_api_base", "base_url", "api_base"):
+        value = getattr(llm, attr, None)
+        if value and "openrouter.ai" in str(value).lower():
+            return True
+    return False
+
+
+def _extraction_call_kwargs(llm: Any) -> Dict[str, Any]:
+    """Per-call kwargs for the extraction invocation (never mutate ``llm``)."""
+    kwargs: Dict[str, Any] = {"stream": False}
+    if _supports_extra_body(llm) and _is_openrouter(llm):
+        kwargs["extra_body"] = {"reasoning": dict(EXTRACTION_REASONING_OVERRIDE)}
+    return kwargs
+
+
+class _NonStreamingStructuredLLM:
+    """Per-call view: no streaming (and, on OpenRouter, no reasoning) for ONE extraction call.
+
+    The LangChain idiom ``llm.bind(streaming=False)`` does NOT survive the
+    native structured path: a ``RunnableBinding`` forwards
+    ``with_structured_output`` to the UNBOUND model
+    (``RunnableBinding.__getattr__``), so the binding's kwargs never reach the
+    call. This view applies a falsy ``stream`` kwarg to the runnable that is
+    actually invoked (``BaseChatModel._streaming_disabled`` honors it), with a
+    ``bind`` fallback for models whose ``with_structured_output`` rejects extra
+    kwargs.
+
+    When the base URL is OpenRouter (``_is_openrouter``) it also sends the
+    ``reasoning`` override through ``extra_body``: the extraction model reasons
+    at effort ``high`` by default, spending most of its output on hidden
+    tokens. Other providers reject that field and never receive it. The agent's
+    global LLM/config is never mutated.
+    """
+
+    #: Exposed so a caller/test can assert streaming is off for this view.
+    streaming = False
+
+    def __init__(self, llm: Any):
+        self._llm = llm
+        #: Exposed so a caller/test can assert the per-call override.
+        self.call_kwargs = _extraction_call_kwargs(llm)
+
+    def with_structured_output(self, output_model: Any) -> Any:
+        try:
+            # ChatOpenAI/OpenRouterLLM pass extra kwargs through to
+            # ``bind_tools``, so ``stream`` and ``extra_body`` reach the request.
+            return self._llm.with_structured_output(
+                output_model, **self.call_kwargs
+            )
+        except (AttributeError, TypeError, ValueError):
+            bounded = self._llm.with_structured_output(output_model)
+            try:
+                return bounded.bind(**self.call_kwargs)
+            except (AttributeError, TypeError):
+                return bounded
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        call_kwargs = {**self.call_kwargs, **kwargs}
+        try:
+            bound = self._llm.bind(**call_kwargs)
+        except (AttributeError, TypeError):
+            return await self._llm.ainvoke(*args, **kwargs)
+        return await bound.ainvoke(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._llm, name)
+
+
+def _without_streaming(llm: Any) -> Any:
+    """Return a no-streaming view of ``llm`` for the structured call (no reasoning on OpenRouter)."""
+    if hasattr(llm, "with_structured_output"):
+        return _NonStreamingStructuredLLM(llm)
+    try:
+        return llm.bind(**_extraction_call_kwargs(llm))
+    except (AttributeError, TypeError):
+        return llm
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    """Whether ``error`` is a wall-clock or client-side timeout."""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    return "timeout" in type(error).__name__.lower()
 
 
 def _upper_str(value: Any) -> str:
@@ -122,7 +280,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         graph_retrieval_depth: int = 2,
         graph_decay_factor: float = 0.5,
         connection_pool_size: int = 50,
-        enable_derived_graph: bool = False,
         enable_concept_relations: bool = False,
         concept_relations_prompt: str | None = None,
         concept_definitions: str | None = None,
@@ -149,8 +306,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_retrieval_depth=graph_retrieval_depth
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
-        self._enable_derived_graph = enable_derived_graph
         self._enable_concept_relations = enable_concept_relations
+        # Per-source LLM-extraction attempt counter (process-local). The diary
+        # ``attempt`` is not exposed to the phase body (EffING passes only
+        # completed phases to ``ingestion_phase_run`` and the handler has no
+        # scope to read the current ``processing`` entry), so the first
+        # ``not_ready`` -> ``error`` transition is tracked here. Reset when the
+        # extraction succeeds (or terminally fails) so a later re-ingestion
+        # starts a fresh budget.
+        self._concept_attempts: Dict[str, int] = {}
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
         self._relation_definitions = parse_definitions(relation_definitions or DEFAULT_RELATION_DEFINITIONS)
@@ -170,15 +334,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # phase can join ONLY this source's work. Tasks are also in the flat
         # ``_pending_entity_tasks`` list (close() drains both).
         self._pending_source_tasks: Dict[str, List[asyncio.Task]] = {}
-        # Semaphore: caps concurrent Neo4j write transactions to reduce lock
-        # contention and deadlock probability during bulk PDF ingestion.
-        # Shared between entity extraction and similarity writes.
-        self._neo4j_write_semaphore = asyncio.Semaphore(4)
+        # Neo4j write transactions are serialised per tenant by the tenant
+        # write lock (see tenant_write_lock.py) and, on the graph path, by the
+        # one-transaction-per-source writer (source_graph_writer.py). This
+        # semaphore stays at 1 as a belt-and-braces guard: it must never allow
+        # more than one concurrent write transaction, which is exactly the
+        # condition that deadlocked on shared Entity nodes. Do not raise it and
+        # do not make it configurable.
+        self._neo4j_write_semaphore = asyncio.Semaphore(1)
         self._user_message = None
         self._embedder: Optional[Embeddings] = None
         # In-process fallback lock for reembed_tenant when the Cat distributed
         # lock is unavailable (see the module-level try/except import).
         self._reembed_lock = asyncio.Lock()
+
+        # Per-tenant in-process fallback locks for the tenant write lock when
+        # ``cat.db.crud.distributed_lock`` is unavailable (standalone harness).
+        # Production always uses the distributed lock (see tenant_write_lock).
+        self._local_write_locks: Dict[str, asyncio.Lock] = {}
 
         # Lazy embedder-alignment guard: the embedder is injected by the
         # plugin hooks AFTER the core bootstrap, so initialize() cannot rely
@@ -224,13 +397,75 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "graph_retrieval_depth": self._graph_retrieval_depth,
             "graph_decay_factor": self._graph_decay_factor,
             "connection_pool_size": self._connection_pool_size,
-            "enable_derived_graph": self._enable_derived_graph,
         }
 
     def _is_valid_vector(self, vector: List[float]) -> bool:
         """Check if a vector has non-zero and finite L2-norm."""
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
+
+    @staticmethod
+    def _is_empty_mapping(vector) -> bool:
+        """Whether the point carries EffING's ``vector={}`` empty mapping.
+
+        The staging pass writes ``vector={}`` (a truthy-type but empty
+        ``dict``), NOT a numeric zero-norm vector: ``_store_empty_vectors``
+        builds ``PointStruct(..., vector={})``. The classic core never does
+        this — ``RabbitHole.store_documents`` always writes the list returned
+        by ``embedder.embed_documents`` (a zero-norm *list* on a fallback), and
+        the multimodal image hook either embeds the image or drops it. So an
+        empty mapping can only come from the two-phase machine.
+        """
+        return isinstance(vector, dict) and not vector
+
+    async def _is_empty_vector_staging_pass(
+        self, source: Optional[str], metadata: Dict | None, vector=None
+    ) -> bool:
+        """Whether this write belongs to EffING's empty-vector staging pass.
+
+        The efficient engine stores every chunk TWICE: once in the
+        ``parsing_chunking`` phase with ``vector={}`` (``_store_empty_vectors``)
+        and again in the ``embedding`` phase with real vectors (or
+        payload-only for images). Graph extraction is vector-independent, so
+        it must run on the second pass only.
+
+        The discriminator is the CONJUNCTION of two signals:
+
+        1. the point carries the empty mapping ``vector={}`` (see
+           :meth:`_is_empty_mapping`) — written ONLY by EffING's staging pass;
+           and
+        2. the source's recorded phase is ``parsing_chunking`` — EffING sets
+           it before ``_run_parsing_phase`` (``set_phase``), and its
+           ``embedding`` pass (which may legitimately still carry ``{}`` for a
+           payload-only image) is a different phase.
+
+        The ``resume_owner`` lease is deliberately NOT used: the host never
+        clears it on a terminal status (only ``resume_created``), and the core
+        ingestion rewrites ``phase=parsing_chunking`` for EVERY ingestion, so a
+        classic re-ingest after an EffING ingest inherited
+        ``resume_owner``+``parsing_chunking`` and the graph was silently
+        skipped. The empty mapping is an intrinsic property of the write and
+        cannot fire on the classic path (always a list, zero-norm included).
+
+        Vector VALIDITY is still not the discriminator: a legitimate
+        payload-only / zero-norm vector (list) MUST build the graph.
+
+        No status doc / no empty mapping (classic path, direct writes) means
+        "not a staging pass": build the graph, exactly as before.
+        """
+        if not source or not self._is_empty_mapping(vector):
+            return False
+        try:
+            from cat.plugins.cat_efficient_ingestion import registry
+
+            chat_id = (metadata or {}).get("chat_id")
+            scope = str(chat_id) if chat_id else "agent"
+            doc = await registry.get_status(self.agent_id, scope, source)
+        except Exception:  # noqa: BLE001 - never let the discriminator break a write
+            return False
+        if not doc:
+            return False
+        return doc.get("phase") == registry.PHASE_PARSING_CHUNKING
 
     @staticmethod
     def _next_generation(gen: str) -> str:
@@ -293,7 +528,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     # key does not exist") that Neo4j emits on a fresh database before any
                     # schema elements have been written.  These are harmless — queries that
                     # match nothing simply return zero rows — but pollute the log on startup.
-                    notifications_disabled_categories=["UNRECOGNIZED"],
+                    notifications_disabled_classifications=["UNRECOGNIZED"],
                     **self._neo4j_kwargs,
                 )
                 assert isinstance(self._driver, AsyncDriver)
@@ -466,6 +701,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 log.error(f"{node_label} index creation warning: {e}")
                 raise e
 
+    @tenant_write_locked("_create_similarity_relationships_for_gen")
     async def _create_similarity_relationships_for_gen(
         self,
         point_id: str,
@@ -498,16 +734,24 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if not similar:
                 return
             similar.sort(key=lambda s: s["id"])
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.run(
-                        cast(LiteralString, self._compile_query("create_similar_rel", gen)),
-                        similar=similar,
-                        point_id=point_id,
-                    )
+
+            async def _write_similar():
+                async with self._neo4j_write_semaphore:
+                    async with self._get_session() as session:
+                        await session.run(
+                            cast(LiteralString, self._compile_query("create_similar_rel", gen)),
+                            similar=similar,
+                            point_id=point_id,
+                        )
+
+            await with_transient_retry(
+                _write_similar, operation="create similarity relationships"
+            )
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
+            raise
 
+    @tenant_write_locked("gc generation")
     async def _gc_generation(self, tenant_id: str, gen: str) -> None:
         """Drop the old generation's index, SIMILAR_TO edges and embedding property.
 
@@ -616,9 +860,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         if not docs:
             # Nothing to re-embed — still flip + GC so the schema stays
-            # consistent for the tenant.
-            await self._set_generation(tenant_id, new_gen)
-            await self._gc_generation(tenant_id, old_gen)
+            # consistent for the tenant. LOCK SCOPE: only these Neo4j writes
+            # run under the tenant write lock.
+            async with acquire_tenant_write_lock(
+                self, tenant_id, "_reembed_tenant_impl"
+            ):
+                await self._set_generation(tenant_id, new_gen)
+                await self._gc_generation(tenant_id, old_gen)
             log.info(
                 f"[GraphRAG] reembed_tenant({tenant_id}): no documents, "
                 f"flipped {old_gen} -> {new_gen}"
@@ -626,6 +874,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return
 
         # 2. Re-embed all contents with the new embedder (non-blocking).
+        # LOCK SCOPE: the embedding runs OUTSIDE the tenant write lock. The
+        # lock covers only the Neo4j writes below — holding it across the
+        # embedder call made other writers wait minutes and abort.
         contents = [content for _, content, _ in docs]
         vectors = await asyncio.to_thread(new_embedder.embed_documents, contents)
 
@@ -642,68 +893,69 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     "zero or non-finite vector"
                 )
 
-        if payload:
+        async with acquire_tenant_write_lock(self, tenant_id, "_reembed_tenant_impl"):
+            if payload:
+                async with self._get_session() as session:
+                    await session.run(
+                        cast(
+                            LiteralString,
+                            f"""
+                            UNWIND $docs AS d
+                            MATCH (doc:Document {{id: d.id, tenant_id: $tenant_id}})
+                            SET doc.{new_names["embedding_prop"]} = d.vector
+                            """,
+                        ),
+                        docs=payload,
+                        tenant_id=tenant_id,
+                    )
+
+            # 4. Create the new vector index at the new embedder's dimensions.
+            async with self._get_session() as session:
+                await self._ensure_vector_index_in_session(
+                    session,
+                    new_names["index"],
+                    new_names["embedding_prop"],
+                    new_embedder.size,
+                )
+
+            # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
+            #     embeddings are NOT recomputed on a swap — carry them forward from
+            #     the old generation into the new one (same vectors, new property),
+            #     and create the new entity vector index.
+            old_names = self._versioned_names(old_gen)
             async with self._get_session() as session:
                 await session.run(
                     cast(
                         LiteralString,
                         f"""
-                        UNWIND $docs AS d
-                        MATCH (doc:Document {{id: d.id, tenant_id: $tenant_id}})
-                        SET doc.{new_names["embedding_prop"]} = d.vector
+                        MATCH (e:Entity {{tenant_id: $tenant_id}})
+                        WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
+                        SET e.{new_names["entity_embedding_prop"]} =
+                            e.{old_names["entity_embedding_prop"]}
                         """,
                     ),
-                    docs=payload,
                     tenant_id=tenant_id,
                 )
+                await self._ensure_vector_index_in_session(
+                    session,
+                    new_names["entity_index"],
+                    new_names["entity_embedding_prop"],
+                    new_embedder.size,
+                    node_label="Entity",
+                )
 
-        # 4. Create the new vector index at the new embedder's dimensions.
-        async with self._get_session() as session:
-            await self._ensure_vector_index_in_session(
-                session,
-                new_names["index"],
-                new_names["embedding_prop"],
-                new_embedder.size,
-            )
+            # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
+            #    _create_similarity_relationships against the new index/relation).
+            for doc_id, vector, collection_name in valid_pairs:
+                await self._create_similarity_relationships_for_gen(
+                    doc_id, vector, collection_name, new_gen, tenant_id
+                )
 
-        # 4b. Entity embeddings: doc embeddings are recomputed above, but entity
-        #     embeddings are NOT recomputed on a swap — carry them forward from
-        #     the old generation into the new one (same vectors, new property),
-        #     and create the new entity vector index.
-        old_names = self._versioned_names(old_gen)
-        async with self._get_session() as session:
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (e:Entity {{tenant_id: $tenant_id}})
-                    WHERE e.{old_names["entity_embedding_prop"]} IS NOT NULL
-                    SET e.{new_names["entity_embedding_prop"]} =
-                        e.{old_names["entity_embedding_prop"]}
-                    """,
-                ),
-                tenant_id=tenant_id,
-            )
-            await self._ensure_vector_index_in_session(
-                session,
-                new_names["entity_index"],
-                new_names["entity_embedding_prop"],
-                new_embedder.size,
-                node_label="Entity",
-            )
+            # ── Phase B: flip the epoch (single atomic write) ────────────────
+            await self._set_generation(tenant_id, new_gen)
 
-        # 5. Recompute SIMILAR_TO_{new_gen} from the new vectors (mirrors
-        #    _create_similarity_relationships against the new index/relation).
-        for doc_id, vector, collection_name in valid_pairs:
-            await self._create_similarity_relationships_for_gen(
-                doc_id, vector, collection_name, new_gen, tenant_id
-            )
-
-        # ── Phase B: flip the epoch (single atomic write) ────────────────
-        await self._set_generation(tenant_id, new_gen)
-
-        # ── Phase C: GC the old generation (flip-before-GC is mandatory) ─
-        await self._gc_generation(tenant_id, old_gen)
+            # ── Phase C: GC the old generation (flip-before-GC is mandatory) ─
+            await self._gc_generation(tenant_id, old_gen)
 
         log.info(
             f"[GraphRAG] Seamless re-embed swap for tenant_id={tenant_id}: "
@@ -713,156 +965,165 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def initialize(self, embedder_name: str, embedder_size: int):
         await self._connect()
 
-        async with self._get_session() as session:
-            # Constraints are always idempotent — create them first.
-            await self._ensure_constraints_in_session(session)
+        # Phase 1 — constraints + embedder-change detection. LOCK SCOPE: the
+        # tenant write lock covers ONLY Neo4j work. The shadow re-embed in
+        # phase 2 runs OUTSIDE it (the embedder call takes minutes and must
+        # never hold the tenant write lock).
+        async with acquire_tenant_write_lock(self, None, "initialize graph schema"):
+            async with self._get_session() as session:
+                # Constraints are always idempotent — create them first.
+                await self._ensure_constraints_in_session(session)
 
-            # ── Detect embedder change ────────────────────────────────────────
-            # 1. Dimension mismatch → the HNSW index must be dropped and
-            #    recreated (Neo4j vector indexes are immutable once created).
-            index_dims = await self._get_index_dimensions(
-                session, self._document_vector_index
-            )
-            index_needs_rebuild = index_dims is not None and index_dims != embedder_size
-
-            # 2. Same dimension but different model → embeddings are in a
-            #    different vector space; stale data must be discarded too.
-            name_mismatch = False
-            if not index_needs_rebuild:
-                for collection_name in self._collection_names:
-                    stored = await self._get_collection_embedder_config(
-                        session, collection_name
-                    )
-                    if stored is not None:
-                        stored_name, stored_size = stored
-                        if stored_name != embedder_name or stored_size != embedder_size:
-                            name_mismatch = True
-                            break
-
-            if index_needs_rebuild or name_mismatch:
-                log.warning(
-                    f"[GraphRAG] Embedder change detected "
-                    f"(index_dims={index_dims} → {embedder_size}, "
-                    f"name_mismatch={name_mismatch}). "
-                    "Running seamless shadow-swap re-embed."
+                # ── Detect embedder change ────────────────────────────────
+                # 1. Dimension mismatch → the HNSW index must be dropped and
+                #    recreated (Neo4j vector indexes are immutable once created).
+                index_dims = await self._get_index_dimensions(
+                    session, self._document_vector_index
                 )
-                if self.save_memory_snapshots:
+                index_needs_rebuild = index_dims is not None and index_dims != embedder_size
+
+                # 2. Same dimension but different model → embeddings are in a
+                #    different vector space; stale data must be discarded too.
+                name_mismatch = False
+                if not index_needs_rebuild:
                     for collection_name in self._collection_names:
-                        await self.save_dump(collection_name)
+                        stored = await self._get_collection_embedder_config(
+                            session, collection_name
+                        )
+                        if stored is not None:
+                            stored_name, stored_size = stored
+                            if stored_name != embedder_name or stored_size != embedder_size:
+                                name_mismatch = True
+                                break
 
-                # Seamless swap instead of the old full wipe: shadow-build the
-                # new generation (embedding_v2 / document_embeddings_v2 /
-                # SIMILAR_TO_v2), flip the Epoch token, then GC the old set.
-                # No downtime — the old generation keeps serving reads until
-                # the flip, and no worker is stranded because GC runs after.
-                if self._embedder is not None:
-                    await self.reembed_tenant(self.agent_id, self._embedder)
-                else:
-                    log.warning(
-                        "[GraphRAG] Embedder change detected but no embedder "
-                        "injected; skipping the seamless re-embed swap."
-                    )
+        # Phase 2 — shadow-swap re-embed. OUTSIDE the tenant write lock.
+        if index_needs_rebuild or name_mismatch:
+            log.warning(
+                f"[GraphRAG] Embedder change detected "
+                f"(index_dims={index_dims} → {embedder_size}, "
+                f"name_mismatch={name_mismatch}). "
+                "Running seamless shadow-swap re-embed."
+            )
+            if self.save_memory_snapshots:
+                for collection_name in self._collection_names:
+                    await self.save_dump(collection_name)
 
+            # Seamless swap instead of the old full wipe: shadow-build the
+            # new generation (embedding_v2 / document_embeddings_v2 /
+            # SIMILAR_TO_v2), flip the Epoch token, then GC the old set.
+            # No downtime — the old generation keeps serving reads until
+            # the flip, and no worker is stranded because GC runs after.
+            if self._embedder is not None:
+                await self.reembed_tenant(self.agent_id, self._embedder)
+            else:
+                log.warning(
+                    "[GraphRAG] Embedder change detected but no embedder "
+                    "injected; skipping the seamless re-embed swap."
+                )
+
+        # Phase 3 — schema writes. Under the tenant write lock.
+        async with acquire_tenant_write_lock(self, None, "initialize graph schema"):
+            async with self._get_session() as session:
                 if index_needs_rebuild:
                     await self._drop_vector_indexes_in_session(session)
 
-            # Always ensure indexes exist with the correct dimensions (versioned
-            # schema, todo 11 P4): the read paths query the CURRENT generation's
-            # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
-            # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
-            # index is created anymore — the legacy `embedding` / `e.embedding`
-            # properties only feed the one-time backfill below.
-            gen = await self._read_generation()
-            if gen != self._generation:
-                self._rebuild_for_generation(gen)
-            names = self._names
+                # Always ensure indexes exist with the correct dimensions (versioned
+                # schema, todo 11 P4): the read paths query the CURRENT generation's
+                # vector indexes (document_embeddings_{gen} / entity_embeddings_{gen}
+                # on embedding_{gen} / entity_embedding_{gen}). No legacy unversioned
+                # index is created anymore — the legacy `embedding` / `e.embedding`
+                # properties only feed the one-time backfill below.
+                gen = await self._read_generation()
+                if gen != self._generation:
+                    self._rebuild_for_generation(gen)
+                names = self._names
 
-            if index_needs_rebuild:
-                await self._drop_vector_indexes_in_session(session, names)
+                if index_needs_rebuild:
+                    await self._drop_vector_indexes_in_session(session, names)
 
-            # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
-            # is a silent NO-OP when the index already exists at an OLD
-            # dimensionality. The versioned indexes are the ones all read paths
-            # actually use (find_similar / recall), so repair them synchronously
-            # HERE at boot — before any ingestion worker can race ahead and
-            # hit the dimension mismatch. embedder_size is a plain parameter,
-            # it does not require the embedder object (injected later by hooks).
-            # — Document index
-            v_index_dims = await self._get_index_dimensions(session, names["index"])
-            if v_index_dims is not None and v_index_dims != embedder_size:
-                log.warning(
-                    f"[GraphRAG] Versioned index {names['index']} has "
-                    f"{v_index_dims} dims but embedder is {embedder_size}; "
-                    "dropping and recreating it at boot (vectors already "
-                    "correct, no re-embed needed)."
+                # Neo4j vector indexes are immutable: `CREATE ... IF NOT EXISTS`
+                # is a silent NO-OP when the index already exists at an OLD
+                # dimensionality. The versioned indexes are the ones all read paths
+                # actually use (find_similar / recall), so repair them synchronously
+                # HERE at boot — before any ingestion worker can race ahead and
+                # hit the dimension mismatch. embedder_size is a plain parameter,
+                # it does not require the embedder object (injected later by hooks).
+                # — Document index
+                v_index_dims = await self._get_index_dimensions(session, names["index"])
+                if v_index_dims is not None and v_index_dims != embedder_size:
+                    log.warning(
+                        f"[GraphRAG] Versioned index {names['index']} has "
+                        f"{v_index_dims} dims but embedder is {embedder_size}; "
+                        "dropping and recreating it at boot (vectors already "
+                        "correct, no re-embed needed)."
+                    )
+                    await session.run(
+                        cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                    )
+                await self._ensure_vector_index_in_session(
+                    session, names["index"], names["embedding_prop"], embedder_size
                 )
+                # — Entity index (same generation scheme)
+                ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
+                if ev_index_dims is not None and ev_index_dims != embedder_size:
+                    log.warning(
+                        f"[GraphRAG] Versioned index {names['entity_index']} has "
+                        f"{ev_index_dims} dims but embedder is {embedder_size}; "
+                        "dropping and recreating it at boot (vectors already "
+                        "correct, no re-embed needed)."
+                    )
+                    await session.run(
+                        cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                    )
+                await self._ensure_vector_index_in_session(
+                    session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
+                )
+                # Backfill: copy the legacy unversioned `embedding` property into the
+                # current generation's property for existing documents that lack it,
+                # BUT only when the stored vector already matches the embedder dims
+                # (a stale pre-change vector in the index property would poison the
+                # vector index). Once migrated, the legacy property is REMOVED so
+                # the schema converges to the versioned-only shape. (The driver
+                # suppresses the 01N52 "property does not exist" GQL warning on a
+                # fresh database, so the IS NOT NULL filter is safe.)
                 await session.run(
-                    cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                    cast(
+                        LiteralString,
+                        f"""
+                        MATCH (d:Document {{tenant_id: $tenant_id}})
+                        WHERE d.embedding IS NOT NULL
+                          AND d.{names["embedding_prop"]} IS NULL
+                          AND size(d.embedding) = $dims
+                        SET d.{names["embedding_prop"]} = d.embedding
+                        REMOVE d.embedding
+                        """,
+                    ),
+                    tenant_id=self.agent_id,
+                    dims=embedder_size,
                 )
-            await self._ensure_vector_index_in_session(
-                session, names["index"], names["embedding_prop"], embedder_size
-            )
-            # — Entity index (same generation scheme)
-            ev_index_dims = await self._get_index_dimensions(session, names["entity_index"])
-            if ev_index_dims is not None and ev_index_dims != embedder_size:
-                log.warning(
-                    f"[GraphRAG] Versioned index {names['entity_index']} has "
-                    f"{ev_index_dims} dims but embedder is {embedder_size}; "
-                    "dropping and recreating it at boot (vectors already "
-                    "correct, no re-embed needed)."
-                )
+                # Same one-time backfill for Entity nodes.
                 await session.run(
-                    cast(LiteralString, f"DROP INDEX {names['entity_index']} IF EXISTS")
+                    cast(
+                        LiteralString,
+                        f"""
+                        MATCH (e:Entity {{tenant_id: $tenant_id}})
+                        WHERE e.embedding IS NOT NULL
+                          AND e.{names["entity_embedding_prop"]} IS NULL
+                          AND size(e.embedding) = $dims
+                        SET e.{names["entity_embedding_prop"]} = e.embedding
+                        REMOVE e.embedding
+                        """,
+                    ),
+                    tenant_id=self.agent_id,
+                    dims=embedder_size,
                 )
-            await self._ensure_vector_index_in_session(
-                session, names["entity_index"], names["entity_embedding_prop"], embedder_size, node_label="Entity"
-            )
-            # Backfill: copy the legacy unversioned `embedding` property into the
-            # current generation's property for existing documents that lack it,
-            # BUT only when the stored vector already matches the embedder dims
-            # (a stale pre-change vector in the index property would poison the
-            # vector index). Once migrated, the legacy property is REMOVED so
-            # the schema converges to the versioned-only shape. (The driver
-            # suppresses the 01N52 "property does not exist" GQL warning on a
-            # fresh database, so the IS NOT NULL filter is safe.)
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (d:Document {{tenant_id: $tenant_id}})
-                    WHERE d.embedding IS NOT NULL
-                      AND d.{names["embedding_prop"]} IS NULL
-                      AND size(d.embedding) = $dims
-                    SET d.{names["embedding_prop"]} = d.embedding
-                    REMOVE d.embedding
-                    """,
-                ),
-                tenant_id=self.agent_id,
-                dims=embedder_size,
-            )
-            # Same one-time backfill for Entity nodes.
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"""
-                    MATCH (e:Entity {{tenant_id: $tenant_id}})
-                    WHERE e.embedding IS NOT NULL
-                      AND e.{names["entity_embedding_prop"]} IS NULL
-                      AND size(e.embedding) = $dims
-                    SET e.{names["entity_embedding_prop"]} = e.embedding
-                    REMOVE e.embedding
-                    """,
-                ),
-                tenant_id=self.agent_id,
-                dims=embedder_size,
-            )
 
-        # Create / update collections — always store current embedder metadata.
-        async with self._get_session() as session:
-            for collection_name in self._collection_names:
-                await self._ensure_collection_exists_in_session(
-                    session, collection_name, embedder_name, embedder_size
-                )
+            # Create / update collections — always store current embedder metadata.
+            async with self._get_session() as session:
+                for collection_name in self._collection_names:
+                    await self._ensure_collection_exists_in_session(
+                        session, collection_name, embedder_name, embedder_size
+                    )
 
         log.info(
             f"Advanced GraphRAG initialized "
@@ -942,13 +1203,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         f"{index_dims} dims but embedder is {embedder.size}; "
                         "dropping and recreating it (vectors already correct)."
                     )
-                    async with self._get_session() as session:
-                        await session.run(
-                            cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
-                        )
-                        await self._ensure_vector_index_in_session(
-                            session, names["index"], names["embedding_prop"], embedder.size
-                        )
+                    # LOCK SCOPE: only the Neo4j index rewrite is locked.
+                    async with acquire_tenant_write_lock(
+                        self, None, "_align_embedder_lazy"
+                    ):
+                        async with self._get_session() as session:
+                            await session.run(
+                                cast(LiteralString, f"DROP INDEX {names['index']} IF EXISTS")
+                            )
+                            await self._ensure_vector_index_in_session(
+                                session, names["index"], names["embedding_prop"], embedder.size
+                            )
 
                 if name_mismatch:
                     log.warning(
@@ -957,8 +1222,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         f"from {embedder.name} @ {embedder.size}); running "
                         "seamless shadow-swap re-embed."
                     )
+                    # LOCK SCOPE: reembed_tenant embeds OUTSIDE the tenant write
+                    # lock and locks only its own Neo4j writes.
                     await self.reembed_tenant(self.agent_id, embedder)
 
+            except TenantWriteLockTimeout:
+                # Lock timeout MUST surface: never swallow it into a silent
+                # "alignment skipped" (the write did not proceed, and the caller
+                # must see the failure so the phase can retry).
+                raise
             except Exception as e:
                 # Do not block the read/ingestion path on alignment failures;
                 # a subsequent call will retry (the flag stays False).
@@ -1022,6 +1294,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             embedder_size=embedder_size,
         )
 
+    @tenant_write_locked("create collection")
     async def create_collection(self, embedder_name: str, embedder_size: int, collection_name: str):
         await self._ensure_connected()
 
@@ -1034,6 +1307,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         log.warning("Hybrid collections not supported")
         pass
 
+    @tenant_write_locked("delete collection")
     async def delete_collection(self, collection_name: str, timeout: int | None = None):
         """
         Deletes a collection and its documents.
@@ -1100,11 +1374,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return [r["name"] for r in records]
 
     async def save_dump(self, collection_name: str, folder: str = "dormouse/"):
-        log.info(f"Save dump not implemented, use neo4j-admin dump")
+        log.info("Save dump not implemented, use neo4j-admin dump")
         pass
 
     # ========== POINT METHODS ==========
 
+    @tenant_write_locked("add point to tenant")
     async def add_point_to_tenant(
         self,
         collection_name: str,
@@ -1112,6 +1387,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector: Iterable,
         metadata: Dict = None,
         id_point: str | None = None,
+        skip_graph: bool = False,
+        point_index: int | None = None,
         **kwargs,
     ) -> PointStruct | None:
         """
@@ -1144,9 +1421,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # backfill phase set the vector later.
         vector_valid = self._is_valid_vector(vector_list)
         if not vector_valid:
+            # The chunk is intentionally kept (graph reachability), but a
+            # source whose chunks ALL have zero/non-finite vectors must stay
+            # visible: log the source, the chunk index/id and a running counter
+            # (dense stores drop these points silently).
+            source = (metadata or {}).get("source")
+            self._zero_norm_dropped = getattr(self, "_zero_norm_dropped", 0) + 1
             log.warning(
                 f"[GraphRAG] Storing point {point_id} WITHOUT embedding: "
-                "embedding vector has zero or non-finite L2-norm. The embedder may "
+                "embedding vector has zero or non-finite L2-norm. "
+                f"source={source!r} chunk_index={point_index} "
+                f"zero_norm_dropped={self._zero_norm_dropped}. The embedder may "
                 "have returned a fallback zero tensor (e.g. empty input, cold-start "
                 "failure, or unreachable model). The chunk is kept (graph relations "
                 "still find it) and the embedding can be backfilled later."
@@ -1174,15 +1459,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # The embedding property is set ONLY when the vector is valid: a node
         # stored without `embedding_{gen}` is skipped by the vector index but
         # stays reachable via the graph (entity/relation recall, keywords).
-        create_query = f"""
-        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})
-        CREATE (d:Document {{
+        create_query = """
+        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})
+        CREATE (d:Document {
             id: $id,
             content: $content,
             metadata: $metadata,
             tenant_id: $tenant_id,
             created_at: datetime()
-        }})
+        })
         CREATE (d)-[:BELONGS_TO]->(c)
         RETURN d.id AS id
         """
@@ -1220,9 +1505,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     embedding=vector_list,
                 )
 
-        # Start entity extraction in the background
-        if self._enable_entity_extraction and self._entity_extractor:
-            task = asyncio.create_task(self._extract_and_link_entities(point_id, content, metadata))
+        # Start entity extraction in the background — on every point EXCEPT the
+        # empty-vector staging pass. The efficient engine stores every chunk
+        # twice: first with EMPTY vectors (``_store_empty_vectors``, the
+        # parsing_chunking phase), then again with the real vectors after the
+        # embedding phase deletes and re-adds the points. Extraction is
+        # vector-independent, so without this gate it runs on BOTH passes and
+        # duplicates the whole NER/linking graph work per document.
+        #
+        # The gate is the PASS, not vector validity: a legitimate payload-only
+        # document (zero/empty vector, e.g. an image under a non-multimodal
+        # embedder) MUST still build the graph. ``skip_graph`` is set by
+        # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
+        # recorded ingestion phase); a direct/classic write defaults to False.
+        if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
+            # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
+            # chunk of the source may extract in parallel. It returns the
+            # extracted batch; the source's ONE write happens in
+            # ``drain_source_tasks`` -> ``_write_source_graph`` when the batch
+            # is joined (never one concurrent write transaction per chunk).
+            task = asyncio.create_task(
+                self._extract_document_graph(point_id, content, metadata)
+            )
             self._pending_entity_tasks.append(task)
             self._track_source_task((metadata or {}).get("source"), task)
 
@@ -1230,16 +1534,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Only when the vector is valid: a zero/non-finite vector would produce
         # meaningless (or failing) vector-similarity edges.
         if vector_valid:
-            sim_task = asyncio.create_task(self._create_similarity_relationships(point_id, vector_list, collection_name))
+            # Same detached-context rule as entity extraction above.
+            # Named so ``_drain_source_tasks_counted`` can tell a similarity
+            # failure (no extraction product lost) from an extraction failure.
+            sim_task = asyncio.create_task(
+                detached_write_task(
+                    self._create_similarity_relationships(point_id, vector_list, collection_name)
+                ),
+                name=f"{_SIMILARITY_TASK_PREFIX}{point_id}",
+            )
             self._pending_entity_tasks.append(sim_task)
             self._track_source_task((metadata or {}).get("source"), sim_task)
 
-        # Clean up completed tasks
+        # Clean up completed tasks in the FLAT view only (close() bookkeeping).
+        # The per-source view is deliberately NOT pruned here: ``drain_source_tasks``
+        # is what consumes those tasks and gathers their results into the single
+        # per-source write, so dropping a FINISHED task at this point would
+        # silently lose that chunk's entities/relations. A source's list is
+        # released when it is drained (pop), at close(), or when the source is
+        # explicitly deleted/purged (``_drop_source_tasks``).
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
-        # Mirror the prune in the per-source view so the dict does not grow
-        # with finished tasks of sources that never get drained.
-        for _src, _tasks in list(self._pending_source_tasks.items()):
-            self._pending_source_tasks[_src] = [t for t in _tasks if not t.done()]
 
         return PointStruct(
             id=point_id,
@@ -1260,9 +1574,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         The same task stays in the flat ``_pending_entity_tasks`` list (so
         ``close()`` still drains it); this dict is the per-source view the
         graph-building phase uses to join ONLY one source's work.
+
+        Tasks stay here until ``drain_source_tasks`` pops the list — including
+        tasks that already FINISHED. Their result is the graph payload, so it
+        must survive until the batch write, not be pruned on completion.
         """
         if source:
             self._pending_source_tasks.setdefault(source, []).append(task)
+
+    def _drop_source_tasks(self, source: Optional[str]) -> None:
+        """Forget a source's tracked tasks because its graph is being deleted.
+
+        Only the explicit delete/purge paths call this: their results are
+        irrelevant once the source's artifacts are gone. The tasks themselves
+        stay in the flat list so ``close()`` still cancels the running ones;
+        completed ones are pruned there. Together with ``close()`` (whole-dict
+        clear) and ``drain_source_tasks`` (pop) this is what keeps the dict from
+        growing without bound in a long-lived process.
+        """
+        if source:
+            self._pending_source_tasks.pop(source, None)
 
     def has_pending_source_tasks(self, source: str) -> bool:
         """Whether any LIVE background task remains for a source.
@@ -1273,23 +1604,71 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         tasks = self._pending_source_tasks.get(source) or []
         return any(not t.done() for t in tasks)
 
-    async def drain_source_tasks(self, source: str) -> None:
-        """Await (join) all background tasks spawned for one source, inline.
+    async def drain_source_tasks(self, source: str) -> bool:
+        """Join one source's background extraction and write it ONCE.
 
-        Pops the source's task list (both the per-source view and the flat
-        list) and gathers them. The underlying methods
-        (``_extract_and_link_entities`` / ``_create_similarity_relationships``)
-        already fail-soft internally, so a failure here is logged, not raised
-        — the deterministic phase work below re-runs the same steps awaited.
+        Extraction tasks are lock-free and run in parallel; their results are
+        accumulated here and flushed through ``_write_source_graph`` in ONE
+        transaction per source. Similarity tasks (which do write) are joined in
+        the same gather; their result is ignored and their failure is only
+        logged (the spaCy phase re-runs similarity anyway).
+
+        Returns ``True`` only when the COMPLETE batch was written, so the phase
+        can skip a redundant re-extraction. When any EXTRACTION task failed or
+        was cancelled, the partial batch is still written (best effort for the
+        classic path) but ``False`` is returned, so the deterministic phase
+        re-extracts every chunk awaited. Task failures are logged; an error of
+        the graph write itself propagates to the caller.
+        """
+        return await self._drain_source_tasks_counted(source) is not None
+
+    async def _drain_source_tasks_counted(
+        self, source: str
+    ) -> Optional[Tuple[int, int]]:
+        """``drain_source_tasks`` returning ``(entities, relations)`` written.
+
+        ``None`` means "no complete batch was written" (same cases where the
+        public method returns ``False``). The spaCy phase uses the counts as its
+        ``processed`` telemetry; no per-source state is kept on the handler.
         """
         tasks = self._pending_source_tasks.pop(source, [])
         if not tasks:
-            return
+            return None
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r}")
+
+        entities: List[Dict] = []
+        mentions: List[Dict] = []
+        relations: List[Dict] = []
+        failed = 0
+        for task, r in zip(tasks, results):
+            # BaseException: a cancelled task yields CancelledError, which is
+            # not an Exception but still loses that chunk's result.
+            if isinstance(r, BaseException):
+                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r!r}")
+                get_name = getattr(task, "get_name", None)
+                is_similarity = callable(get_name) and str(get_name()).startswith(
+                    _SIMILARITY_TASK_PREFIX
+                )
+                if not is_similarity:
+                    failed += 1
+            elif isinstance(r, dict) and "entities" in r:
+                entities.extend(r.get("entities") or [])
+                mentions.extend(r.get("mentions") or [])
+                relations.extend(r.get("relations") or [])
+
+        if not entities and not relations:
+            return None
+
+        await self._write_source_graph(
+            entities,
+            mentions,
+            relations,
+            operation=f"write source graph for '{source}'",
+        )
+        if failed:
+            return None
+        return len(entities), len(relations)
 
     async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
         """Fetch all stored points of one source, grouped by collection.
@@ -1312,27 +1691,35 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 result[collection_name] = points
         return result
 
-    async def run_graph_building_phase(self, source: str, cat=None) -> Dict[str, Any]:
-        """Deterministic, awaited graph-building phase for one source (T22).
+    async def run_spacy_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited spaCy graph phase for one source (T5).
 
-        Runs the graph work the old ``after_rabbithole_stored_documents`` hook
-        fired-and-forgot, but inline and awaited:
+        The NER + link + similarity work the old ``after_rabbithole_stored_documents``
+        hook fired-and-forgot, but inline and awaited:
 
         1. joins the source's background NER/similarity tasks
-           (``drain_source_tasks``);
-        2. re-runs ``_create_similarity_relationships`` for the source's
-           stored points (needs valid vectors — that is why the embedding
-           phase must precede);
-        3. runs the LLM concept-relations step (``_extract_concept_relations``)
-           for the source.
+           (``_drain_source_tasks_counted``), which flushes the accumulated
+           extraction in ONE graph transaction (or sequential batches above
+           the guard);
+        2. when no complete background batch was available (e.g. a phase
+           retry after a restart, or a failed/cancelled chunk task), extracts
+           every stored chunk CONCURRENTLY (spaCy is
+           CPU-bound, no Neo4j locks) and writes the source's graph in ONE
+           transaction — never one concurrent transaction per chunk;
+        3. re-runs ``_create_similarity_relationships`` for the source's
+           stored points with valid vectors (needs valid vectors — that is
+           why the embedding phase must precede).
 
         Returns ``{"status": "done"}`` on success and
         ``{"status": "not_ready", "retry_after": <s>}`` when the source's
-        points are not yet in the store. Exceptions propagate (the core maps
-        raise -> status=error, fail-hard). All writes are idempotent MERGEs,
-        so re-running after a retry never duplicates data.
+        points are not yet in the store. A phase that RAN and produced ZERO
+        entities is ``done`` with an ``empty-extraction`` warning (the content
+        simply has no entities); its ``processed`` count is 0. Exceptions
+        propagate (the core maps raise -> status=error, fail-hard). All writes
+        are idempotent MERGEs, so re-running after a retry never duplicates
+        data.
         """
-        await self.drain_source_tasks(source)
+        drained = await self._drain_source_tasks_counted(source)
 
         by_collection = await self.get_source_points_by_collection(source)
         if not by_collection:
@@ -1346,8 +1733,130 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if vector and self._is_valid_vector(vector):
                     await self._create_similarity_relationships(p.id, vector, collection_name)
 
-        if self._enable_knowledge_graph and self._enable_concept_relations:
-            await self._extract_concept_relations(source, all_points, stray_cat=cat)
+        # NER + link. When the background batch already produced the write,
+        # skip the redundant re-extraction. Otherwise extract every chunk
+        # CONCURRENTLY and write the source graph in ONE transaction.
+        processed: Optional[int] = None
+        if drained is not None:
+            entity_count, relation_count = drained
+            processed = entity_count + relation_count
+        elif self._enable_entity_extraction and self._entity_extractor:
+            content_points = [
+                p
+                for p in all_points
+                if (getattr(p, "payload", None) or {}).get("page_content", "")
+            ]
+            extractions = await asyncio.gather(
+                *(
+                    self._extract_document_graph(
+                        p.id,
+                        (getattr(p, "payload", None) or {}).get("page_content", ""),
+                        (getattr(p, "payload", None) or {}).get("metadata", {}),
+                    )
+                    for p in content_points
+                )
+            )
+            entities: List[Dict] = []
+            mentions: List[Dict] = []
+            relations: List[Dict] = []
+            for extracted in extractions:
+                if not extracted:
+                    continue
+                entities.extend(extracted["entities"])
+                mentions.extend(extracted["mentions"])
+                relations.extend(extracted["relations"])
+            processed = len(entities) + len(relations)
+            if entities or relations:
+                await self._write_source_graph(
+                    entities,
+                    mentions,
+                    relations,
+                    operation=f"write source graph for '{source}'",
+                )
+            else:
+                # The phase RAN correctly (spaCy executed) and found nothing:
+                # a content property, not a failure. ``done`` + warning keeps
+                # the phase complete (no retry, dependents not blocked).
+                char_count = sum(
+                    len((getattr(p, "payload", None) or {}).get("page_content", ""))
+                    for p in content_points
+                )
+                log.warning(
+                    f"[GraphRAG] spaCy extraction found no entities in "
+                    f"{char_count} chars of {len(content_points)} chunks for "
+                    f"'{source}'"
+                )
+                return {
+                    "status": "done",
+                    "warnings": [
+                        {
+                            "code": "empty-extraction",
+                            "message": (
+                                f"no entities found in {char_count} chars of "
+                                f"{len(content_points)} chunks for '{source}'"
+                            ),
+                        }
+                    ],
+                    "processed": 0,
+                }
+
+        if processed is None:
+            return {"status": "done"}
+        return {"status": "done", "processed": processed}
+
+    async def run_llm_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
+        """Deterministic, awaited LLM graph phase for one source (T5).
+
+        Runs ONLY the LLM concept-relations step (``_extract_concept_relations``)
+        for the source's stored points, gated on ``_enable_concept_relations``.
+        ``enable_knowledge_graph`` is display-only (UI) and does not gate.
+        Independent from the spaCy phase:
+        it consumes ONLY the stored chunks + LLM + definitions/prompt, NOT the
+        spaCy entities, so it can run in any order relative to
+        ``run_spacy_extraction_phase``.
+
+        Returns ``{"status": "done"}`` on success and
+        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
+        points are not yet in the store OR the LLM outcome is transient
+        (timeout / 429 / 5xx / dropped connection / first empty response).
+        A permanent LLM failure (no LLM configured, repeated empty/unparsable
+        output, partial extraction) returns ``{"status": "error", "reason"}``
+        so the phase is recorded as ``error``, never as a silent ``done``.
+        With ``enable_concept_relations`` off the phase produces no product by
+        definition, so it reports ``{"status": "skipped", "reason"}``; the
+        toggle is part of ``_concept_fingerprint``, so enabling it later
+        re-runs the phase.
+        All writes are idempotent MERGEs, so re-running after a retry never
+        duplicates data.
+
+        It never joins the source's background spaCy tasks: that batch belongs
+        to ``run_spacy_extraction_phase``, and writing it here would record a
+        spaCy write failure as an LLM-phase error.
+        """
+        by_collection = await self.get_source_points_by_collection(source)
+        if not by_collection:
+            return {"status": "not_ready", "retry_after": 5}
+
+        all_points: List[Record] = []
+        for collection_name, points in by_collection.items():
+            all_points.extend(points)
+
+        if not self._enable_concept_relations:
+            # The feature is off: no product exists to produce, so the phase is
+            # inapplicable (``skipped``), not a silent success.
+            return {
+                "status": "skipped",
+                "reason": "concept-relations extraction disabled",
+            }
+
+        outcome = await self._extract_concept_relations(
+            source, all_points, stray_cat=cat
+        )
+        if isinstance(outcome, dict):
+            # Pass the body's result through unchanged: ``done`` (with its
+            # real ``processed`` count and any ``empty-extraction`` warning),
+            # ``not_ready``, ``error`` or ``skipped``.
+            return outcome
 
         return {"status": "done"}
 
@@ -1357,239 +1866,296 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         content: str,
         metadata: Dict,
     ) -> None:
-        """
-        Extracts entities from the document and links them to the graph.
-        Runs in the background.
+        """Extract ONE document and write it in ONE transaction.
 
-        Uses three batched UNWIND queries instead of N sequential calls:
-        one for entity nodes, one for MENTIONS edges, one for RELATED_TO edges.
-        Relations with the same (source, target, type) key are deduplicated
-        in Python before being sent, averaging their weights.
+        Kept for the single-document / classic call path. Batch ingestion
+        accumulates every chunk of a source first (see ``drain_source_tasks``
+        and ``run_spacy_extraction_phase``) and calls ``_write_source_graph``
+        ONCE per source instead of once per chunk.
         """
-        entity_embedding_prop = self._names["entity_embedding_prop"]
-        batch_entity_query = f"""
-        UNWIND $entities AS ent
-        MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
-        ON CREATE SET
-            e.name       = ent.name,
-            e.type       = ent.type,
-            e.types      = [ent.type],
-            e.created_at = datetime(),
-            e.metadata   = ent.metadata,
-            e.{entity_embedding_prop} = ent.embedding
-        ON MATCH SET
-            e.last_seen  = datetime(),
-            e.name       = ent.name,
-            e.types      = CASE WHEN ent.type IN coalesce(e.types, [])
-                THEN e.types ELSE coalesce(e.types, []) + ent.type END,
-            e.metadata   = ent.metadata,
-            e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
-                THEN ent.embedding ELSE e.{entity_embedding_prop} END
-        REMOVE e.concept_gen, e.concept_gen_active
-        """
+        extracted = await self._extract_document_graph(
+            document_id, content, metadata
+        )
+        if not extracted:
+            return
+        await self._write_source_graph(
+            extracted["entities"],
+            extracted["mentions"],
+            extracted["relations"],
+            operation=f"extract/link entities for document {document_id}",
+        )
 
-        batch_mention_query = """
-        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
-        WITH d
-        UNWIND $mentions AS m
-        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
-        MERGE (d)-[r:MENTIONS]->(e)
-        ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
-        ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
-        """
+    async def _extract_document_graph(
+        self,
+        document_id: str,
+        content: str,
+        metadata: Dict,
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Extract entities/mentions/relations for ONE document (NO DB writes).
 
-        batch_relation_query = """
-        UNWIND $relations AS rel
-        MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
-        MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
-        MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
-        ON CREATE SET
-            r.weight = rel.weight,
-            r.created_at = datetime(),
-            r.source_files = rel.source_files
-        ON MATCH SET
-            r.weight = (r.weight + rel.weight) / 2,
-            r.source_files = CASE
-                WHEN rel.source_files IS NULL THEN r.source_files
-                WHEN r.source_files IS NULL THEN rel.source_files
-                ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
-            END
+        Pure extraction: spaCy is CPU-bound and takes no Neo4j locks, so this
+        may run concurrently for every chunk of a source. The write is deferred
+        to ``_write_source_graph`` (one transaction per source).
         """
-
-        # File-provenance edges: every entity created from this document's
-        # content gets a (Document)-[:PROVENANCE]->(Entity) edge, so a file
-        # deletion cascade can prune the entity exactly when ALL documents
-        # that referenced it are gone. `tracked_by_provenance` marks the
-        # entity as provenance-managed (legacy entities created before this
-        # migration are left untouched by the prune).
-        batch_provenance_query = """
-        UNWIND $mentions AS m
-        MATCH (d:Document {id: $doc_id, tenant_id: $tenant_id})
-        MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
-        MERGE (d)-[:PROVENANCE]->(e)
-        SET e.tracked_by_provenance = true
-        """
-
         # Which file produced this document? Used for the per-edge provenance
         # list on RELATED_TO relations (None for non-file memories such as
         # episodic points, which are never wiped per-source).
         _doc_source = (metadata or {}).get("source")
         _source_files = [_doc_source] if _doc_source else None
 
-        try:
-            extracted = await self._entity_extractor.extract(content, document_id, metadata)
-            if not extracted.entities:
-                return
+        extracted = await self._entity_extractor.extract(
+            content, document_id, metadata
+        )
+        if not extracted.entities:
+            return None
 
-            entity_type_map = {e.name: e.type for e in extracted.entities}
+        entity_type_map = {e.name: e.type for e in extracted.entities}
 
-            # Build batch payload for entities and mentions in one pass
-            entities_batch = []
-            mentions_batch = []
-            for entity in extracted.entities:
-                entity_id = self._entity_extractor.get_entity_hash(
-                    entity.name, entity.type, self.agent_id
-                )
-                entities_batch.append({
-                    "id":        entity_id,
-                    "name":      _normalize_entity_name(entity.name),
-                    "type":      entity.type.value,
-                    # Serialise to JSON string: Neo4j does not support Map-type
-                    # node properties (only primitives / arrays are allowed).
-                    # Accumulated shape {"source_documents": [...],
-                    # "confidence": <max>} — merged against the node's existing
-                    # metadata inside _write_entities before this is persisted.
-                    "metadata":  json.dumps({"source_documents": [document_id], "confidence": entity.confidence}),
-                    "embedding": None,  # populated below when enable_entity_embeddings=True
-                })
-                mentions_batch.append({
-                    "entity_id":  entity_id,
-                    "confidence": entity.confidence,
-                })
-
-            # Batch-embed all entity names in one call (non-blocking via thread)
-            if self._enable_entity_embeddings and self._embedder is not None:
-                try:
-                    names = [ent["name"] for ent in entities_batch]
-                    embeddings = await asyncio.to_thread(
-                        self._embedder.embed_documents, names
-                    )
-                    for ent, emb in zip(entities_batch, embeddings):
-                        if self._is_valid_vector(emb):
-                            ent["embedding"] = emb
-                        else:
-                            log.warning(
-                                f"[GraphRAG] Skipping entity embedding for {ent['name']}: "
-                                "zero or non-finite vector"
-                            )
-                except Exception as emb_err:
-                    log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
-
-            # Build and deduplicate relation payload (average weights on collision)
-            rel_map: Dict[Tuple, Dict] = {}
-            for relation in extracted.relations:
-                source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
-                target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
-                source_id = self._entity_extractor.get_entity_hash(
-                    relation.source_entity, source_type, self.agent_id
-                )
-                target_id = self._entity_extractor.get_entity_hash(
-                    relation.target_entity, target_type, self.agent_id
-                )
-                if not source_id or not target_id or source_id == target_id:
-                    continue
-                key = (source_id, target_id, relation.relation_type)
-                if key in rel_map:
-                    rel_map[key]["weight"] = (rel_map[key]["weight"] + relation.weight) / 2
-                else:
-                    rel_map[key] = {
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "rel_type":  relation.relation_type,
-                        "weight":    relation.weight,
-                        "source_files": _source_files,
-                    }
-            relations_batch = list(rel_map.values())
-
-            # Sort all batches by ID so every concurrent transaction acquires
-            # Neo4j node locks in the same order — breaks circular wait chains.
-            entities_batch.sort(key=lambda e: e["id"])
-            mentions_batch.sort(key=lambda m: m["entity_id"])
-            relations_batch.sort(key=lambda r: (r["source_id"], r["target_id"]))
-
-            # execute_write wraps all three queries in a single managed write
-            # transaction that the Neo4j driver automatically retries on
-            # TransientError (including DeadlockDetected).
-            # The semaphore caps concurrent write transactions to further
-            # reduce lock contention during bulk PDF ingestion.
-            async def _write_entities(tx):
-                # Metadata accumulation inside the write transaction: read each
-                # entity's existing metadata, merge it into the payload
-                # (source_documents dedup union + running max confidence) and let
-                # the ON CREATE / ON MATCH write below persist the merged
-                # JSON-string shape {"source_documents": [...], "confidence": m}.
-                # The bounded lost-update window under concurrent same-entity
-                # extractions is accepted — the write semaphore caps concurrency.
-                if entities_batch:
-                    meta_result = await tx.run(
-                        cast(
-                            LiteralString,
-                            """
-                            UNWIND $ids AS id
-                            MATCH (e:Entity {id: id, tenant_id: $tenant_id})
-                            RETURN id AS id, e.metadata AS metadata
-                            """,
-                        ),
-                        ids=[ent["id"] for ent in entities_batch],
-                        tenant_id=self.agent_id,
-                    )
-                    existing_metadata = {
-                        rec["id"]: rec["metadata"]
-                        async for rec in meta_result
-                    }
-                    for ent in entities_batch:
-                        ent["metadata"] = json.dumps(
-                            _merge_entity_metadata(
-                                existing_metadata.get(ent["id"]),
-                                json.loads(ent["metadata"]),
-                            )
-                        )
-
-                await tx.run(
-                    cast(LiteralString, batch_entity_query),
-                    entities=entities_batch,
-                    tenant_id=self.agent_id,
-                )
-                await tx.run(
-                    cast(LiteralString, batch_mention_query),
-                    mentions=mentions_batch,
-                    doc_id=document_id,
-                    tenant_id=self.agent_id,
-                )
-                await tx.run(
-                    cast(LiteralString, batch_provenance_query),
-                    mentions=mentions_batch,
-                    doc_id=document_id,
-                    tenant_id=self.agent_id,
-                )
-                if relations_batch:
-                    await tx.run(
-                        cast(LiteralString, batch_relation_query),
-                        relations=relations_batch,
-                        tenant_id=self.agent_id,
-                    )
-
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.execute_write(_write_entities)
-
-            log.debug(
-                f"Linked {len(entities_batch)} entities and {len(relations_batch)} relations "
-                f"for document {document_id}"
+        # Build batch payload for entities and mentions in one pass.
+        entities_batch = []
+        mentions_batch = []
+        for entity in extracted.entities:
+            entity_id = self._entity_extractor.get_entity_hash(
+                entity.name, entity.type, self.agent_id
             )
-        except Exception as e:
-            log.error(f"Failed to extract entities for {document_id}: {e}")
+            entities_batch.append({
+                "id":        entity_id,
+                "name":      _normalize_entity_name(entity.name),
+                "type":      entity.type.value,
+                # Serialise to JSON string: Neo4j does not support Map-type
+                # node properties (only primitives / arrays are allowed).
+                # Accumulated shape {"source_documents": [...],
+                # "confidence": <max>} — merged against the node's existing
+                # metadata inside _write_graph_plan_in_tx before it is persisted.
+                "metadata":  json.dumps({"source_documents": [document_id], "confidence": entity.confidence}),
+                "embedding": None,  # populated below when enable_entity_embeddings=True
+            })
+            mentions_batch.append({
+                "doc_id":     document_id,
+                "entity_id":  entity_id,
+                "confidence": entity.confidence,
+            })
 
+        # Batch-embed all entity names in one call (non-blocking via thread)
+        if self._enable_entity_embeddings and self._embedder is not None:
+            try:
+                names = [ent["name"] for ent in entities_batch]
+                embeddings = await asyncio.to_thread(
+                    self._embedder.embed_documents, names
+                )
+                for ent, emb in zip(entities_batch, embeddings):
+                    if self._is_valid_vector(emb):
+                        ent["embedding"] = emb
+                    else:
+                        log.warning(
+                            f"[GraphRAG] Skipping entity embedding for {ent['name']}: "
+                            "zero or non-finite vector"
+                        )
+            except Exception as emb_err:
+                log.warning(f"[GraphRAG] Entity embedding skipped: {emb_err}")
+
+        # Build and deduplicate relation payload (average weights on collision)
+        rel_map: Dict[Tuple, Dict] = {}
+        for relation in extracted.relations:
+            source_type = entity_type_map.get(relation.source_entity, EntityType.UNKNOWN)
+            target_type = entity_type_map.get(relation.target_entity, EntityType.UNKNOWN)
+            source_id = self._entity_extractor.get_entity_hash(
+                relation.source_entity, source_type, self.agent_id
+            )
+            target_id = self._entity_extractor.get_entity_hash(
+                relation.target_entity, target_type, self.agent_id
+            )
+            if not source_id or not target_id or source_id == target_id:
+                continue
+            key = (source_id, target_id, relation.relation_type)
+            if key in rel_map:
+                rel_map[key]["weight"] = (rel_map[key]["weight"] + relation.weight) / 2
+            else:
+                rel_map[key] = {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "rel_type":  relation.relation_type,
+                    "weight":    relation.weight,
+                    "source_files": _source_files,
+                }
+
+        return {
+            "entities": entities_batch,
+            "mentions": mentions_batch,
+            "relations": list(rel_map.values()),
+        }
+
+    @tenant_write_locked("write source graph")
+    async def _write_source_graph(
+        self,
+        entities: List[Dict],
+        mentions: List[Dict],
+        relations: List[Dict],
+        operation: str = "write source graph",
+    ) -> int:
+        """Write ONE source's graph in ONE transaction (sequential above guard).
+
+        Extraction stays parallel and lock-free; this is the single serialised
+        writer. ``source_graph_writer.write_source_graph`` deduplicates the
+        accumulated chunks (entities by id, relations by
+        ``(source_id, target_id, rel_type)``) and plans the transaction(s).
+        Below ``GRAPH_WRITE_BATCH_MAX_ITEMS`` that is exactly one transaction;
+        above it, transactions run strictly one after another, never concurrent.
+        """
+        if not entities and not relations:
+            return 0
+
+        async def _execute_plan(plan: Dict[str, List[Dict]]) -> None:
+            async with self._get_session() as session:
+                await session.execute_write(
+                    lambda tx: self._write_graph_plan_in_tx(tx, plan)
+                )
+
+        async def _execute_with_retry(plan: Dict[str, List[Dict]]) -> None:
+            # ``with_transient_retry`` stays the INNER layer of each batch.
+            await with_transient_retry(
+                lambda: _execute_plan(plan),
+                operation=operation,
+            )
+
+        count = await write_source_graph(
+            entities,
+            mentions,
+            relations,
+            _execute_with_retry,
+            max_items=GRAPH_WRITE_BATCH_MAX_ITEMS,
+        )
+        log.debug(
+            f"[GraphRAG] Source graph written in {count} transaction(s) "
+            f"({len(entities)} entities, {len(relations)} relations): {operation}"
+        )
+        return count
+
+    async def _write_graph_plan_in_tx(self, tx, plan: Dict[str, List[Dict]]) -> None:
+        """Execute one planned transaction body (entities+mentions+relations)."""
+        entity_embedding_prop = self._names["entity_embedding_prop"]
+        entities = plan["entities"]
+        mentions = plan["mentions"]
+        relations = plan["relations"]
+
+        if entities:
+            # Metadata accumulation inside the write transaction: read each
+            # entity's existing metadata, merge the incoming (already deduped
+            # across chunks) payload and let ON CREATE / ON MATCH persist the
+            # accumulated {"source_documents": [...], "confidence": <max>}.
+            meta_result = await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $ids AS id
+                    MATCH (e:Entity {id: id, tenant_id: $tenant_id})
+                    RETURN id AS id, e.metadata AS metadata
+                    """,
+                ),
+                ids=[ent["id"] for ent in entities],
+                tenant_id=self.agent_id,
+            )
+            existing_metadata = {
+                rec["id"]: rec["metadata"]
+                async for rec in meta_result
+            }
+            for ent in entities:
+                ent["metadata"] = json.dumps(
+                    _merge_entity_metadata(
+                        existing_metadata.get(ent["id"]),
+                        json.loads(ent["metadata"]),
+                    )
+                )
+
+            await tx.run(
+                cast(
+                    LiteralString,
+                    f"""
+                    UNWIND $entities AS ent
+                    MERGE (e:Entity {{id: ent.id, tenant_id: $tenant_id}})
+                    ON CREATE SET
+                        e.name       = ent.name,
+                        e.type       = ent.type,
+                        e.types      = [ent.type],
+                        e.created_at = datetime(),
+                        e.metadata   = ent.metadata,
+                        e.{entity_embedding_prop} = ent.embedding
+                    ON MATCH SET
+                        e.last_seen  = datetime(),
+                        e.name       = ent.name,
+                        e.types      = CASE WHEN ent.type IN coalesce(e.types, [])
+                            THEN e.types ELSE coalesce(e.types, []) + ent.type END,
+                        e.metadata   = ent.metadata,
+                        e.{entity_embedding_prop} = CASE WHEN ent.embedding IS NOT NULL
+                            THEN ent.embedding ELSE e.{entity_embedding_prop} END
+                    REMOVE e.concept_gen, e.concept_gen_active
+                    """,
+                ),
+                entities=entities,
+                tenant_id=self.agent_id,
+            )
+
+        if mentions:
+            # MENTIONS and PROVENANCE are per (document, entity): the document
+            # id rides in each mention so one transaction can cover every chunk
+            # of the source.
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $mentions AS m
+                    MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+                    MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+                    MERGE (d)-[r:MENTIONS]->(e)
+                    ON CREATE SET r.created_at  = datetime(), r.confidence = m.confidence
+                    ON MATCH SET  r.last_seen   = datetime(), r.confidence = m.confidence
+                    """,
+                ),
+                mentions=mentions,
+                tenant_id=self.agent_id,
+            )
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $mentions AS m
+                    MATCH (d:Document {id: m.doc_id, tenant_id: $tenant_id})
+                    MATCH (e:Entity {id: m.entity_id, tenant_id: $tenant_id})
+                    MERGE (d)-[:PROVENANCE]->(e)
+                    SET e.tracked_by_provenance = true
+                    """,
+                ),
+                mentions=mentions,
+                tenant_id=self.agent_id,
+            )
+
+        if relations:
+            await tx.run(
+                cast(
+                    LiteralString,
+                    """
+                    UNWIND $relations AS rel
+                    MATCH (s:Entity {id: rel.source_id, tenant_id: $tenant_id})
+                    MATCH (t:Entity {id: rel.target_id, tenant_id: $tenant_id})
+                    MERGE (s)-[r:RELATED_TO {type: rel.rel_type}]->(t)
+                    ON CREATE SET
+                        r.weight = rel.weight,
+                        r.created_at = datetime(),
+                        r.source_files = rel.source_files
+                    ON MATCH SET
+                        r.weight = (r.weight + rel.weight) / 2,
+                        r.source_files = CASE
+                            WHEN rel.source_files IS NULL THEN r.source_files
+                            WHEN r.source_files IS NULL THEN rel.source_files
+                            ELSE [x IN r.source_files WHERE NOT x IN rel.source_files] + rel.source_files
+                        END
+                    """,
+                ),
+                relations=relations,
+                tenant_id=self.agent_id,
+            )
+
+    @tenant_write_locked("refresh technology entities")
     async def refresh_technology_entities(self, tenant_id: str) -> None:
         """
         Refreshes the Technology-entity subgraph for a single tenant.
@@ -1825,15 +2391,22 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 tenant_id=tenant_id,
             )
 
-        async with self._neo4j_write_semaphore:
-            async with self._get_session() as session:
-                await session.execute_write(_write_refresh)
+        async def _write_all():
+            async with self._neo4j_write_semaphore:
+                async with self._get_session() as session:
+                    await session.execute_write(_write_refresh)
+
+        await with_transient_retry(
+            _write_all,
+            operation=f"refresh technology entities for tenant {tenant_id}",
+        )
 
         log.info(
             f"[GraphRAG] Refreshed Technology entities for tenant_id={tenant_id} "
             f"({len(entities_batch)} entities, {len(mentions_batch)} mentions)"
         )
 
+    @tenant_write_locked("recompute provenance")
     async def recompute_provenance(self, tenant_id: str | None = None) -> None:
         """One-time backfill of provenance metadata for legacy (pre-migration) data.
 
@@ -2029,6 +2602,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.error(f"[GraphRAG] Provenance marker failed for {tenant_id}: {e}")
 
     @retry_on_generation_change
+    @tenant_write_locked("create similarity relationships")
     async def _create_similarity_relationships(self, point_id: str, vector: List[float], collection_name: str):
         """
         Creates bidirectional SIMILAR_TO relationships between similar documents.
@@ -2073,22 +2647,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             similar.sort(key=lambda s: s["id"])
 
             # Write phase — plain auto-commit session.run (no managed
-            # transaction): correctness is guaranteed by the
-            # retry_on_generation_change decorator (detect-and-rerun-once),
-            # not by driver-managed tx. The semaphore caps concurrent writers
-            # to reduce contention.
-            async with self._neo4j_write_semaphore:
-                async with self._get_session() as session:
-                    await session.run(
-                        cast(LiteralString, self._compile_query("create_similar_rel", self._generation)),
-                        similar=similar,
-                        point_id=point_id,
-                    )
+            # transaction), so transient errors (e.g. DeadlockDetected) are
+            # retried explicitly by with_transient_retry. The semaphore caps
+            # concurrent writers to reduce contention.
+            async def _write_similarity():
+                async with self._neo4j_write_semaphore:
+                    async with self._get_session() as session:
+                        await session.run(
+                            cast(LiteralString, self._compile_query("create_similar_rel", self._generation)),
+                            similar=similar,
+                            point_id=point_id,
+                        )
+
+            await with_transient_retry(
+                _write_similarity,
+                operation=f"create similarity relationships for {point_id}",
+            )
 
             log.debug(f"Created {len(similar) * 2} similarity relationships for {point_id}")
 
         except Exception as e:
             log.error(f"Failed to create similarity relationships: {e}")
+            raise
 
     async def add_points_to_tenant(
         self, collection_name: str, points: List[PointStruct]
@@ -2096,16 +2676,43 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         await self._ensure_connected()
 
         operation_id = random.randint(1, 100000)
+
+        # Discriminate the EMPTY-VECTOR STAGING PASS, not vector validity.
+        # The staging pass (``parsing_chunking``) writes every point with the
+        # empty mapping ``vector={}`` and must not build any graph; the
+        # ``embedding`` pass writes the same points with real vectors OR
+        # payload-only and owns the graph. The phase read is cached per source
+        # (one registry read per unique source/chat scope, not per point); the
+        # empty-mapping signal is per point and cannot appear on the classic
+        # path (see ``_is_empty_mapping``), so a stale ``resume_owner`` lease
+        # can never turn a classic re-ingest into a false staging pass.
+        staging_cache: Dict[tuple, bool] = {}
+        staging_flags: List[bool] = []
         for point in points:
+            meta = (point.payload or {}).get("metadata", {}) or {}
+            key = (meta.get("source"), meta.get("chat_id"), self._is_empty_mapping(point.vector))
+            if key not in staging_cache:
+                staging_cache[key] = await self._is_empty_vector_staging_pass(
+                    meta.get("source"), meta, point.vector
+                )
+            staging_flags.append(staging_cache[key])
+
+        for index, (point, is_staging) in enumerate(zip(points, staging_flags)):
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
+                skip_graph=is_staging,
+                point_index=index,
             )
 
-        if self._enable_derived_graph:
+        # Derived structure graph (SourceFile / NEXT / Section / ...) follows
+        # the SAME pass discriminator: skipped only when the whole batch is the
+        # empty-vector staging pass. The LLM concept step is NOT run here.
+        batch_is_staging = bool(points) and all(staging_flags)
+        if not batch_is_staging:
             sources: Dict[str, List[PointStruct]] = {}
             for p in points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
@@ -2113,12 +2720,21 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 if src:
                     sources.setdefault(src, []).append(p)
             for source, src_points in sources.items():
-                await self.create_derived_graph_for_source(source, src_points)
+                # Structure only: the LLM step has one owner per path (classic
+                # hook / EffING phase / --graph part B); running it here too
+                # called the LLM twice per source on every engine.
+                await self.create_derived_graph_for_source(
+                    source, src_points, run_concepts=False
+                )
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @tenant_write_locked("delete tenant points")
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
         await self._ensure_connected()
+        # The source is being deleted: any pending extraction result for it is
+        # irrelevant (the chunks and their artifacts are going away).
+        self._drop_source_tasks((metadata or {}).get("source"))
 
         operation_id = random.randint(1, 100000)
 
@@ -2135,10 +2751,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        query = f"""
+        # Resolve the matching Document ids with a read, then delete them in
+        # bounded, strictly sequential transactions. A single DETACH DELETE of
+        # a whole large source exceeded Neo4j's transaction memory limit (529
+        # points-with-edges ≈ 714 MiB against the 716.8 MiB cap), so the delete
+        # is split by DELETE_BATCH_MAX_ITEMS (see batched_delete.py).
+        resolve_query = f"""
         MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})<-[:BELONGS_TO]-(d:Document)
         {where_clause}
-        DETACH DELETE d
+        RETURN d.id AS id
         """
 
         # ── File-deletion cascade (provenance-based graph cleanup) ──────────
@@ -2152,21 +2773,59 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         source = (metadata or {}).get("source")
 
         async with self._get_session() as session:
-            await (await session.run(cast(LiteralString, query), **params)).consume()
+            result = await session.run(cast(LiteralString, resolve_query), **params)
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_documents(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})<-[:BELONGS_TO]-(d:Document)
+                        WHERE d.id IN $ids
+                        DETACH DELETE d
+                        """),
+                        collection_name=collection_name,
+                        tenant_id=self.agent_id,
+                        ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_documents)
 
             if source:
-                await session.run(
+                result = await session.run(
                     """
                     MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
                     WHERE r.source_files IS NOT NULL AND $source IN r.source_files
-                    SET r.source_files = [x IN r.source_files WHERE x <> $source]
-                    WITH r
-                    WHERE size(r.source_files) = 0
-                    DELETE r
+                    RETURN elementId(r) AS rid
                     """,
                     source=source,
                     tenant_id=self.agent_id,
                 )
+                related_ids = [
+                    record["rid"] async for record in result if record["rid"] is not None
+                ]
+
+                async def _strip_related(batch: List[str]) -> None:
+                    await (
+                        await session.run(
+                            """
+                            MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                            WHERE elementId(r) IN $rids
+                            SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                            WITH r
+                            WHERE size(r.source_files) = 0
+                            DELETE r
+                            """,
+                            rids=batch,
+                            source=source,
+                            tenant_id=self.agent_id,
+                        )
+                    ).consume()
+
+                await delete_in_batches(related_ids, _strip_related)
 
             # Entity pruning:
             # - Per-file deletion (source set): keep the provenance-tracked
@@ -2181,62 +2840,343 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             #   created by older plugin versions without tracked_by_provenance
             #   used to survive forever as ghosts).
             if source:
-                prune_query = """
+                prune_resolve = """
                 MATCH (e:Entity {tenant_id: $tenant_id})
                 WHERE e.tracked_by_provenance = true
+                  AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """
+                prune_delete = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.id IN $ids
+                  AND e.tracked_by_provenance = true
                   AND NOT (e)<-[:PROVENANCE]-()
                 DETACH DELETE e
                 """
             else:
-                prune_query = """
+                prune_resolve = """
                 MATCH (e:Entity {tenant_id: $tenant_id})
                 WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """
+                prune_delete = """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE e.id IN $ids
+                  AND NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
                 DETACH DELETE e
                 """
 
-            await session.run(prune_query, tenant_id=self.agent_id)
+            result = await session.run(prune_resolve, tenant_id=self.agent_id)
+            entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _prune_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        prune_delete, ids=batch, tenant_id=self.agent_id
+                    )
+                ).consume()
+
+            await delete_in_batches(entity_ids, _prune_entities)
 
         async with self._get_session() as session:
-            await session.run(
+            result = await session.run(
                 """
                 MATCH (sf:SourceFile {tenant_id: $tenant_id})
                 WHERE NOT (sf)<-[:PART_OF]-()
-                DETACH DELETE sf
+                RETURN sf.name AS name
                 """,
                 tenant_id=self.agent_id,
             )
+            sourcefile_names = [
+                record["name"] async for record in result if record["name"] is not None
+            ]
+
+            async def _delete_sourcefiles(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                        WHERE sf.name IN $names
+                        DETACH DELETE sf
+                        """,
+                        names=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(sourcefile_names, _delete_sourcefiles)
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @tenant_write_locked("purge source graph artifacts")
+    async def purge_source_graph_artifacts(self, source: str) -> int:
+        """Delete the graph artifacts ONE source contributed to this tenant.
+
+        Source-scoped phase purge used by the EffING ``ingestion_phase_purge``
+        hook before an abandoned graph phase is re-run. It removes ONLY what
+        the graph phases derived from ``source`` and leaves:
+          - the chunk Documents themselves (owned by parsing/embedding),
+          - entities/relations still referenced by OTHER sources,
+          - every other tenant's data.
+
+        Steps (all tenant-filtered):
+          1. delete PROVENANCE / MENTIONS edges from this source's Documents
+             and prune ONLY the entities those edges pointed at once they have
+             no other provenance/mention (entities untouched by this source are
+             never candidates);
+          2. delete SIMILAR_TO_* edges touching this source's Documents;
+          3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
+             that existed only because of it;
+
+        The source's SourceFile node (document structure, built during the
+        embedding phase) is kept: it is removed with the source's points.
+
+        Returns the number of Document nodes that belonged to the source (0 is
+        a valid "nothing was derived" result, not an error).
+        """
+        await self._ensure_connected()
+        # The source's artifacts are being purged: drop its pending tasks so a
+        # late finished result cannot resurrect the graph that was just removed.
+        self._drop_source_tasks(source)
+        tenant_id = self.agent_id
+        meta_fragment = f'"source": {json.dumps(source)}'
+        async with self._get_session() as session:
+            # Resolve the source's Document ids FIRST (read only), then drive
+            # every delete below from bounded sequential batches. A single
+            # transaction over a large source exceeds Neo4j's tx memory limit;
+            # see batched_delete.DELETE_BATCH_MAX_ITEMS.
+            result = await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})
+                WHERE d.metadata CONTAINS $meta
+                RETURN d.id AS id
+                """,
+                tenant_id=tenant_id,
+                meta=meta_fragment,
+            )
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+            doc_count = len(document_ids)
+
+            # Candidates MUST be resolved before their edges are removed: only
+            # entities this source pointed at may ever be pruned here.
+            result = await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                WHERE d.id IN $doc_ids
+                  AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                RETURN DISTINCT e.id AS id
+                """,
+                tenant_id=tenant_id,
+                doc_ids=document_ids,
+            )
+            candidate_entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_source_edges(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                        WHERE d.id IN $doc_ids
+                          AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        doc_ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_source_edges)
+
+            async def _prune_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (e:Entity {tenant_id: $tenant_id})
+                        WHERE e.id IN $ids
+                          AND NOT (e)<-[:PROVENANCE]-()
+                          AND NOT (e)<-[:MENTIONS]-()
+                        DETACH DELETE e
+                        """,
+                        tenant_id=tenant_id,
+                        ids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(candidate_entity_ids, _prune_entities)
+
+            # SIMILAR_TO_* edges: resolve relationship ids, then chunk.
+            result = await session.run(
+                """
+                MATCH (d:Document {tenant_id: $tenant_id})-[r]-(:Document {tenant_id: $tenant_id})
+                WHERE d.id IN $doc_ids AND type(r) STARTS WITH 'SIMILAR_TO'
+                RETURN DISTINCT elementId(r) AS rid
+                """,
+                tenant_id=tenant_id,
+                doc_ids=document_ids,
+            )
+            similar_ids = [
+                record["rid"] async for record in result if record["rid"] is not None
+            ]
+
+            async def _delete_similar(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (a:Document {tenant_id: $tenant_id})-[r]-(b:Document {tenant_id: $tenant_id})
+                        WHERE elementId(r) IN $rids
+                          AND type(r) STARTS WITH 'SIMILAR_TO'
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        rids=batch,
+                    )
+                ).consume()
+
+            await delete_in_batches(similar_ids, _delete_similar)
+
+            # RELATED_TO provenance strip + empty-edge delete, chunked.
+            result = await session.run(
+                """
+                MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                WHERE r.source_files IS NOT NULL AND $source IN r.source_files
+                RETURN elementId(r) AS rid
+                """,
+                tenant_id=tenant_id,
+                source=source,
+            )
+            related_ids = [
+                record["rid"] async for record in result if record["rid"] is not None
+            ]
+
+            async def _strip_related(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        """
+                        MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+                        WHERE elementId(r) IN $rids
+                        SET r.source_files = [x IN r.source_files WHERE x <> $source]
+                        WITH r WHERE size(r.source_files) = 0
+                        DELETE r
+                        """,
+                        tenant_id=tenant_id,
+                        rids=batch,
+                        source=source,
+                    )
+                ).consume()
+
+            await delete_in_batches(related_ids, _strip_related)
+            # The SourceFile node (document structure) is NOT a graph-phase
+            # product: the embedding phase builds it, and EffING does not
+            # re-run embedding when it recovers a graph phase. It goes away
+            # with the source's points (both point deletes prune orphan SourceFiles).
+        log.info(
+            f"[GraphRAG] Purged graph artifacts for source '{source}' "
+            f"({doc_count} document(s), tenant {tenant_id})"
+        )
+        return doc_count
+
+    @tenant_write_locked("delete tenant points by ids")
     async def delete_tenant_points_by_ids(self, collection_name: str, points_ids: List) -> UpdateResult:
         await self._ensure_connected()
 
         operation_id = random.randint(1, 100000)
 
-        query = """
+        # Resolve the matching Document ids with a read, then delete them in
+        # bounded sequential transactions (see batched_delete.py). The same
+        # batching applies to the orphan entity / SourceFile sweeps below.
+        resolve_query = """
         MATCH (c:Collection {name: $collection_name})<-[:BELONGS_TO]-(d:Document)
         WHERE d.id IN $ids AND d.tenant_id = $tenant_id
-        DETACH DELETE d
-        """
-        orphan_query = """
-        MATCH (e:Entity {tenant_id: $tenant_id})
-        WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
-        DETACH DELETE e
-        """
-        orphan_sf_query = """
-        MATCH (sf:SourceFile {tenant_id: $tenant_id})
-        WHERE NOT (sf)<-[:PART_OF]-()
-        DETACH DELETE sf
+        RETURN d.id AS id
         """
         async with self._get_session() as session:
-            await session.run(
-                cast(LiteralString, query),
+            result = await session.run(
+                cast(LiteralString, resolve_query),
                 collection_name=collection_name,
                 ids=points_ids,
-                tenant_id=self.agent_id
+                tenant_id=self.agent_id,
             )
-            await session.run(cast(LiteralString, orphan_query), tenant_id=self.agent_id)
-            await session.run(cast(LiteralString, orphan_sf_query), tenant_id=self.agent_id)
+            document_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_documents(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (c:Collection {name: $collection_name})<-[:BELONGS_TO]-(d:Document)
+                        WHERE d.id IN $ids AND d.tenant_id = $tenant_id
+                        DETACH DELETE d
+                        """),
+                        collection_name=collection_name,
+                        ids=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(document_ids, _delete_documents)
+
+            result = await session.run(
+                """
+                MATCH (e:Entity {tenant_id: $tenant_id})
+                WHERE NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                RETURN e.id AS id
+                """,
+                tenant_id=self.agent_id,
+            )
+            orphan_entity_ids = [
+                record["id"] async for record in result if record["id"] is not None
+            ]
+
+            async def _delete_orphan_entities(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (e:Entity {tenant_id: $tenant_id})
+                        WHERE e.id IN $ids
+                          AND NOT (e)<-[:MENTIONS]-() AND NOT (e)<-[:PROVENANCE]-()
+                        DETACH DELETE e
+                        """),
+                        ids=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(orphan_entity_ids, _delete_orphan_entities)
+
+            result = await session.run(
+                """
+                MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                WHERE NOT (sf)<-[:PART_OF]-()
+                RETURN sf.name AS name
+                """,
+                tenant_id=self.agent_id,
+            )
+            orphan_sourcefile_names = [
+                record["name"] async for record in result if record["name"] is not None
+            ]
+
+            async def _delete_orphan_sourcefiles(batch: List[str]) -> None:
+                await (
+                    await session.run(
+                        cast(LiteralString, """
+                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                        WHERE sf.name IN $names
+                        DETACH DELETE sf
+                        """),
+                        names=batch,
+                        tenant_id=self.agent_id,
+                    )
+                ).consume()
+
+            await delete_in_batches(orphan_sourcefile_names, _delete_orphan_sourcefiles)
+
         return UpdateResult(status="completed", operation_id=operation_id)
 
     @ensure_version
@@ -2457,7 +3397,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         active_gen = await self._read_concept_gen(self.agent_id)
         if active_gen is None:
-            active_gen = self._concept_fingerprint()
+            active_gen = await self._concept_fingerprint()
         return await self._run_cached(
             f"recall_entity_related:{depth}",
             self._generation,
@@ -2751,6 +3691,59 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             record = await result.single()
             return record["count"] if record else 0
 
+    async def count_source_chunk_points(
+        self, collection_name: str, source: str, chat_id: str | None = None
+    ) -> int:
+        """Count the stored CHUNK points of ONE source (catalogue cards excluded).
+
+        This is the store-grounded freshness probe: the completed-phases diary
+        is bookkeeping, not proof the points still exist, so a wipe that leaves
+        the diary intact must be detectable. It is ONE bounded query per source
+        (``LIMIT 1`` before the count), never a per-chunk query.
+
+        The catalogue card and its segments carry ``is_catalogue_card: true``
+        and are NOT chunks: a source whose only stored point is a card must
+        read as EMPTY, otherwise a wiped source with an intact diary would look
+        populated and its embed phase would never re-run.
+
+        Args:
+            collection_name: The vector collection (e.g. ``"declarative"``).
+            source: The source file name / URL.
+            chat_id: The conversation scope, or None for the agent KB. When
+                set, only points of that conversation are counted.
+
+        Returns:
+            The number of matching chunk points (0 when none).
+        """
+        await self._ensure_connected()
+
+        where_clauses = [
+            "d.tenant_id = $tenant_id",
+            "c.name = $collection_name",
+            "d.metadata CONTAINS $source_frag",
+            "NOT d.metadata CONTAINS $card_frag",
+        ]
+        params: Dict = {
+            "tenant_id": self.agent_id,
+            "collection_name": collection_name,
+            "source_frag": f'"source": {json.dumps(source)}',
+            "card_frag": '"is_catalogue_card": true',
+        }
+        if chat_id:
+            where_clauses.append("d.metadata CONTAINS $chat_frag")
+            params["chat_frag"] = f'"chat_id": {json.dumps(chat_id)}'
+
+        query = f"""
+        MATCH (c:Collection {{name: $collection_name, tenant_id: $tenant_id}})<-[:BELONGS_TO]-(d:Document)
+        WHERE {' AND '.join(where_clauses)}
+        WITH d LIMIT 1
+        RETURN count(d) AS count
+        """
+        async with self._get_session() as session:
+            result = await session.run(cast(LiteralString, query), **params)
+            record = await result.single()
+            return record["count"] if record else 0
+
     # ========== SEARCH METHODS ==========
 
     @ensure_version
@@ -2826,17 +3819,25 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         source: str,
         stored_points: List[PointStruct],
         stray_cat=None,
+        run_concepts: bool = True,
     ) -> None:
         """
         Create derived graph nodes and relations after all documents for a
-        source have been ingested.  Handles chunkers with different metadata
-        profiles gracefully — only creates structure that the available metadata
-        supports.
+        source have been ingested.
 
-        Always created (require only source; chunk_index is used when present,
-        otherwise derived from the arrival order of the points):
+        ``run_concepts=False`` builds the structure only (steps 1-7) and skips
+        the LLM concept step 8: the caller declares that another path owns it
+        (``add_points_to_tenant`` on every engine, ``--graph`` part A3).
+
+        Handles chunkers with different metadata profiles gracefully — only
+        creates structure that the available metadata supports.
+
+        Always created (require only source; ordering uses start_index when the
+        chunker provides it, falling back to chunk_index, and finally to the
+        arrival order of the points):
           - :SourceFile node + [:PART_OF] from each document
-          - [:NEXT] edges between consecutive chunks (ordered by chunk_index)
+          - [:NEXT] edges between consecutive chunks (ordered by start_index,
+            then chunk_index)
 
         Created when chunker provides rich metadata:
           - :Section / :Paragraph labels on documents with chunk_level
@@ -2864,6 +3865,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": ci,
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -2882,6 +3884,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 regular_points.append({
                     "id": p.id,
                     "chunk_index": len(regular_points),
+                    "start_index": meta.get("start_index"),
                     "chunk_level": meta.get("chunk_level"),
                     "parent_id": meta.get("parent_id"),
                     "has_formula": meta.get("has_formula", False),
@@ -2889,114 +3892,124 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             if not regular_points:
                 return
 
-        regular_points.sort(key=lambda x: x["chunk_index"])
+        regular_points.sort(
+            key=lambda x: x["start_index"]
+            if x.get("start_index") is not None
+            else x["chunk_index"]
+        )
         point_ids = [rp["id"] for rp in regular_points]
 
-        async with self._get_session() as session:
-            # 1 — SourceFile node (idempotent)
-            await session.run(
-                "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
-                source=source,
-                tenant_id=tenant_id,
-            )
-
-            # 2 — PART_OF links
-            await session.run(
-                """
-                UNWIND $point_ids AS pid
-                MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
-                MERGE (d)-[:PART_OF]->(sf)
-                """,
-                point_ids=point_ids,
-                source=source,
-                tenant_id=tenant_id,
-            )
-
-            # 3 — NEXT edges between consecutive chunks
-            if len(regular_points) > 1:
-                pairs = [
-                    {"curr": regular_points[i]["id"], "next": regular_points[i + 1]["id"]}
-                    for i in range(len(regular_points) - 1)
-                ]
+        # LOCK SCOPE: only the Neo4j derived-graph writes (steps 1-7)
+        # run under the tenant write lock. Step 8 (LLM concept
+        # extraction) runs OUTSIDE it — it is long non-Neo4j work.
+        async with acquire_tenant_write_lock(
+            self, None, "create derived graph for source"
+        ):
+            async with self._get_session() as session:
+                # 1 — SourceFile node (idempotent)
                 await session.run(
-                    """
-                    UNWIND $pairs AS pair
-                    MATCH (a:Document {id: pair.curr, tenant_id: $tenant_id})
-                    MATCH (b:Document {id: pair.next, tenant_id: $tenant_id})
-                    MERGE (a)-[:NEXT]->(b)
-                    """,
-                    pairs=pairs,
-                    tenant_id=tenant_id,
-                )
-
-            # 4 — Structure labels (Section / Paragraph) from chunk_level
-            if any(rp.get("chunk_level") for rp in regular_points):
-                section_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "section"]
-                paragraph_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "paragraph"]
-                if section_ids:
-                    await session.run(
-                        """
-                        UNWIND $ids AS pid
-                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                        SET d:Section
-                        """,
-                        ids=section_ids,
-                        tenant_id=tenant_id,
-                    )
-                if paragraph_ids:
-                    await session.run(
-                        """
-                        UNWIND $ids AS pid
-                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                        SET d:Paragraph
-                        """,
-                        ids=paragraph_ids,
-                        tenant_id=tenant_id,
-                    )
-
-            # 5 — FormulaChunk label
-            formula_ids = [rp["id"] for rp in regular_points if rp.get("has_formula")]
-            if formula_ids:
-                await session.run(
-                    """
-                    UNWIND $ids AS pid
-                    MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                    SET d:FormulaChunk
-                    """,
-                    ids=formula_ids,
-                    tenant_id=tenant_id,
-                )
-
-            # 6 — CHILD_OF from parent_id
-            child_pairs = [
-                {"child": rp["id"], "parent": rp["parent_id"]}
-                for rp in regular_points if rp.get("parent_id")
-            ]
-            if child_pairs:
-                await session.run(
-                    """
-                    UNWIND $pairs AS pair
-                    MATCH (child:Document {id: pair.child, tenant_id: $tenant_id})
-                    MATCH (parent:Document {id: pair.parent, tenant_id: $tenant_id})
-                    MERGE (child)-[:CHILD_OF]->(parent)
-                    """,
-                    pairs=child_pairs,
-                    tenant_id=tenant_id,
-                )
-
-            # 7 — HAS_SUMMARY from SourceFile to CATALOG card
-            if catalogue_id:
-                await session.run(
-                    """
-                    MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
-                    MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
-                    MERGE (sf)-[:HAS_SUMMARY]->(card)
-                    """,
-                    card_id=catalogue_id,
+                    "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
                     source=source,
                     tenant_id=tenant_id,
                 )
+
+                # 2 — PART_OF links
+                await session.run(
+                    """
+                    UNWIND $point_ids AS pid
+                    MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                    MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                    MERGE (d)-[:PART_OF]->(sf)
+                    """,
+                    point_ids=point_ids,
+                    source=source,
+                    tenant_id=tenant_id,
+                )
+
+                # 3 — NEXT edges between consecutive chunks
+                if len(regular_points) > 1:
+                    pairs = [
+                        {"curr": regular_points[i]["id"], "next": regular_points[i + 1]["id"]}
+                        for i in range(len(regular_points) - 1)
+                    ]
+                    await session.run(
+                        """
+                        UNWIND $pairs AS pair
+                        MATCH (a:Document {id: pair.curr, tenant_id: $tenant_id})
+                        MATCH (b:Document {id: pair.next, tenant_id: $tenant_id})
+                        MERGE (a)-[:NEXT]->(b)
+                        """,
+                        pairs=pairs,
+                        tenant_id=tenant_id,
+                    )
+
+                # 4 — Structure labels (Section / Paragraph) from chunk_level
+                if any(rp.get("chunk_level") for rp in regular_points):
+                    section_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "section"]
+                    paragraph_ids = [rp["id"] for rp in regular_points if rp["chunk_level"] == "paragraph"]
+                    if section_ids:
+                        await session.run(
+                            """
+                            UNWIND $ids AS pid
+                            MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                            SET d:Section
+                            """,
+                            ids=section_ids,
+                            tenant_id=tenant_id,
+                        )
+                    if paragraph_ids:
+                        await session.run(
+                            """
+                            UNWIND $ids AS pid
+                            MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                            SET d:Paragraph
+                            """,
+                            ids=paragraph_ids,
+                            tenant_id=tenant_id,
+                        )
+
+                # 5 — FormulaChunk label
+                formula_ids = [rp["id"] for rp in regular_points if rp.get("has_formula")]
+                if formula_ids:
+                    await session.run(
+                        """
+                        UNWIND $ids AS pid
+                        MATCH (d:Document {id: pid, tenant_id: $tenant_id})
+                        SET d:FormulaChunk
+                        """,
+                        ids=formula_ids,
+                        tenant_id=tenant_id,
+                    )
+
+                # 6 — CHILD_OF from parent_id
+                child_pairs = [
+                    {"child": rp["id"], "parent": rp["parent_id"]}
+                    for rp in regular_points if rp.get("parent_id")
+                ]
+                if child_pairs:
+                    await session.run(
+                        """
+                        UNWIND $pairs AS pair
+                        MATCH (child:Document {id: pair.child, tenant_id: $tenant_id})
+                        MATCH (parent:Document {id: pair.parent, tenant_id: $tenant_id})
+                        MERGE (child)-[:CHILD_OF]->(parent)
+                        """,
+                        pairs=child_pairs,
+                        tenant_id=tenant_id,
+                    )
+
+                # 7 — HAS_SUMMARY from SourceFile to CATALOG card
+                if catalogue_id:
+                    await session.run(
+                        """
+                        MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
+                        MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                        MERGE (sf)-[:HAS_SUMMARY]->(card)
+                        """,
+                        card_id=catalogue_id,
+                        source=source,
+                        tenant_id=tenant_id,
+                    )
 
         log.info(
             f"[GraphRAG] Derived graph for '{source}': {len(regular_points)} docs, "
@@ -3006,29 +4019,45 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction (gated on the
-        # enable_knowledge_graph master switch, D1). Self-contained: when no
-        # stray_cat is available (vector-db path via add_points_to_tenant — the
-        # plugin hooks are unreliable under the multi-worker toggle race, so
-        # they cannot be the trigger), the agent LLM is resolved directly from
-        # the saved agent config via _resolve_agent_llm().
-        if self._enable_knowledge_graph and self._enable_concept_relations:
+        # 8 — LLM-based concept relation extraction (gated on
+        # enable_concept_relations; enable_knowledge_graph is display-only).
+        # ONE owner per path: the classic ``after_rabbithole_stored_documents``
+        # hook, the EffING ``graph_llm_extraction`` phase, ``--graph`` part B.
+        # Storage-only callers pass run_concepts=False. Without a stray_cat the
+        # agent LLM is resolved from the saved agent config.
+        if run_concepts and self._enable_concept_relations:
             try:
                 if stray_cat is not None:
-                    await self._extract_concept_relations(source, stored_points, stray_cat)
+                    outcome = await self._extract_concept_relations(
+                        source, stored_points, stray_cat
+                    )
                 else:
+                    # No stray_cat: resolve the agent LLM explicitly so a
+                    # missing LLM is a configuration ERROR, never a silent no-op.
                     llm = await self._resolve_agent_llm()
                     if llm is not None:
-                        await self._extract_concept_relations(source, stored_points, llm=llm)
+                        outcome = await self._extract_concept_relations(
+                            source, stored_points, llm=llm
+                        )
+                    else:
+                        outcome = {
+                            "status": "error",
+                            "reason": "no LLM configured for graph concept extraction",
+                        }
+                if isinstance(outcome, dict) and outcome.get("status") != "done":
+                    log.error(
+                        f"[GraphRAG] Concept relation extraction for '{source}' "
+                        f"did not complete: status={outcome.get('status')} "
+                        f"reason={outcome.get('reason')}"
+                    )
             except Exception as e:
                 log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
 
     async def _resolve_agent_llm(self) -> Optional[Any]:
         """Resolve the agent's configured LLM without a ``StrayCat`` reference.
 
-        Self-contained vector-db path: step 8 of ``create_derived_graph_for_source``
-        also runs from ``add_points_to_tenant``, where no ``stray_cat`` is passed
-        and the plugin hooks are unreliable (multi-worker toggle race). The LLM
+        Used when the LLM concept step runs without a ``stray_cat`` (e.g. the
+        concept recompute and the EffING phase body). The LLM
         is resolved through the official ``ServiceProvider`` against the agent's
         saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
         any configured LLM class works (not just the probe's OpenRouterLLM).
@@ -3048,9 +4077,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ``context_execute_hook == "cat"``. Imports are lazy (plugin import-safe
         rule).
 
-        Returns None when the agent has no LLM or resolution fails (step 8
-        degrades to a no-op); the resolved LLM is cached on the handler so a
-        multi-file ingestion resolves it once.
+        Returns None when the agent has no LLM or resolution fails; callers
+        treat that as a configuration error, never as a silent no-op. The
+        resolved LLM is cached on the handler so a multi-file ingestion
+        resolves it once.
         """
         cached = getattr(self, "_llm", None)
         if cached is not None:
@@ -3081,6 +4111,97 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             log.warning(f"[GraphRAG] Could not resolve agent LLM for '{agent_id}': {e}")
             return None
 
+    _BINARY_REPLACEMENT_RATIO = 0.10
+    #: Header every catalogue card starts with. Card text is never source prose.
+    _CATALOGUE_CARD_HEADER = "# CATALOGUE CARD"
+
+    @classmethod
+    def _looks_binary_content(cls, content: str) -> bool:
+        """True when ``content`` is raw bytes decoded as text, not prose.
+
+        PDF/CATALOG card segments decode (with ``errors="replace"``) to NUL
+        bytes, a leading ``%PDF`` marker or a flood of U+FFFD. Feeding them to
+        the extractor makes the LLM return a valid empty product.
+        """
+        if not content:
+            return False
+        if "\x00" in content:
+            return True
+        if content.lstrip().startswith("%PDF"):
+            return True
+        sample = content[:4096]
+        if not sample:
+            return False
+        replacements = sample.count("\ufffd")
+        return (replacements / len(sample)) >= cls._BINARY_REPLACEMENT_RATIO
+
+    @classmethod
+    def _looks_like_catalogue_card_content(cls, content: str) -> bool:
+        """True when ``content`` starts with the catalogue-card header."""
+        return content.lstrip().startswith(cls._CATALOGUE_CARD_HEADER)
+
+    @staticmethod
+    def _point_content_and_metadata(point: Any) -> Tuple[str, Dict[str, Any]]:
+        payload = getattr(point, "payload", None) or {}
+        content = payload.get("page_content", "") or ""
+        metadata = payload.get("metadata", {}) or {}
+        return content, metadata
+
+    @classmethod
+    def _select_extraction_text_points(
+        cls, points: List[Any]
+    ) -> List[Any]:
+        """Return the stored points usable as concept-extraction input.
+
+        Only TEXT from NON-IMAGE chunks is sent to the LLM, and the decision is
+        PURELY content-first: the CATALOG card flags are metadata, never a veto.
+        A point is dropped only when its content is provably NOT usable text:
+
+          1. blank content -> dropped (nothing to extract);
+          2. IMAGE point (``image: True`` / ``image_file`` / ``image_mime_type``)
+             -> dropped: its ``page_content`` is only ``"[Image] …"``, an image
+             chunk that must never reach an LLM prompt;
+          3. binary-looking content -> dropped EVEN IF unflagged: unreadable
+             bytes can never feed the LLM;
+          4. content starting with the catalogue-card header -> dropped: it is
+             card text, not source prose;
+          5. punctuation/whitespace-only content (no alphanumeric) -> dropped
+             (nothing meaningful to extract).
+
+        ``full_card`` / ``is_catalogue_card`` / ``is_catalogue_card_segment``
+        NEVER drop a point whose content is readable prose: production observed
+        real prose chunks carrying leaked card metadata, and content wins.
+
+        Survivors are ordered by ``metadata.start_index`` when present, else
+        ``metadata.chunk_index``, ascending; points with neither keep their
+        arrival order after the positioned ones.
+        """
+        selected: List[Tuple[bool, Any, int, Any]] = []
+        for arrival, point in enumerate(points):
+            content, metadata = cls._point_content_and_metadata(point)
+            if not content.strip():
+                continue
+            if (
+                metadata.get("image") is True
+                or metadata.get("image_file")
+                or metadata.get("image_mime_type")
+            ):
+                continue
+            if cls._looks_binary_content(content):
+                continue
+            if cls._looks_like_catalogue_card_content(content):
+                continue
+            if not any(ch.isalnum() for ch in content):
+                continue
+            position = metadata.get("start_index")
+            if position is None:
+                position = metadata.get("chunk_index")
+            selected.append(
+                (position is None, position if position is not None else 0, arrival, point)
+            )
+        selected.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [item[3] for item in selected]
+
     async def _extract_concept_relations(
         self,
         source: str,
@@ -3088,25 +4209,49 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         stray_cat=None,
         gen: str | None = None,
         llm=None,
-    ) -> None:
+    ) -> Dict[str, Any]:
+        """Run LLM concept/relation extraction for one source.
+
+        Returns a ``PhaseResult``-compatible dict: ``{"status": "done"}`` with
+        the extracted product on success, ``{"status": "not_ready"}`` for a
+        transient LLM failure (retried inside the phase's budget) and
+        ``{"status": "error", "reason": ...}`` for a permanent one. A VALID
+        LLM call that returns an empty product on non-empty text is ``done``
+        with an ``empty-extraction`` warning (the phase ran, the content has
+        no concepts/relations) and ``processed=0``; a phase that produced
+        nothing because the LLM could NOT run stays ``not_ready`` / ``error``.
+        """
         tenant_id = self.agent_id
 
         # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
         # LLM (hook path), then a self-contained resolve from the agent config
-        # (vector-db path, no stray_cat). None -> skip silently.
+        # (no stray_cat). A missing/default LLM is a
+        # CONFIGURATION error, never a silent no-op.
         if llm is None:
             if stray_cat is not None:
                 llm = getattr(stray_cat, "large_language_model", None)
-            if llm is None:
+            if not self._is_usable_llm(llm):
                 llm = await self._resolve_agent_llm()
-        if llm is None:
-            return
+        if not self._is_usable_llm(llm):
+            log.error(
+                "[GraphRAG] No usable LLM configured for graph concept "
+                f"extraction of '{source}'"
+            )
+            return {
+                "status": "error",
+                "reason": "no LLM configured for graph concept extraction",
+            }
 
-        # Join full section texts (no per-chunk truncation), up to a total limit
+        # Join full section texts (no per-chunk truncation), up to a total limit.
+        # Only TEXT from NON-IMAGE chunks is input: image points ("[Image] …"),
+        # catalogue-card text (a card header), raw PDF bytes and any other
+        # binary-looking content are dropped, and the survivors are ordered by
+        # start_index/chunk_index. Card FLAGS never drop readable prose: a chunk
+        # that merely inherited card metadata is still real text (content wins).
         texts: List[str] = []
         total_len = 0
         max_chars = 12000
-        for p in stored_points:
+        for p in self._select_extraction_text_points(stored_points):
             content = (p.payload or {}).get("page_content", "")
             if not content or not content.strip():
                 continue
@@ -3117,14 +4262,77 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         combined = "\n\n".join(texts)
         if not combined.strip():
-            return
+            # No LLM is invoked on content that has no readable text. When the
+            # store did return points but ALL of them were card/binary, that is
+            # a completed extraction with the ``empty-extraction`` warning
+            # (genuinely unreadable input), not a retryable failure.
+            if stored_points:
+                log.warning(
+                    f"[GraphRAG] No usable text in {len(stored_points)} point(s) "
+                    f"for '{source}' (all image/card/binary)"
+                )
+                return {
+                    "status": "done",
+                    "warnings": [
+                        {
+                            "code": "empty-extraction",
+                            "message": (
+                                f"no usable text in {len(stored_points)} "
+                                f"point(s) for '{source}'"
+                            ),
+                        }
+                    ],
+                    "processed": 0,
+                }
+            # No input text is not an LLM failure: there is simply nothing to
+            # extract. A phase over empty input truthfully produced no product.
+            return {"status": "done", "processed": 0}
 
         if len(combined) > max_chars:
             combined = combined[:max_chars] + " [truncated]"
 
-        relations = await self._llm_extract_relations(combined, llm=llm)
-        if not relations.get("concepts") and not relations.get("relations"):
-            return
+        attempt = self._next_concept_attempt(source)
+        outcome = await self._llm_extract_relations(combined, llm=llm, attempt=attempt)
+        status = outcome.get("status")
+        if status != "done":
+            log.warning(
+                f"[GraphRAG] Concept relation extraction for '{source}' did not "
+                f"complete: status={status} reason={outcome.get('reason')}"
+            )
+            if status == "error":
+                self._clear_concept_attempt(source)
+            return outcome
+
+        relations = {
+            "concepts": outcome.get("concepts", []),
+            "relations": outcome.get("relations", []),
+        }
+
+        # A VALID LLM call that returned empty concepts AND relations on
+        # non-empty text is a ``done`` phase with an ``empty-extraction``
+        # warning: the call ran, the content simply has no concepts. This is
+        # distinct from every "could not run" path (timeout, schema error,
+        # no LLM), which stays ``not_ready`` / ``error`` in
+        # ``_llm_extract_relations``.
+        if not relations["concepts"] and not relations["relations"]:
+            self._clear_concept_attempt(source)
+            log.warning(
+                f"[GraphRAG] LLM extraction found no concepts or relations in "
+                f"{len(combined)} chars for '{source}'"
+            )
+            return {
+                "status": "done",
+                "warnings": [
+                    {
+                        "code": "empty-extraction",
+                        "message": (
+                            f"no concepts or relations found in "
+                            f"{len(combined)} chars for '{source}'"
+                        ),
+                    }
+                ],
+                "processed": 0,
+            }
 
         # Every concept created from this source is provenance-linked to the
         # documents (the file's chunks) that produced it, so the deletion
@@ -3139,24 +4347,82 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             relations,
             source=source,
             document_ids=document_ids,
-            concept_gen=gen or self._concept_fingerprint(),
+            concept_gen=gen or await self._concept_fingerprint(),
         )
+        self._clear_concept_attempt(source)
         log.info(
             f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
         )
+        return {"status": "done", "processed": len(relations.get("relations", []))}
+
+    @staticmethod
+    def _is_usable_llm(llm: Any) -> bool:
+        """A configured LLM that can actually extract (never the dumb default)."""
+        return llm is not None and type(llm).__name__ != "LLMDefault"
+
+    def _next_concept_attempt(self, source: str) -> int:
+        """Increment and return the per-source LLM-extraction attempt count."""
+        attempt = self._concept_attempts.get(source, 0) + 1
+        self._concept_attempts[source] = attempt
+        return attempt
+
+    def _clear_concept_attempt(self, source: str) -> None:
+        """Forget the per-source attempt counter after a terminal outcome."""
+        self._concept_attempts.pop(source, None)
 
     async def _llm_extract_relations(
-        self, text: str, stray_cat=None, llm=None
-    ) -> Dict[str, list]:
-        # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
-        # LLM. The self-contained resolve happens one level up
-        # (``_extract_concept_relations``); a None here means no LLM is
-        # available -> return empty (step 8 no-op).
+        self, text: str, stray_cat=None, llm=None, attempt: int = 1
+    ) -> Dict[str, Any]:
+        """Extract ``{"concepts","relations"}`` or report a truthful phase state.
+
+        Every LLM outcome maps onto a ``PhaseResult``-compatible dict:
+
+        - clean extraction -> ``{"status": "done", concepts, relations}``.
+          ``done`` always carries at least one storable item on BOTH the
+          lenient and the native structured-output branch;
+        - no usable LLM -> ``error`` (a configuration problem, never
+          ``skipped``);
+        - transient failure — ``StructuredLLMError`` with NO raw text (the
+          client failed before producing output: timeout / 429 / 5xx / dropped
+          connection) or any other exception escaping the client ->
+          ``not_ready``;
+        - wall-clock/client timeout -> ``not_ready`` on the FIRST attempt
+          (retried inside the phase's budget), then ``error`` naming the
+          timeout. The await itself is bounded by
+          ``CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS`` (default 180 s), so a
+          stalled streaming socket can never keep the phase ``processing``;
+        - a VALID structured result that is empty on non-empty text -> the
+          caller turns it into ``done`` + an ``empty-extraction`` warning (the
+          content has no concepts/relations; the call succeeded);
+        - unparsable output on non-empty text (a ``StructuredLLMError`` whose
+          raw text yields no items) -> ``not_ready`` on the FIRST attempt
+          (transient, retried inside the phase's budget), then ``error``
+          carrying a raw prefix;
+        - partial extraction (items dropped: a non-whitelisted type, blank
+          endpoints, a blank concept text, a blank relation text, or a
+          malformed non-list ``concepts``/``relations`` container) ->
+          ``error`` carrying ``dropped=<n>`` and a raw prefix.
+
+        The empty/partial gate runs on both branches. A non-list container
+        (``null``, a number, a dict, a string) is coerced to zero parsed items
+        but counted as at least one dropped candidate, so it can neither raise
+        nor pass silently.
+
+        ``attempt`` is the per-source counter maintained by
+        ``_extract_concept_relations`` (the diary ``attempt`` is not exposed to
+        the phase body).
+        """
+        # Public-entry guard: the only caller (the phase body) always passes a
+        # resolved, usable llm; this keeps a direct call with a stray_cat sane.
         if llm is None:
             if stray_cat is not None:
                 llm = getattr(stray_cat, "large_language_model", None)
-        if llm is None:
-            return {"concepts": [], "relations": []}
+        if not self._is_usable_llm(llm):
+            log.error("[GraphRAG] No usable LLM configured for graph concept extraction")
+            return {
+                "status": "error",
+                "reason": "no LLM configured for graph concept extraction",
+            }
         # Use the per-agent prompt from settings; fall back to the built-in
         # default when it is not configured (None / empty). The document text
         # is concatenated after the prompt (no {text} placeholder anymore).
@@ -3176,38 +4442,257 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # model (todo 2) whitelist-enforces concept/relation types at
         # validation time.
         output_model = self._build_llm_output_model()
+        call_timeout = llm_call_timeout_seconds()
         try:
-            result = await StructuredLLM().run(
-                full_prompt, llm, output_model
+            # Wall-clock deadline: streaming responses have no overall
+            # deadline, so the await itself must be bounded or a stalled
+            # socket keeps the phase ``processing`` forever. The structured
+            # call also runs with streaming disabled for this call only
+            # (``_without_streaming``) and, on OpenRouter, with reasoning
+            # turned off: the model defaults to effort ``high``, and hidden
+            # reasoning tokens dominated the latency while the extraction only
+            # needs the final JSON.
+            result = await asyncio.wait_for(
+                StructuredLLM().run(
+                    full_prompt, _without_streaming(llm), output_model
+                ),
+                timeout=call_timeout,
             )
             model = result.model
             if hasattr(model, "model_dump"):
                 data = model.model_dump()
             else:
                 data = model or {}
-            if not data.get("concepts") and not data.get("relations"):
+            concepts = data.get("concepts") or []
+            relations = data.get("relations") or []
+            raw = getattr(result, "text", "") or ""
+            # The output model only enforces non-empty STRINGS, so a
+            # whitespace-only concept text / relation endpoint is schema-valid
+            # yet unstorable (``_store_concept_relations`` skips it). Drop what
+            # the store would skip; what remains is the real product.
+            concepts, relations = self._drop_unstorable_items(concepts, relations)
+            if not concepts and not relations:
+                # The LLM call itself SUCCEEDED and returned a valid empty
+                # product: the content has no concepts/relations. That is
+                # ``done`` (with the caller's ``empty-extraction`` warning),
+                # never a retryable failure.
                 log.warning(
-                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
-                    f"raw={result.text[:300]!r}"
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations "
+                    f"(valid empty result); raw={raw[:300]!r}"
                 )
-            return {
-                "concepts": data.get("concepts", []),
-                "relations": data.get("relations", []),
-            }
+                return {
+                    "status": "done",
+                    "concepts": [],
+                    "relations": [],
+                    "processed": 0,
+                }
+            # Same dropped-item gate as the lenient path: stale items the
+            # schema let through but the store skipped are a partial
+            # extraction, never a quiet ``done``.
+            dropped = self._count_dropped_items(raw, concepts, relations)
+            if dropped > 0:
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"partial LLM extraction: dropped={dropped} item(s); "
+                        f"raw={raw[:300]!r}"
+                    ),
+                }
+            return {"status": "done", "concepts": concepts, "relations": relations}
         except StructuredLLMError as e:
-            log.warning(
-                f"[GraphRAG] Structured LLM extraction failed, falling back to "
-                f"lenient parsing: {e}"
-            )
-            # Lenient fallback: the parser now returns the {"concepts","relations"}
-            # dict natively (todo 5), so the result feeds straight into the store.
-            data = self._parse_concept_relations(e.raw_text)
-            if not data.get("concepts") and not data.get("relations"):
+            raw = e.raw_text or ""
+            if not raw.strip():
+                # No model text at all: the native client failed before
+                # producing output (timeout / 429 / 5xx / dropped connection).
+                # That is the transient class, never a terminal parse error.
                 log.warning(
-                    f"[GraphRAG] LLM extraction produced empty concepts/relations; "
-                    f"raw={e.raw_text[:300]!r}"
+                    f"[GraphRAG] Transient structured LLM failure (attempt "
+                    f"{attempt}): {e}"
                 )
-            return data
+                return {
+                    "status": "not_ready",
+                    "reason": f"transient structured LLM failure: {e}",
+                    "retry_after": 5,
+                }
+            log.warning(
+                f"[GraphRAG] Structured LLM extraction failed (attempt {attempt}), "
+                f"falling back to lenient parsing: {e}"
+            )
+            # Lenient fallback: the parser returns the {"concepts","relations"}
+            # dict natively (todo 5), so a fully-parsed result feeds straight
+            # into the store.
+            data = self._parse_concept_relations(raw)
+            concepts = data.get("concepts", [])
+            relations = data.get("relations", [])
+            if not concepts and not relations:
+                log.warning(
+                    f"[GraphRAG] LLM extraction produced empty concepts/relations "
+                    f"(attempt {attempt}); raw={raw[:300]!r}"
+                )
+                if attempt <= 1:
+                    return {
+                        "status": "not_ready",
+                        "reason": (
+                            "unparsable LLM extraction "
+                            f"(attempt {attempt}); raw={raw[:300]!r}"
+                        ),
+                        "retry_after": 5,
+                    }
+                return {
+                    "status": "error",
+                    "reason": (
+                        "unparsable LLM extraction "
+                        f"after {attempt} attempt(s); raw={raw[:300]!r}"
+                    ),
+                }
+            dropped = self._count_dropped_items(raw, concepts, relations)
+            if dropped > 0:
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"partial LLM extraction: dropped={dropped} item(s); "
+                        f"raw={raw[:300]!r}"
+                    ),
+                }
+            return {"status": "done", "concepts": concepts, "relations": relations}
+        except Exception as e:  # noqa: BLE001 - client failure or timeout
+            if _is_timeout_error(e):
+                # Transient on the first attempt (the phase's own not-ready
+                # budget then governs retries); a repeat timeout in the same
+                # handler is terminal and names the timeout so the phase can
+                # never stay ``processing`` forever.
+                log.warning(
+                    f"[GraphRAG] LLM extraction timed out after "
+                    f"{call_timeout:.0f}s (attempt {attempt}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                if attempt <= 1:
+                    return {
+                        "status": "not_ready",
+                        "reason": (
+                            f"LLM extraction timed out after {call_timeout:.0f}s "
+                            f"(attempt {attempt}); retrying"
+                        ),
+                        "retry_after": 5,
+                    }
+                return {
+                    "status": "error",
+                    "reason": (
+                        f"LLM extraction timed out after {call_timeout:.0f}s "
+                        f"after {attempt} attempt(s)"
+                    ),
+                }
+            log.warning(
+                f"[GraphRAG] Transient LLM extraction failure (attempt {attempt}): "
+                f"{type(e).__name__}: {e}"
+            )
+            return {
+                "status": "not_ready",
+                "reason": (
+                    "transient LLM extraction failure: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                "retry_after": 5,
+            }
+
+    @staticmethod
+    def _drop_unstorable_items(
+        concepts: List[Dict], relations: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Items dropped from a validated native product, before the gate.
+
+        ``_store_concept_relations`` skips a concept with a blank ``text`` and a
+        relation with a blank ``origin``/``destination``; the output model only
+        rejects a blank concept text/endpoint (a blank relation ``text`` is
+        allowed). When SOME items survive, the removed ones are counted by
+        ``_count_dropped_items`` and the extraction is a partial ``error``.
+        When NONE survives, the product is a valid empty one (``done`` with the
+        ``empty-extraction`` warning): blank-only items are how the model says
+        it found nothing.
+
+        A blank relation ``text`` is dropped HERE even though the store would
+        still write the edge: the model must not reject the whole payload for
+        it, but it must not silently pass as a clean extraction either, so it
+        becomes a counted drop.
+        """
+
+        def _text(value: Any) -> str:
+            return str(value or "").strip()
+
+        kept_concepts = [
+            c for c in concepts if isinstance(c, dict) and _text(c.get("text"))
+        ]
+        kept_relations = [
+            r
+            for r in relations
+            if isinstance(r, dict)
+            and _text(r.get("origin"))
+            and _text(r.get("destination"))
+            and _text(r.get("text"))
+        ]
+        return kept_concepts, kept_relations
+
+    def _count_dropped_items(
+        self, raw: str, concepts: List[Dict], relations: List[Dict]
+    ) -> int:
+        """Items the lenient parse rejected from a raw LLM payload.
+
+        Counts candidate records in the raw JSON (new ``{concepts,relations}``
+        contract or the legacy bare list) and subtracts the records the parse
+        kept. Concepts synthesized from a legacy list are not counted as raw
+        candidates, so only genuinely dropped relation records are reported.
+        """
+        raw_concepts, raw_relations = self._raw_item_counts(raw)
+        dropped = max(0, raw_concepts - len(concepts))
+        dropped += max(0, raw_relations - len(relations))
+        return dropped
+
+    def _raw_item_counts(self, raw: str) -> Tuple[int, int]:
+        """``(concept_items, relation_items)`` present in a raw LLM payload."""
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\[[\s\S]*\]", text)
+            if not match:
+                return 0, 0
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                return 0, 0
+        if isinstance(data, list):
+            return 0, len(data)
+        if not isinstance(data, dict):
+            return 0, 0
+        # A MISSING key means "no candidates", but a PRESENT key with a
+        # malformed non-list value (``null``, a number, a dict, a string) means
+        # its records were all dropped and must count as at least one.
+        raw_concepts = data["concepts"] if "concepts" in data else []
+        raw_relations = data["relations"] if "relations" in data else []
+        return (
+            self._raw_container_count(raw_concepts),
+            self._raw_container_count(raw_relations),
+        )
+
+    @staticmethod
+    def _raw_container_count(value: Any) -> int:
+        """Candidate record count of one raw payload container.
+
+        A list counts its records. Any other PRESENT value (``null``, a dict, a
+        string, a number) is a MALFORMED container: its records were all
+        dropped, so it counts as at least one candidate — never as zero, which
+        would hide the loss. A missing key is handled by the caller, which
+        passes an empty list.
+        """
+        if isinstance(value, list):
+            return len(value)
+        if isinstance(value, dict):
+            return max(1, len(value))
+        return 1
 
     def _parse_concept_relations(self, raw: str) -> Dict[str, list]:
         """Parse an LLM JSON payload into the ``{"concepts","relations"}`` shape.
@@ -3224,7 +4709,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         ``concepts`` derived from the unique subjects/objects.
 
         Never raises: malformed JSON / non-dict payloads yield
-        ``{"concepts": [], "relations": []}``.
+        ``{"concepts": [], "relations": []}``. A non-list ``concepts`` /
+        ``relations`` container (``null``, a number, a dict, a string) is a
+        malformed payload, not an iterable: it is coerced to zero parsed
+        candidates here, while ``_raw_container_count`` still counts it as a
+        dropped item in the partial-extraction gate.
         """
         import re
         import json
@@ -3282,8 +4771,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if not isinstance(data, dict):
             return {"concepts": [], "relations": []}
 
+        # A non-list container must never be iterated: ``null`` / ``0`` raise
+        # ``TypeError`` and would skip the dropped-item count below. Coerce it
+        # to an empty candidate list; the raw count still sees the key present
+        # and counts it as a dropped item.
+        raw_concepts = data.get("concepts", [])
+        if not isinstance(raw_concepts, list):
+            raw_concepts = []
+        raw_relations = data.get("relations", [])
+        if not isinstance(raw_relations, list):
+            raw_relations = []
+
         concepts = []
-        for item in data.get("concepts", []):
+        for item in raw_concepts:
             if not isinstance(item, dict):
                 continue
             ctype = str(item.get("type", "")).strip().upper()
@@ -3297,7 +4797,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
 
         relations = []
-        for item in data.get("relations", []):
+        for item in raw_relations:
             if not isinstance(item, dict):
                 continue
             rtype = str(item.get("type", "")).strip().upper()
@@ -3322,20 +4822,85 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
 
-    def _concept_fingerprint(self) -> str:
+    def _spacy_fingerprint(self) -> str:
+        """Stable SHA-256 fingerprint of the effective spaCy extraction config.
+
+        Normalizes the model map (``sort_keys=True``) and the whitespace-
+        stripped technology terminology (``extra_technology_patterns``), so
+        cosmetic edits (line order, indentation, trailing whitespace) do NOT
+        produce a spurious generation change — mirroring
+        ``_concept_fingerprint``. ``enable_entity_extraction`` is included
+        because it gates the per-point extraction (turning it off leaves no
+        spaCy entities at all), so it is material for the phase. The resulting
+        token is the material marker for the ``graph_spacy_extraction`` phase.
+        """
+        payload = (
+            "MODELS:" + json.dumps(self._spacy_models, sort_keys=True)
+            + "|PATTERNS:"
+            + json.dumps(
+                [p.strip() for p in (self._extra_technology_patterns or [])],
+                sort_keys=True,
+            )
+            + "|ENTITY_EXTRACTION:"
+            + json.dumps(bool(self._enable_entity_extraction))
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _resolve_agent_llm_identity(self) -> str:
+        """Stable, secret-free identifier of the agent's configured LLM.
+
+        Resolved the same way the extraction phase resolves its LLM: the
+        agent-scoped ``llm`` service setting (``ServiceProvider`` /
+        ``_resolve_agent_llm`` read the same category). The identifier is
+        ``<config class name>:<model>`` — never a client object and never
+        credentials; a missing/default/dumb LLM collapses to a stable sentinel
+        so the fingerprint stays deterministic. Cached per handler instance.
+        """
+        cached = getattr(self, "_llm_identity", None)
+        if cached is not None:
+            return cached
+
+        identity = "none"
+        agent_id = getattr(self, "agent_id", None)
+        if agent_id:
+            try:
+                # lazy import (plugin import-safe rule)
+                from cat.db.cruds import settings as crud_settings
+
+                saved = await crud_settings.get_settings_by_category(agent_id, "llm")
+                if saved:
+                    name = str(saved.get("name") or "")
+                    value = saved.get("value") or {}
+                    model = value.get("model") if isinstance(value, dict) else None
+                    if name and name != "LLMDefaultConfig":
+                        identity = f"{name}:{model or ''}"
+                    else:
+                        identity = "default"
+            except Exception:  # noqa: BLE001
+                identity = "unknown"
+
+        self._llm_identity = identity
+        return identity
+
+    async def _concept_fingerprint(self) -> str:
         """Stable SHA-256 fingerprint of the effective concept-relations config.
 
-        Normalizes the PARSED definition dicts (``sort_keys=True``) and the
-        whitespace-stripped prompt, so cosmetic edits (line order, indentation,
-        trailing whitespace) do NOT produce a spurious generation change. The
-        resulting token tags every concept node/edge written by
-        ``_store_concept_relations`` (the ``concept_gen`` property) and is what
-        the save-trigger recompute (todo 12) flips to.
+        Normalizes the PARSED definition dicts (``sort_keys=True``), the
+        whitespace-stripped prompt, the agent-level LLM identity and the
+        ``enable_concept_relations`` toggle, so cosmetic edits do NOT produce a
+        spurious generation change. The LLM identity is material because it
+        actually produces the concepts; the toggle is material because it
+        gates the whole extraction. The resulting token tags every concept
+        node/edge written by ``_store_concept_relations`` (the ``concept_gen``
+        property) and is what the save-trigger recompute (todo 12) flips to.
         """
         payload = (
             "CONCEPT:" + json.dumps(self._concept_definitions, sort_keys=True)
             + "|REL:" + json.dumps(self._relation_definitions, sort_keys=True)
             + "|PROMPT:" + (self._concept_relations_prompt or "").strip()
+            + "|LLM:" + await self._resolve_agent_llm_identity()
+            + "|CONCEPT_RELATIONS:"
+            + json.dumps(bool(self._enable_concept_relations))
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -3364,6 +4929,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 return str(record["gen"])
             return None
 
+    @tenant_write_locked("_write_concept_gen")
     async def _write_concept_gen(self, tenant_id: str, gen: str) -> None:
         """Persist the tenant's active concept-generation marker.
 
@@ -3383,6 +4949,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 gen=gen,
             )
 
+    @tenant_write_locked("_flip_concept_gen")
     async def _flip_concept_gen(
         self, tenant_id: str, expected_prev_gen: str | None, new_gen: str
     ) -> bool:
@@ -3470,6 +5037,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     return False
         return True
 
+    @tenant_write_locked("_gc_stale_concept_nodes")
     async def _gc_stale_concept_nodes(self, tenant_id: str) -> None:
         """Deferred GC of concept nodes superseded by a generation flip.
 
@@ -3507,11 +5075,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         OTHER generation. No re-ingest, no re-embed, no full wipe; every query
         is tenant-scoped and the walk is serialized by the write semaphore.
         """
-        if not (self._enable_knowledge_graph and self._enable_concept_relations):
+        if not self._enable_concept_relations:
             return
         tenant_id = self.agent_id
         if gen is None:
-            gen = self._concept_fingerprint()
+            gen = await self._concept_fingerprint()
 
         await self._ensure_connected()
         async with self._neo4j_write_semaphore:
@@ -3563,7 +5131,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 for p in by_source[source]
             ]
-            await self._extract_concept_relations(source, payloads, stray_cat, gen=gen)
+            outcome = await self._extract_concept_relations(
+                source, payloads, stray_cat, gen=gen
+            )
+            if isinstance(outcome, dict) and outcome.get("status") != "done":
+                log.error(
+                    f"[GraphRAG] Concept recompute for '{source}' did not "
+                    f"complete: status={outcome.get('status')} "
+                    f"reason={outcome.get('reason')}"
+                )
 
     def _build_llm_output_model(self) -> type[BaseModel]:
         """Dynamically build the Pydantic output model for structured LLM
@@ -3576,6 +5152,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         may emit lowercase/mixed-case types. If a parsed definitions dict is
         empty (e.g. an all-comment settings field), the built-in defaults are
         used for the model build ONLY — the stored dicts are left untouched.
+
+        Constraint choice: ``min_length=1`` guards the concept ``text`` and the
+        relation endpoints, because an empty one produces no node/edge. The
+        relation ``text`` deliberately has NO minimum length: the store
+        tolerates a blank relation text, so rejecting the WHOLE payload for it
+        would be stricter than the writer. Such an item is instead dropped and
+        counted by ``_drop_unstorable_items``/``_count_dropped_items``, so one
+        blank text becomes a ``dropped=<n>`` partial result, never a schema
+        rejection and never a silent ``done``.
         """
         concept_keys = sorted(self._concept_definitions.keys()) or sorted(
             parse_definitions(DEFAULT_CONCEPT_DEFINITIONS).keys()
@@ -3590,13 +5175,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         Concept = create_model(
             "Concept",
             type=(ConceptType, ...),
-            text=(str, ...),
+            text=(str, Field(min_length=1)),
         )
         Relation = create_model(
             "Relation",
             type=(RelationType, ...),
-            origin=(str, ...),
-            destination=(str, ...),
+            origin=(str, Field(min_length=1)),
+            destination=(str, Field(min_length=1)),
+            # No min_length: the store writes the edge even with a blank text.
+            # A blank text is dropped and counted downstream instead of
+            # rejecting the whole payload at validation time.
             text=(str, ...),
         )
         return create_model(
@@ -3624,6 +5212,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 return t, enum
         return "CONCEPT", EntityType.CONCEPT
 
+    @tenant_write_locked("_store_concept_relations")
     async def _store_concept_relations(
         self,
         tenant_id: str,
@@ -3716,7 +5305,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                         metadata=metadata,
                     )
 
-                await session.execute_write(_write_concept)
+                await with_transient_retry(
+                    lambda: session.execute_write(_write_concept),
+                    operation=f"store concept '{c_name}' for tenant {tenant_id}",
+                )
 
             for rel in rels:
                 try:
@@ -3826,11 +5418,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             SET t.metadata = $t_metadata
                             MERGE (s)-[r:RELATED_TO {type: $rel_type}]->(t)
                             SET r.concept_gen = CASE WHEN $r_gen IS NOT NULL THEN $r_gen ELSE r.concept_gen END
-                            # Idempotent weight: re-running the graph phase for the
-                            # same source+gen must not mutate the edge. The old
-                            # `+ 0.5` accumulated on every re-run; the weight is
-                            # write-only (never read by recall), so first-write
-                            # behavior (1.0) is preserved and re-runs are no-ops.
+                            // Idempotent weight: re-running the graph phase for the
+                            // same source+gen must not mutate the edge. The old
+                            // `+ 0.5` accumulated on every re-run; the weight is
+                            // write-only (never read by recall), so first-write
+                            // behavior (1.0) is preserved and re-runs are no-ops.
                             SET r.weight = coalesce(r.weight, 1.0)
                             SET r.text = $rel_text
                             SET r.source_files = CASE
@@ -3856,7 +5448,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             source_files=source_files,
                         )
 
-                    await session.execute_write(_write_relation)
+                    await with_transient_retry(
+                        lambda: session.execute_write(_write_relation),
+                        operation="store concept relations",
+                    )
 
                     # PROVENANCE edges from every producing document to both
                     # concept entities (concepts carry no MENTIONS edges, so
@@ -3864,8 +5459,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     # the RESOLVED endpoint id, not the raw name, so the
                     # deletion cascade always lands on the surviving node.
                     if document_ids:
-                        await session.run(
-                            """
+                        await with_transient_retry(
+                            lambda: session.run(
+                                """
                             UNWIND $doc_ids AS did
                             MATCH (d:Document {id: did, tenant_id: $tenant_id})
                             MATCH (s:Entity {id: $subject_id, tenant_id: $tenant_id})
@@ -3873,16 +5469,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             MERGE (d)-[:PROVENANCE]->(s)
                             MERGE (d)-[:PROVENANCE]->(t)
                             """,
-                            doc_ids=document_ids,
-                            tenant_id=tenant_id,
-                            subject_id=subject_id,
-                            object_id=object_id,
+                                doc_ids=document_ids,
+                                tenant_id=tenant_id,
+                                subject_id=subject_id,
+                                object_id=object_id,
+                            ),
+                            operation="store concept relations",
                         )
                 except Exception as e:
                     log.warning(
                         f"[GraphRAG] Failed to store relation "
                         f"'{rel.get('origin')} -[{rel.get('type')}]-> {rel.get('destination')}': {e}"
                     )
+                    raise
 
 
 DEFAULT_CONCEPT_DEFINITIONS = """## Concept types (assign each extracted concept exactly one type)
@@ -3952,12 +5551,16 @@ async def wipe_tenant_graph_data(agent_key: str) -> None:
         return
     handler = GraphRAGHandler(**config)
     handler.agent_id = agent_key
-    try:
-        await handler._ensure_connected()
-        async with handler._get_session() as session:
-            await handler._drop_tenant_data_in_session(session)
-    finally:
-        await handler.close()
+    # Tenant-scoped write lock around the whole wipe: serialises against any
+    # concurrent writer of the same tenant (Lock ordering: taken AFTER the
+    # source lock held by the caller, never before).
+    async with acquire_tenant_write_lock(handler, agent_key, "wipe tenant graph data"):
+        try:
+            await handler._ensure_connected()
+            async with handler._get_session() as session:
+                await handler._drop_tenant_data_in_session(session)
+        finally:
+            await handler.close()
 
 
 def parse_definitions(text: str) -> Dict[str, str]:
@@ -4051,10 +5654,6 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     graph_retrieval_depth: int = Field(default=2, description="Max depth for graph traversal", ge=1, le=5)
     graph_decay_factor: float = Field(default=0.8, description="Score decay factor per hop", ge=0.5, le=1.0)
 
-    enable_derived_graph: bool = Field(
-        default=False,
-        description="Automatically create derived graph nodes and relations (SourceFile, Section labels, NEXT edges, PART_OF links, HAS_SUMMARY link) after document ingestion",
-    )
     enable_concept_relations: bool = Field(
         default=False,
         description="Extract conceptual relations (IS_A, PART_OF, EXAMPLE_OF, PREREQUISITE_FOR, etc.) using the configured LLM after document ingestion",
@@ -4087,7 +5686,11 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
     )
     enable_knowledge_graph: bool = Field(
         default=False,
-        description="Enable the knowledge graph feature globally",
+        description=(
+            "Display-only flag for the frontend; it does not gate backend "
+            "concept writes or retrieval. Use enable_concept_relations to "
+            "control LLM concept/relation extraction."
+        ),
     )
     enable_student_knowledge_graph: bool = Field(
         default=False,
@@ -4107,8 +5710,8 @@ class Neo4jGraphRAGConfig(VectorDatabaseSettings):
 
     @classmethod
     def parse_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
-        # Merge stored config with model defaults so new fields (e.g.
-        # enable_derived_graph) appear in existing saved configs.
+        # Merge stored config with model defaults so new fields appear in
+        # existing saved configs.
         config = super().parse_config(config)
         return cls(**config).model_dump()
 

@@ -68,10 +68,12 @@ This repository is a plugin for **Grinning Cat** and depends on the `base_plugin
 At runtime it provides:
 
 - a custom vector database handler: `GraphRAGHandler`
-- a settings model: `Neo4jGraphRAGConfig`
-- a hook in `main.py` that captures the raw user message before memory recall
+- a settings model: `Neo4jGraphRAGConfig`, registered through `factory_allowed_vector_databases`
+- ingestion hooks: embedder injection, the classic `after_rabbithole_stored_documents` graph writer, the EffING phase registration (`ingestion_phase_objects`, `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`, `ingestion_phase_purge` — which also re-queues the sibling graph phase —, `before_ingestion_status_completed`)
+- a query hook that captures the raw user message before memory recall
+- maintenance hooks: boot-time provenance reconciliation, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
 
-That hook is important: it allows the retrieval stage to extract entities from the actual query text, instead of relying only on whatever vector search returns.
+The query hook is important: it allows the retrieval stage to extract entities from the actual query text, instead of relying only on whatever vector search returns.
 
 ---
 
@@ -101,6 +103,85 @@ Results found by both graph and vector phases receive a boost during reranking.
 
 ---
 
+## Ingestion modes: classic vs efficient phase machine
+
+The plugin can build the graph in two mutually exclusive ways, decided per agent by `_phase_path_active(cat)`:
+
+| SYSTEM-level `ingestion` engine | [`cat_efficient_ingestion`](https://github.com/DEH-RAG/cat-efficient-ingestion) active on the system plugin manager | EffING active on this agent | Path used |
+|---|---|---|---|
+| core engine | any | any | **classic** |
+| `EfficientIngestionConfiguration` | no | any | **classic** |
+| `EfficientIngestionConfiguration` | yes | no | **classic** |
+| `EfficientIngestionConfiguration` | yes | yes | **phase machine** |
+
+EffING is installed under `cat/plugins` as a regular plugin, so being installed is not enough: it must be active, both on the system plugin manager (where the core resolves the `ingestion` engine, one of only two system-level services together with `embedder`) and on the agent, and importable as `cat.plugins.cat_efficient_ingestion` (otherwise a warning is logged and the classic path runs). If reading the engine setting fails, the last value read successfully is reused, so the decision does not flip in the middle of an ingestion. The same decision gates the phase registration: where the phase machine is inactive the graph phases are not registered with EffING and the classic `after_rabbithole_stored_documents` callback is the only writer; where it is active that callback is a no-op. Graph work therefore never runs twice and is never skipped.
+
+### Phase registration (EffING)
+
+Where the phase machine is active (see above), the plugin registers **exactly two** phases through the `ingestion_phase_specs` accumulator, in this order:
+
+- **`graph_spacy_extraction`** — spaCy NER + entity linking + similarity edges.
+- **`graph_llm_extraction`** — LLM concept/relation extraction.
+
+Both declare `settings_category=None` (the material marker *is* the settings fingerprint) and `depends_on=("parsing_chunking", "embedding")` (the graph work needs the stored chunks and valid vectors). `ingestion_phase_settings_marker` returns `_spacy_fingerprint` for the spaCy phase and `_concept_fingerprint` for the LLM phase; `ingestion_phase_run` dispatches each phase to its awaited executor (`run_spacy_extraction_phase` / `run_llm_extraction_phase`), returning `{"status": "done"}` only when the phase produced its product, `{"status": "not_ready", "retry_after": 5}` while the source's points are still absent (or the LLM outcome is transient) and `{"status": "skipped", "reason"}` when the phase is inapplicable (the LLM phase with `enable_concept_relations` off). `before_ingestion_status_completed` is the completion gate: it fails the ingestion hard if live background graph tasks remain for the source.
+
+A graph phase is considered stale when the dependencies' marker identity or the plugin's own fingerprint changes; EffING computes this itself (no timestamps, no full settings dumps, no raw Redis). Re-running is always safe: every write is an idempotent MERGE.
+
+### Concept and relation extraction (agent-level LLM)
+
+The LLM phase extracts `concept` nodes and typed `RELATED_TO` relations using the **agent's own LLM** (`cat.llm`, resolved per agent from that agent's saved `llm` configuration) — it is **not** a system-level service, so two agents can use different models and prompts.
+
+Three per-agent settings drive it:
+
+- **`concept_definitions`** — one `TYPE: definition` per line; each key becomes an admissible concept type (uppercased) and is interpolated into `{concept_definitions}`.
+- **`relation_definitions`** — one `TYPE: definition` per line; each key becomes an admissible relation type and is interpolated into `{relation_definitions}`.
+- **`concept_relations_prompt`** — the prompt template; the document text is appended after it. Empty falls back to the built-in default.
+
+Each structured LLM call is bounded by a wall-clock deadline, `CAT_INGESTION_LLM_CALL_TIMEOUT_SECONDS` (default `180` seconds; invalid/non-positive values fall back to the default), and runs with streaming disabled (`stream=False`); when the LLM's base URL is OpenRouter, reasoning is also turned off through a `reasoning: {"enabled": false}` override in `extra_body` (other providers reject that field, so they never receive it). Both apply per call only — the agent's LLM config is never changed. A stalled streaming socket therefore becomes `not_ready` on the first attempt (the phase's 300 s not-ready budget governs retries) and then `error` naming the timeout, never an unbounded `processing` phase.
+
+The fingerprint also includes the **agent-level LLM identity** (`<config class name>:<model>`, resolved from the agent's `llm` category) and the `enable_concept_relations` toggle, because both change what the phase produces. `enable_student_knowledge_graph` and the display-only `enable_knowledge_graph` are deliberately excluded. `_concept_fingerprint` is SHA-256 over the parsed definitions + the whitespace-stripped prompt + the LLM identity + the toggle. When any material input changes, the fingerprint changes; the next ingestion recomputes concept extraction, and a save-triggered recompute re-runs it for existing documents.
+
+Writes are **generation-versioned**: every concept node/edge is tagged with the fingerprint as its `concept_gen`, the tenant's active generation is persisted on its `Collection` node (`concept_gen_active`), and superseded generations are hidden by the retrieval gate and garbage-collected. The stale-concept GC only deletes nodes marked inactive **and** with no remaining `MENTIONS` edge, so shared spaCy-owned entities survive a generation flip.
+
+Toggles and phase markers:
+
+- The document-structure graph (`:SourceFile`, `[:PART_OF]`, `[:NEXT]`, `[:HAS_SUMMARY]`) is **always built**.
+- **`enable_concept_relations`** is the only switch for the LLM concept/relation phase; with it off, that phase still completes but does no extraction. **`enable_knowledge_graph`** is display-only: the frontend UI uses it, but it does not gate any backend write or retrieval. **`enable_student_knowledge_graph`** is display-only as well. The spaCy phase independently honours `enable_entity_extraction`.
+- **`graph_llm_extraction` marker** — SHA-256 over the parsed `concept_definitions` + `relation_definitions` + whitespace-stripped `concept_relations_prompt` + the agent-level LLM identity (`<config class name>:<model>`) + `enable_concept_relations`. Display-only toggles are excluded because they cannot change the produced concepts.
+- **`graph_spacy_extraction` marker** — SHA-256 over the normalized `spacy_models` map + whitespace-stripped `extra_technology_patterns` + `enable_entity_extraction`.
+
+
+### One extraction per document (empty-pass discriminator)
+
+The efficient engine stores each chunk twice: first with the empty mapping `vector={}` (parsing/chunking), then again with real vectors after embedding. Graph extraction is vector-independent, so the plugin gates it on the **pass**, not on vector validity. `_is_empty_vector_staging_pass` requires BOTH the intrinsic empty mapping `vector={}` (only `_store_empty_vectors` / the efficient image builder writes it) AND the source's recorded `parsing_chunking` phase (`embedding` -> build). The empty mapping is what distinguishes the staging pass from a classic write: the core writes the `List[float]` returned by the embedder (a zero-norm list on fallback) and the multimodal hook either embeds an image or drops it, so `{}` never occurs on the classic path. The phase machine's `resume_owner` lease is deliberately not used — the host never clears it on a terminal status, so a classic re-ingest after an efficient ingest inherited `resume_owner` + `parsing_chunking` and the graph was silently skipped. This keeps the graph work at **one extraction per document** instead of two, while a legitimate payload-only / zero-vector document (e.g. an image under a non-multimodal embedder) still builds the graph exactly once. Vector validity is still required only for the similarity edges, where a zero vector is meaningless.
+
+### Shared Entity-node schema (internal contract)
+
+Both phases write to the SAME `Entity` nodes, which is why the LLM phase is NOT extracted into a separate plugin. The contract is internal to this plugin:
+
+- the spaCy NER step (`_extract_and_link_entities`) writes shared Entity nodes and `REMOVE`s the `concept_gen` / `concept_gen_active` tags from them;
+- the LLM concept-relations step tags its own Entity nodes with `concept_gen`;
+- the stale-concept GC (`_gc_stale_concept_nodes`) only deletes nodes marked `concept_gen_active = false` AND with no remaining `MENTIONS` edge — the `NOT (e)<-[:MENTIONS]-()` guard protects shared spaCy nodes, so an entity that spaCy picked up keeps its `MENTIONS` edge and is never deleted when the LLM generation flips.
+
+Because the two phases coordinate on the same node schema, they must live in the same plugin.
+
+### Configuration scope
+
+Only two services are **system-level** in Cat; everything else is **per-agent**:
+
+| Setting / service | Scope | Notes |
+|---|---|---|
+| `ingestion` engine | **system** | `DEFAULT_SYSTEM_KEY`; decides classic vs phase path |
+| `embedder` | **system** | embedding model / dimension |
+| `llm` (agent LLM) | per-agent | used by concept/relation extraction |
+| `chunker` | per-agent | |
+| vector store (`Neo4jGraphRAGConfig` / `GraphRAGHandler`) | per-agent | |
+| concept definitions / relation definitions / prompt / `enable_concept_relations` / agent `llm` | per-agent | drive `_concept_fingerprint` |
+
+### EffING dependency
+
+`plugin.json` declares `cat_efficient_ingestion` as a dependency, so the Cat installs this plugin only next to it (EffING is installed as a regular plugin in `cat/plugins/cat_efficient_ingestion`, and this plugin imports it as `cat.plugins.cat_efficient_ingestion`: EffING's `isinstance` checks only accept phase classes imported through the same module path it was loaded from). The code itself stays import-safe without it: when the system ingestion engine is not EffING's, or EffING is not active for the agent, the classic path runs unchanged; when EffING is active but `cat.plugins.cat_efficient_ingestion` cannot be imported, a warning is logged and the classic path runs.
+
 ## Requirements
 
 Before using this plugin, make sure you have:
@@ -109,7 +190,7 @@ Before using this plugin, make sure you have:
 - the `base_plugin` dependency available in your Cat environment
 - a running **Neo4j** instance
 - a Neo4j version with **vector index support** available
-- Python dependencies from `requirements.txt`
+- the Python dependencies declared in `pyproject.toml`
 - at least one installed **spaCy model**
 
 ### Python dependencies
@@ -117,7 +198,7 @@ Before using this plugin, make sure you have:
 From this repository:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 ### Install a spaCy model
@@ -129,6 +210,8 @@ python -m spacy download en_core_web_lg
 ```
 
 If the configured model is unavailable, the extractor attempts to fall back to `en_core_web_sm`.
+
+Only standard statistical spaCy pipelines (e.g. `en_core_web_sm/lg`, `it_core_news_lg`) are supported; `*_trf` transformer pipelines are not supported and `spacy-transformers` is not a dependency.
 
 ---
 
@@ -169,7 +252,7 @@ The plugin exposes a `Neo4jGraphRAGConfig` settings model.
 | `enable_entity_extraction`  | `True`           | Enables spaCy-based entity extraction               |
 | `enable_entity_embeddings`  | `False`          | Enables entity embeddings and entity vector index   |
 | `enable_entity_expansion`   | `True`           | Enables graph-aware expansion during recall         |
-| `spacy_model`               | `en_core_web_lg` | spaCy model used for extraction                     |
+| `spacy_models`              | `{"en": "en_core_web_lg"}` | spaCy model per language, used for extraction |
 | `extra_technology_patterns` | `[]`             | Extra regex patterns for domain-specific tech terms |
 
 ### Graph retrieval settings
@@ -185,6 +268,17 @@ The plugin exposes a `Neo4jGraphRAGConfig` settings model.
 |-------------------------|---------|---------------------------------|
 | `connection_pool_size`  | `50`    | Neo4j connection pool size      |
 | `save_memory_snapshots` | `False` | Enables snapshot backup support |
+
+### Graph building and LLM extraction
+
+| Setting | Default | Description |
+|---|---|---|
+| `enable_knowledge_graph` | `False` | Display-only frontend flag; no backend extraction/retrieval gating |
+| `enable_concept_relations` | `False` | Enables LLM concept/relation extraction (the only concept-write gate) |
+| `concept_definitions` | built-in RITA defaults | Admissible concept types, one `TYPE: definition` per line |
+| `relation_definitions` | built-in RITA defaults | Admissible relation types, one `TYPE: definition` per line |
+| `concept_relations_prompt` | built-in template | Prompt sent to the agent LLM; document text is appended |
+| `enable_student_knowledge_graph` | `False` | Frontend-visualisation flag only; no backend extraction/retrieval gating |
 
 ---
 
@@ -277,7 +371,7 @@ When a collection is deleted:
 
 - its collection node is removed
 - its documents are deleted
-- orphaned entities are pruned only if they are no longer mentioned anywhere else
+- orphaned entities are pruned only if they are not mentioned anywhere else
 
 This preserves shared knowledge across collections whenever entities are still referenced.
 
@@ -320,14 +414,70 @@ A few things are worth knowing before production use:
 
 | File | Purpose |
 |---|---|
-| `main.py` | Grinning Cat hook to capture the raw user query before recall |
-| `settings.py` | Plugin configuration model exposed to Grinning Cat |
-| `graphrag_handler.py` | Core Neo4j-backed GraphRAG memory handler |
+| `main.py` | Hook registration: query capture, embedder injection, classic graph writer, EffING phase hooks, transfer cleanup, boot reconciliation |
+| `graphrag_handler.py` | `GraphRAGHandler` core logic + `Neo4jGraphRAGConfig` settings model |
 | `entity_extractor.py` | spaCy-based entity and relation extraction pipeline |
-| `constants.py` | Entity mappings, regex technology patterns, relation verb map |
+| `constants.py` | Entity mappings, regex technology patterns, relation verb map, default concept/relation definitions |
 | `models.py` | Pydantic models for entities and extracted relations |
+| `epoch.py` / `versioning.py` | Generation-token helpers and versioned read/write decorators |
+| `structured_llm.py` | Structured JSON output helpers for the agent LLM |
 | `plugin.json` | Plugin metadata for Grinning Cat |
-| `requirements.txt` | Python dependencies |
+| `pyproject.toml` | Python dependencies |
+| `tests/` | Standalone, import-safe behavioral harnesses (run as scripts) |
+| `scripts/` | `maintenance_agent.py` and `cleanup_null_vectors.py` utilities |
+
+### Maintenance CLI
+
+`maintenance_agent.py` runs inside the Cat container and drives the ingestion
+engine and the GraphRAG graph rebuild. Scope is `--agent <id>` (repeatable; an
+explicit id is the only way to target a protected/`__*__` agent) or `--all`
+(protected agents always skipped). Ops are combinable: `--reingest`,
+`--reembed`, `--resume-failed`, `--graph`.
+
+```bash
+# Re-embed only (chunk reuse) for one agent
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --reembed --yes
+
+# Re-ingest from scratch (points-first wipe, then re-parse + re-embed)
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --reingest --yes
+
+# Resume ONLY the failed phases (keeps complete phases, no purge/re-parse/re-embed)
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --resume-failed --yes
+
+# Rebuild the GraphRAG graph (wipe-then-rebuild)
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --graph --yes
+
+# Show the resolved plan without touching anything (exits 2)
+docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --resume-failed --dry-run
+```
+
+Safety contract: the default mode is **dry-run** — it prints the resolved plan
+(agent, source, failed phases, kept-phase count for `--resume-failed`) and
+exits **2** with zero writes; every mutating op requires `--yes`; agents are
+processed sequentially with per-agent and per-source `try/except` isolation;
+`--json` emits machine-readable plan/summary lines.
+
+Exit codes: **0** = all resumed/ops cleanly, **1** = partial failure (some
+source/agent/op failed, or a `--verify` check failed), **2** = aborted
+(dry-run or missing `--yes`, or EffING is not importable).
+
+`--resume-failed` deletes only the diary entries whose state is `error`
+(including collateral `dependency <x> is error` rows), keeps every `complete`
+entry with its `tag`/`started_at`, writes `status=processing`/`error=None`,
+and re-dispatches only the cleared phases via
+`reembed_sources(..., stale_after=0.0)`. A source with no failed phase is
+reported `nothing-to-resume` and left untouched; a disabled
+`graph_llm_extraction` phase ends `skipped`, never `error`.
+
+### Maintenance script coordination
+
+Before each per-agent run `maintenance_agent.py` writes
+`agents:<agent_id>:ingestion:maintenance` (`{"owner": "maintenance",
+"started_at": ...}`, TTL 2h, refreshed per source) through `cat.db.crud`, and
+deletes it in a `finally` (success or failure). While the marker exists the
+EffING periodic sweep skips that agent, so the app never steals/retries rows
+the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
+never blocks the sweep forever.
 
 ---
 
@@ -363,7 +513,7 @@ Two mitigations are available:
 
 - **Use a multilingual spaCy model** — models such as `xx_ent_wiki_sm` cover named entities across many languages.
   The NER component is language-agnostic; only the regex patterns are English-centric.
-  Set `spacy_model` in the plugin configuration to switch model.
+  Set `spacy_models` in the plugin configuration to switch model.
 - **Extend the regex list** — use `extra_technology_patterns` to add domain-specific or non-English terms at
   configuration time.
 

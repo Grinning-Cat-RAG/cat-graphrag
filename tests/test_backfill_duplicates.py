@@ -2,7 +2,7 @@
 
 
 # ── Everything below runs ONLY when executed as a script (docker exec
-#    cheshire_cat_core python /app/test_backfill_duplicates.py). The Cat
+#    cheshire_cat_core python /app/cat/plugins/cat_graphrag/tests/test_backfill_duplicates.py). The Cat
 #    plugin loader imports this module with zero effect.
 if __name__ == "__main__":
 
