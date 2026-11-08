@@ -1,5 +1,7 @@
 from typing import List, Dict, Any
 import asyncio
+import math
+import time
 from langchain_core.documents import Document
 
 from cat import hook, RecallSettings, VectorDatabaseSettings
@@ -17,6 +19,19 @@ from .entity_extractor import EntityExtractor
 # harmless at import time (no side effects) and therefore import-safe.
 _concept_recompute_lock = asyncio.Lock()
 _concept_recompute_pending: Dict[str, str] = {}
+# tenant -> the fingerprint whose visible concepts this process checked: a change of the agent's LLM fires no hook, so
+# the plugin checks before a recall or an ingestion, once per change (not per message).
+_concept_checked: Dict[str, str] = {}
+# A recompute holds a Redis lock per tenant and generation, so that two pods noticing the same change do not both pay
+# the LLM pass; it expires on its own if the pod dies (a recompute longer than this may start twice: the flip guard
+# keeps it correct).
+_CONCEPT_RECOMPUTE_LOCK_SECONDS = 2 * 60 * 60
+# tenant -> when this process checks again a change being recomputed by another pod (its lock was taken): the holder
+# may die, its lock then expires and the next check here starts the work.
+_concept_recheck_at: Dict[str, float] = {}
+_CONCEPT_RECHECK_SECONDS = 10 * 60
+# The running recomputes: held here, owned by no request (a request's agent closes its handler when it ends).
+_concept_jobs: set = set()
 
 
 @hook(priority=10)
@@ -75,7 +90,49 @@ async def before_cat_recalls_memories(config: RecallSettings, cat: StrayCat) -> 
         if hasattr(cat.vector_memory_handler, "_align_embedder_lazy"):
             await cat.vector_memory_handler._align_embedder_lazy()
 
+    await _check_concept_generation(cat)
     return config
+
+
+async def _check_concept_generation(cat) -> None:
+    """``_ensure_concept_generation``, never failing the recall or the ingestion that runs it."""
+    try:
+        await _ensure_concept_generation(cat)
+    except Exception as e:  # noqa: BLE001 - a check, never a reason to fail the caller
+        log.warning(f"[GraphRAG] Concept generation check failed for {getattr(cat, 'agent_key', '?')}: {e}")
+
+
+async def _ensure_concept_generation(cat) -> None:
+    """The visible concepts are those of the current concept settings AND of the agent's LLM.
+
+    A save of the plugin settings recomputes them (``after_vector_database_settings_update``); a change of the
+    agent's LLM fires no hook. So, once per tenant and fingerprint in this process: if concepts of another generation
+    are still visible, the same recompute starts. Not "marker != fingerprint": an agent never recomputed has no marker
+    and its concepts are those of the current fingerprint (no LLM pass on the day of the release).
+    """
+    # Lazy import (FX-9): same reload-order rationale as after_cheshire_cat_creation.
+    from .graphrag_handler import GraphRAGHandler as _GH
+    handler = cat.vector_memory_handler
+    if not isinstance(handler, _GH) or not handler._enable_concept_relations:
+        return
+    tenant = cat.agent_key
+    fingerprint = await handler._concept_fingerprint()
+    if _concept_checked.get(tenant) == fingerprint and time.monotonic() < _concept_recheck_at.get(tenant, math.inf):
+        return  # checked (or recomputing elsewhere: checked again after an interval)
+    _concept_checked[tenant] = fingerprint
+    _concept_recheck_at.pop(tenant, None)
+    try:
+        stale = await handler.has_stale_visible_concepts(fingerprint)
+    except Exception:
+        _concept_checked.pop(tenant, None)  # the next recall checks again
+        raise
+    if not stale:
+        return
+    async with _concept_recompute_lock:
+        if _concept_recompute_pending.get(tenant) == fingerprint:
+            return  # already scheduled in this process
+        _concept_recompute_pending[tenant] = fingerprint
+    _schedule_concept_recompute(tenant, fingerprint, "concepts of another generation are visible")
 
 
 async def _inject_embedder(cat) -> None:
@@ -95,6 +152,7 @@ async def _inject_embedder(cat) -> None:
 @hook(priority=10)
 async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     await _inject_embedder(cat)
+    await _check_concept_generation(cat)
 
     # Lazy import (FX-9): same reload-order rationale as
     # after_cheshire_cat_creation — a module-level binding would be the
@@ -271,23 +329,78 @@ async def after_vector_database_settings_update(
     async with _concept_recompute_lock:
         _concept_recompute_pending[cat.agent_key] = new_gen
 
-    task = asyncio.create_task(
-        _concept_recompute_job(handler, cat, cat.agent_key, new_gen)
-    )
-    # Tracked so the handler's close() can await it during agent shutdown
-    # (pattern from after_cheshire_cat_creation) and so it is not GC'd.
-    handler._pending_entity_tasks.append(task)
-    log.info(
-        f"[GraphRAG] Concept-relation config changed for {cat.agent_key}: "
-        f"scheduled recompute to generation {new_gen[:12]}"
-    )
+    _schedule_concept_recompute(cat.agent_key, new_gen, "concept-relation config changed")
 
 
-async def _concept_recompute_job(
-    handler: GraphRAGHandler, cat: StrayCat, tenant: str, new_gen: str
-) -> None:
+def _schedule_concept_recompute(tenant: str, new_gen: str, why: str) -> None:
+    """Start the recompute of the tenant's concepts to ``new_gen`` in background. The task belongs to no request (a
+    request's agent shuts its handler down, cancelling the handler's tasks, as soon as the request ends): it is held
+    here until it ends, and it loads an agent of its own."""
+    task = asyncio.create_task(_concept_recompute_job(tenant, new_gen))
+    _concept_jobs.add(task)
+    task.add_done_callback(_concept_jobs.discard)
+    log.info(f"[GraphRAG] {why} for {tenant}: scheduled recompute to generation {new_gen[:12]}")
+
+
+async def _agent_for_recompute(tenant: str):
+    """The agent the recompute works on: loaded as a request loads it (its handler, its LLM), owned by the job."""
+    from cat.looking_glass.bill_the_lizard import BillTheLizard
+
+    return await BillTheLizard().get_cheshire_cat(tenant)
+
+
+async def _concept_recompute_job(tenant: str, new_gen: str) -> None:
+    """The recompute of a tenant's concepts to ``new_gen`` (``_concept_recompute_passes``), on an agent of its own,
+    holding the Redis lock of that tenant and generation.
+
+    - The lock is taken by another pod: the work is theirs; this pod checks again after an interval (if the holder
+      died, its lock expires and a later check here starts the work).
+    - Any other end without the generation in place (a failure, a cancellation, the agent gone): nothing pending and
+      nothing checked here, so the next recall checks again.
     """
-    Single-flight concept recompute for one tenant.
+    from redis.exceptions import LockError
+
+    from cat.db.crud import distributed_lock
+
+    from .graphrag_handler import GraphRAGHandler as _GH
+
+    held = done = elsewhere = False
+    try:
+        async with distributed_lock(
+            f"graphrag-concept-recompute:{tenant}:{new_gen}",
+            timeout=_CONCEPT_RECOMPUTE_LOCK_SECONDS,
+            blocking_timeout=0.1,
+        ):
+            held = True
+            ccat = await _agent_for_recompute(tenant)
+            handler = getattr(ccat, "vector_memory_handler", None)
+            if not isinstance(handler, _GH):
+                log.info(f"[GraphRAG] Concept recompute of {tenant}: the agent is gone or not on GraphRAG anymore")
+                return
+            done = await _concept_recompute_passes(handler, ccat, tenant, new_gen)
+    except LockError as e:
+        if held:  # a lock of the work itself (e.g. the tenant write lock): a failure of the recompute
+            log.error(f"[GraphRAG] Concept recompute failed for {tenant}: {e}")
+        else:
+            elsewhere = True
+            log.info(f"[GraphRAG] Concept recompute of {tenant} to {new_gen[:12]} is running elsewhere")
+    except Exception as e:  # noqa: BLE001 - a background job: logged, then retried by a later check
+        log.error(f"[GraphRAG] Concept recompute failed for {tenant}: {e}")
+    finally:
+        if elsewhere:
+            async with _concept_recompute_lock:
+                if _concept_recompute_pending.get(tenant) == new_gen:
+                    _concept_recompute_pending.pop(tenant, None)
+            _concept_recheck_at[tenant] = time.monotonic() + _CONCEPT_RECHECK_SECONDS
+        elif not done:
+            await _forget_concept_work(tenant, new_gen)
+
+
+async def _concept_recompute_passes(
+    handler: GraphRAGHandler, cat, tenant: str, new_gen: str
+) -> bool:
+    """
+    Single-flight concept recompute for one tenant. Returns whether the tenant ends on the pending generation.
 
     Latest-wins: every pass re-reads ``_concept_recompute_pending`` and the
     persisted marker. The in-process lock only serializes pending-map access;
@@ -295,6 +408,7 @@ async def _concept_recompute_job(
     (gen-guard inside ``_flip_concept_gen``) aborts and this loop re-derives
     from the marker read and the newest pending generation. A flip that commits
     is followed by the deferred GC of stale old-generation concept nodes.
+    Exceptions propagate (the job forgets the work: a later check retries).
     """
     attempts = 0
     while attempts < 4:
@@ -302,27 +416,22 @@ async def _concept_recompute_job(
         async with _concept_recompute_lock:
             pending = _concept_recompute_pending.get(tenant)
         if pending is None:
-            return  # superseded work: a newer job took over
+            return False  # superseded work: a newer job took over
         active = await handler._read_concept_gen(tenant)
         if active == pending:
             async with _concept_recompute_lock:
                 if _concept_recompute_pending.get(tenant) == pending:
                     _concept_recompute_pending.pop(tenant, None)
-            return
+            return True
 
-        try:
-            await handler.recompute_concept_relations(cat, gen=pending)
-            flipped = await handler._flip_concept_gen(tenant, active, pending)
-        except Exception as e:  # noqa: BLE001
-            log.error(f"[GraphRAG] Concept recompute failed for {tenant}: {e}")
-            return  # keep pending: the next settings save re-triggers it
-
+        await handler.recompute_concept_relations(cat, gen=pending)
+        flipped = await handler._flip_concept_gen(tenant, active, pending)
         if flipped:
             await handler._gc_stale_concept_nodes(tenant)
             async with _concept_recompute_lock:
                 if _concept_recompute_pending.get(tenant) == pending:
                     _concept_recompute_pending.pop(tenant, None)
-            return
+            return True
 
         # Gen-guard aborted: a newer save won the race -> loop re-reads the
         # latest pending generation (latest-wins).
@@ -330,3 +439,15 @@ async def _concept_recompute_job(
         f"[GraphRAG] Concept recompute for {tenant} gave up after repeated "
         "gen-guard aborts (newer saves keep winning)"
     )
+    return False
+
+
+async def _forget_concept_work(tenant: str, gen: str) -> None:
+    """A recompute to ``gen`` that will not complete here: nothing pending for it, nothing checked, so the next recall
+    of this process checks the concepts again and starts it if they are still stale."""
+    async with _concept_recompute_lock:
+        if _concept_recompute_pending.get(tenant) == gen:
+            _concept_recompute_pending.pop(tenant, None)
+    if _concept_checked.get(tenant) == gen:
+        _concept_checked.pop(tenant, None)
+    _concept_recheck_at.pop(tenant, None)

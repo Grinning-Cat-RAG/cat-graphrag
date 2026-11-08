@@ -43,6 +43,9 @@ Requirements per script:
   a Redis Stack on `localhost:6379`; the stateful one also needs `hypothesis`
   and accepts `--examples N` and `--mutate llm-dependency|no-purge` (a wrong
   rule injected on purpose: the run must then report the mutation as caught);
+- `test_concept_generation.py` — the REAL core and Redis (the recompute
+  lock): a change of the agent's LLM recomputes the concepts once, across
+  pods, and a failure is retried;
 - `test_ingestion_lane.py` — the REAL core and Redis: the heavy steps of an
   ingestion run on the core's ingestion lane (a one-worker lane), a chat
   message's analysis stays off it;

@@ -7,6 +7,8 @@
 - ``wipe_tenant_graph`` (the maintenance ``--graph``) removes every graph edge and entity of the tenant, keeps its
   documents and structure, and never touches another tenant;
 - the metadata read back are the ones the caller stored (no ``tenant_id``, also on Documents written before);
+- ``has_stale_visible_concepts``: visible concepts of another generation, on nodes or on edges only, per tenant;
+- a concept found again by a recompute takes the new generation and survives the flip and the GC.
 - the read-only graph checks of the maintenance ``--verify`` (``_graph_checks``) on a healthy and a broken graph.
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout, a Redis Stack on
@@ -240,12 +242,62 @@ if __name__ == "__main__":
                  if p.id == point.id]
         assert found == [meta], found
 
+    async def test_stale_visible_concepts(handler, other):
+        """Visible concepts of a generation other than the current fingerprint: on nodes, or on RELATED_TO edges only
+        (concepts linking entities spaCy also found); deactivated ones and other tenants' do not count."""
+        assert await handler.has_stale_visible_concepts("gen-new") is False  # no concept at all
+        await run(handler, "CREATE (:Entity {id: $id, tenant_id: $tenant_id, name: 'c', concept_gen: 'gen-old'})",
+                  id=f"{TENANT}:concept-old")
+        assert await handler.has_stale_visible_concepts("gen-new") is True
+        assert await handler.has_stale_visible_concepts("gen-old") is False
+        await run(handler, "MATCH (e:Entity {id: $id, tenant_id: $tenant_id}) SET e.concept_gen_active = false",
+                  id=f"{TENANT}:concept-old")
+        assert await handler.has_stale_visible_concepts("gen-new") is False, "a deactivated concept counted"
+        await run(
+            handler,
+            """
+            CREATE (a:Entity {id: $a, tenant_id: $tenant_id, name: 'a'})-[:RELATED_TO {type: 'USES', concept_gen: 'gen-old'}]->
+                   (b:Entity {id: $b, tenant_id: $tenant_id, name: 'b'})
+            """,
+            a=f"{TENANT}:spacy-a", b=f"{TENANT}:spacy-b",
+        )
+        assert await handler.has_stale_visible_concepts("gen-new") is True, "a concept edge between spaCy nodes missed"
+        await run(handler, "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->() SET r.concept_gen_active = false")
+        assert await handler.has_stale_visible_concepts("gen-new") is False
+        await run(other, "CREATE (:Entity {id: $id, tenant_id: $tenant_id, name: 'c', concept_gen: 'gen-old'})",
+                  id=f"{OTHER}:concept-old")
+        assert await handler.has_stale_visible_concepts("gen-new") is False, "another tenant's concepts counted"
+
+    async def test_a_concept_found_again_survives_the_flip(handler, other):
+        """A recompute finds again a concept (and its relation) of the previous generation: the node takes the new
+        generation like its edge, so the flip to it keeps both visible and the GC keeps the node."""
+        payload = {
+            "concepts": [{"text": "Fattura elettronica", "type": "DEFINITION"}, {"text": "SDI", "type": "DEFINITION"}],
+            "relations": [{"origin": "Fattura elettronica", "destination": "SDI", "type": "SENT_TO", "text": "sent to"}],
+        }
+        await handler._store_concept_relations(TENANT, payload, source="f.pdf", document_ids=["d-f"], concept_gen="gen-a")
+        await handler._flip_concept_gen(TENANT, await handler._read_concept_gen(TENANT), "gen-a")
+        # the recompute with another LLM: the same concepts again, tagged with the new generation
+        await handler._store_concept_relations(TENANT, payload, source="f.pdf", document_ids=["d-f"], concept_gen="gen-b")
+        assert await handler._flip_concept_gen(TENANT, "gen-a", "gen-b")
+        await handler._gc_stale_concept_nodes(TENANT)
+        nodes = await run(handler, "MATCH (e:Entity {tenant_id: $tenant_id}) WHERE e.name IN $names "
+                                   "RETURN e.name AS name, e.concept_gen AS gen, e.concept_gen_active AS active",
+                          names=["fattura elettronica", "sdi"])
+        assert sorted((r["name"], r["gen"], r["active"]) for r in nodes) == [
+            ("fattura elettronica", "gen-b", None), ("sdi", "gen-b", None),
+        ], [dict(r) for r in nodes]
+        edges = await run(handler, "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO {type: 'SENT_TO'}]->() "
+                                   "RETURN r.concept_gen AS gen, r.concept_gen_active AS active")
+        assert [(r["gen"], r["active"]) for r in edges] == [("gen-b", None)], [dict(r) for r in edges]
+
     async def main_async():
         handler = make_handler()
         other = make_handler(OTHER)
         tests = (
             test_purge_is_scoped_to_collection_and_chat, test_points_read_once_across_pages,
             test_wipe_tenant_graph, test_verify_graph_checks, test_stored_metadata_are_the_callers,
+            test_stale_visible_concepts, test_a_concept_found_again_survives_the_flip,
         )
         failed = 0
         try:

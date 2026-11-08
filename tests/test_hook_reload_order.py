@@ -322,10 +322,14 @@ def test_settings_hook_schedules_recompute_after_reload_order():
     # Capture the scheduled job without running it (no loop, no real graph).
     captured = {}
 
+    class _Task:
+        def add_done_callback(self, callback):
+            captured["done_callback"] = callback
+
     def _fake_create_task(coro):
         captured["coro"] = coro
         coro.close()
-        return types.SimpleNamespace()
+        return _Task()
 
     main._concept_recompute_job = AsyncMock()
     original_create_task = main.asyncio.create_task
@@ -342,12 +346,11 @@ def test_settings_hook_schedules_recompute_after_reload_order():
     finally:
         main.asyncio.create_task = original_create_task
 
-    main._concept_recompute_job.assert_called_once_with(
-        handler, cat, "agent_reload_test", "gen_new"
-    )
-    assert len(handler._pending_entity_tasks) == 1, (
-        "the scheduled task must be tracked for close()"
-    )
+    main._concept_recompute_job.assert_called_once_with("agent_reload_test", "gen_new")
+    # held by the plugin, not by the request's handler: the request's agent closes that handler when it ends
+    assert handler._pending_entity_tasks == [], "the job is tied to the request's handler"
+    assert len(main._concept_jobs) == 1 and "done_callback" in captured, "the scheduled job is not held"
+    main._concept_jobs.clear()
 
 
 def test_settings_hook_skips_when_no_concept_change():

@@ -4715,6 +4715,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
+    async def has_stale_visible_concepts(self, fingerprint: str) -> bool:
+        """Whether this tenant still shows concepts of a generation other than ``fingerprint``: concept nodes, or
+        concept edges between entities spaCy also found, written with other concept settings or another LLM and not
+        deactivated by a flip. Then the concepts must be recomputed to ``fingerprint`` (a change of the agent's LLM
+        fires no hook: this is how the plugin notices it). Read only, one row at most."""
+        await self._ensure_connected()
+        async with self._get_session() as session:
+            result = await session.run(
+                cast(LiteralString, STALE_VISIBLE_CONCEPTS_QUERY), tenant_id=self.agent_id, gen=fingerprint,
+            )
+            return await result.single() is not None
+
     async def _read_concept_gen(self, tenant_id: str | None = None) -> str | None:
         """Read the tenant's active concept-generation marker.
 
@@ -5056,7 +5068,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # holds the id do we fall back to a name-keyed MERGE + guarded SET id
         # within the same statement (atomic check-then-act). Ownership rule:
         # only nodes CREATED by this write get concept_gen-tagged; adopted
-        # nodes stay NER-owned/untagged. `types` accumulates (primary type
+        # nodes stay NER-owned/untagged. A concept node found again (it holds
+        # a concept_gen) takes the generation being written, like its edges:
+        # otherwise the flip to that generation would deactivate it and the GC
+        # delete it, losing every concept both generations found. `types` accumulates (primary type
         # first-wins + dedup union list); `metadata` carries the pre-merged
         # contribution. `name` is stored fully normalized.
         endpoint_query = """
@@ -5071,6 +5086,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         )
         WITH 1 AS _keep
         MATCH (e:Entity {id: $eid, tenant_id: $tenant_id})
+        SET e.concept_gen = CASE WHEN $gen IS NOT NULL AND e.concept_gen IS NOT NULL THEN $gen ELSE e.concept_gen END
+        SET e.concept_gen_active = CASE WHEN $gen IS NOT NULL AND e.concept_gen = $gen THEN null ELSE e.concept_gen_active END
         SET e.name = $name
         SET e.type = coalesce(e.type, $type)
         SET e.types = CASE
@@ -5205,6 +5222,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             WITH 1 AS _keep
                             MATCH (s:Entity {id: $subject_id, tenant_id: $tenant_id})
                             MATCH (t:Entity {id: $object_id, tenant_id: $tenant_id})
+                            SET s.concept_gen = CASE WHEN $s_gen IS NOT NULL AND s.concept_gen IS NOT NULL THEN $s_gen ELSE s.concept_gen END
+                            SET s.concept_gen_active = CASE WHEN $s_gen IS NOT NULL AND s.concept_gen = $s_gen THEN null ELSE s.concept_gen_active END
+                            SET t.concept_gen = CASE WHEN $t_gen IS NOT NULL AND t.concept_gen IS NOT NULL THEN $t_gen ELSE t.concept_gen END
+                            SET t.concept_gen_active = CASE WHEN $t_gen IS NOT NULL AND t.concept_gen = $t_gen THEN null ELSE t.concept_gen_active END
                             SET s.name = $subject
                             SET s.type = CASE
                                 WHEN $s_type IS NOT NULL THEN coalesce(s.type, $s_type)
@@ -5420,6 +5441,19 @@ SET r.concept_gen_active = false
 CONCEPT_FLIP_MARKER_QUERY = """
 MERGE (c:Collection {tenant_id: $tenant_id})
 SET c.concept_gen_active = $new_gen
+"""
+# Visible concepts of a generation other than $gen (not deactivated by a flip), on nodes or on RELATED_TO edges.
+STALE_VISIBLE_CONCEPTS_QUERY = """
+CALL () {
+  MATCH (e:Entity {tenant_id: $tenant_id})
+  WHERE e.concept_gen IS NOT NULL AND e.concept_gen <> $gen AND coalesce(e.concept_gen_active, true)
+  RETURN 1 AS hit LIMIT 1
+  UNION
+  MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
+  WHERE r.concept_gen IS NOT NULL AND r.concept_gen <> $gen AND coalesce(r.concept_gen_active, true)
+  RETURN 1 AS hit LIMIT 1
+}
+RETURN hit LIMIT 1
 """
 CONCEPT_GC_STALE_QUERY = """
 MATCH (e:Entity {tenant_id: $tenant_id})
