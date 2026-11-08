@@ -1,16 +1,21 @@
-"""MyGRAPH phase markers must track what actually changes each phase output.
+"""The tags of the graph phases and the concept generation must track what actually changes their output.
 
 Loads the real plugin ``graphrag_handler`` (relative imports resolved through a
-synthetic package) and pins the two material fingerprints:
+synthetic package) and pins:
 
-- ``_spacy_fingerprint``: spaCy models + technology patterns +
-  ``enable_entity_extraction`` (the toggle gates per-point extraction).
-- ``_concept_fingerprint``: concept/relation definitions + prompt +
-  agent-level LLM identity + ``enable_concept_relations``.
+- ``spacy_phase_settings`` (the tag of the spaCy phase): the spaCy models,
+  ``enable_entity_extraction`` and ``enable_concept_relations`` (the phase
+  purges the concepts too); the technology patterns are refreshed by their
+  own job on save, so they must NOT move it; model order must not move it;
+- ``concept_phase_settings`` (the tag of the LLM phase): only
+  ``enable_concept_relations`` (definitions and prompt belong to the
+  generation flip);
+- ``_concept_fingerprint`` (the concept generation): concept/relation
+  definitions + prompt + agent-level LLM identity + ``enable_concept_relations``.
 
 The frontend-visualisation toggle (``enable_student_knowledge_graph``) and the
-display-only ``enable_knowledge_graph`` must NOT move either marker. Cosmetic
-edits (key order, trailing whitespace) must not move them either.
+display-only ``enable_knowledge_graph`` must NOT move the fingerprint. Cosmetic
+edits (key order, trailing whitespace) must not move it either.
 
 Standalone script (plugin rules): the host imports every ``.py`` under the
 plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
@@ -21,7 +26,15 @@ host checkout:
     .venv/bin/python /path/to/cat-graphrag/tests/test_phase_fingerprint.py
 """
 
+
 if __name__ == "__main__":
+    import os
+
+    # the real core refuses to load without these secrets: test-only values, never a running Cat's
+    os.environ.setdefault("CAT_CRYPTO_KEY", "test_only_crypto_key_0123456789abcdef")
+    os.environ.setdefault("CAT_CRYPTO_SALT", "test_only_crypto_salt_0123456789")
+    os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
+
     import asyncio
     import importlib
     import sys
@@ -65,21 +78,31 @@ if __name__ == "__main__":
         handler._resolve_agent_llm_identity = _identity
         return handler
 
-    def test_spacy_fingerprint_sensitive_to_entity_extraction_toggle():
+    def test_spacy_phase_settings_sensitive_to_entity_extraction_toggle():
         on = _handler(enable_entity_extraction=True)
         off = _handler(enable_entity_extraction=False)
-        assert on._spacy_fingerprint() != off._spacy_fingerprint()
+        assert on.spacy_phase_settings() != off.spacy_phase_settings()
 
-    def test_spacy_fingerprint_cosmetic_edits_are_stable():
+    def test_spacy_phase_settings_ignore_patterns_and_model_order():
         a = _handler(
             spacy_models={"en": "en_core_web_sm", "it": "it_core_news_sm"},
             extra_technology_patterns=["Python", "  Docker  "],
         )
         b = _handler(
             spacy_models={"it": "it_core_news_sm", "en": "en_core_web_sm"},
-            extra_technology_patterns=["Python", "Docker"],
+            extra_technology_patterns=["Kafka"],
         )
-        assert a._spacy_fingerprint() == b._spacy_fingerprint()
+        assert a.spacy_phase_settings() == b.spacy_phase_settings()
+
+    def test_spacy_phase_settings_follow_the_concept_toggle():
+        # the spaCy phase purges the concepts too: turning them off must re-run it
+        assert _handler(enable_concept_relations=False).spacy_phase_settings() != _handler().spacy_phase_settings()
+
+    def test_concept_phase_settings_hold_only_the_toggle():
+        a = _handler(concept_definitions="ALPHA: first", concept_relations_prompt="one")
+        b = _handler(concept_definitions="GAMMA: third", concept_relations_prompt="two")
+        assert a.concept_phase_settings() == b.concept_phase_settings()
+        assert _handler(enable_concept_relations=False).concept_phase_settings() != a.concept_phase_settings()
 
     def test_concept_fingerprint_moves_with_llm_identity():
         async def _run():

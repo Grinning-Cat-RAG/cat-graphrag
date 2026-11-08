@@ -7,5 +7,5 @@
   "thumb": "https://raw.githubusercontent.com/matteocacciola/cat-graphrag/main/thumb.png",
   "version": "0.1.0",
   "min_cat_version": "1.0.0",
-  "dependencies": ["base_plugin", "cat_efficient_ingestion"]
+  "dependencies": ["base_plugin"]
 }

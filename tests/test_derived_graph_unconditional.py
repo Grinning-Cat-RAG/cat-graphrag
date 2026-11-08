@@ -21,6 +21,13 @@ host checkout:
 """
 
 if __name__ == "__main__":
+    import os
+
+    # the real core refuses to load without these secrets: test-only values, never a running Cat's
+    os.environ.setdefault("CAT_CRYPTO_KEY", "test_only_crypto_key_0123456789abcdef")
+    os.environ.setdefault("CAT_CRYPTO_SALT", "test_only_crypto_salt_0123456789")
+    os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
+
     import asyncio
     import importlib
     import sys

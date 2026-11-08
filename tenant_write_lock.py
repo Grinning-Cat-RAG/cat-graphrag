@@ -26,9 +26,9 @@ never share a lock (no global lock across tenants).
 
 Lock ordering (MANDATORY)
 -------------------------
-This lock is taken AFTER the per-source ingestion lock. EffING already holds
-``ingestion-source:<agent>:<source>`` when it invokes the handler, so the
-handler must never acquire a source lock itself. The global order is::
+This lock is taken AFTER the per-source ingestion lock. The core RabbitHole
+already holds the lock of the source (``ingestion-source:...``) when its phases
+invoke the handler, so the handler must never acquire a source lock itself. The global order is::
 
     source lock  ->  tenant write lock
 
@@ -157,8 +157,8 @@ async def acquire_tenant_write_lock(
     if distributed_lock is None:
         # In-process fallback (standalone harness / Redis unavailable).
         # Lock ordering: taken AFTER the per-source lock held by the caller
-        # (EffING holds ``ingestion-source:<agent>:<source>`` before invoking
-        # the handler); never the reverse. See the module docstring.
+        # (the core RabbitHole holds the lock of the source before its phases
+        # invoke the handler); never the reverse. See the module docstring.
         # ``is None``, not truthiness: the handler initialises an EMPTY dict,
         # which must be reused — a fresh dict per call would never serialise.
         locks: Optional[Dict[str, asyncio.Lock]] = getattr(handler, "_local_write_locks", None)
@@ -188,9 +188,9 @@ async def acquire_tenant_write_lock(
             lock.release()
         return
 
-    # Lock ordering: taken AFTER the source lock held by the caller (EffING
-    # holds ``ingestion-source:<agent>:<source>`` before invoking the handler);
-    # never the reverse. See the module docstring.
+    # Lock ordering: taken AFTER the source lock held by the caller (the core
+    # RabbitHole holds the lock of the source before its phases invoke the
+    # handler); never the reverse. See the module docstring.
     acquired = False
     try:
         async with distributed_lock(key, timeout=timeout, blocking_timeout=timeout):

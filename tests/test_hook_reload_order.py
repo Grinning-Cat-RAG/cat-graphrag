@@ -1,7 +1,7 @@
 """Standalone verification for the FX-7/FX-9 fixes: the hooks
-``after_rabbithole_stored_documents`` (FX-7) and
-``after_vector_database_settings_update`` (FX-9) survive the plugin loader's
-reload order via a lazy in-function ``GraphRAGHandler`` import.
+``rabbithole_ingestion_phases`` and ``after_vector_database_settings_update``
+(FX-9) survive the plugin loader's reload order via a lazy in-function
+``GraphRAGHandler`` import.
 
 The MyCAT plugin loader (mad_hatter/plugin.py) walks the plugin's ``*.py``
 files in glob order and ``importlib.reload``s each one. In this folder glob
@@ -18,8 +18,9 @@ order puts ``main.py`` BEFORE ``graphrag_handler.py``:
 
 This harness reproduces that exact sequence (import main, then reload
 graphrag_handler), asserts the stale-binding bug condition holds, then calls
-the hook with a class-B handler and asserts ``create_derived_graph_for_source``
-IS awaited — proving the lazy import resolves the current class.
+the hooks with a class-B handler and asserts they act on it (the graph phases
+are registered, the recompute is scheduled) — proving the lazy import
+resolves the current class.
 
 Runnable:  python tests/test_hook_reload_order.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
@@ -103,7 +104,24 @@ def _install_cat_stub():
     models_mod.Record = type("Record", (), {})
     models_mod.ScoredPoint = type("ScoredPoint", (), {})
     models_mod.UpdateResult = type("UpdateResult", (), {})
+
+    class VectorMemoryType(str):
+        DECLARATIVE = "declarative"
+        EPISODIC = "episodic"
+
+    models_mod.VectorMemoryType = VectorMemoryType
     sys.modules["cat.services.memory.models"] = models_mod
+
+    # the phase API of the core RabbitHole (phases.py subclasses it)
+    rabbit_hole = types.ModuleType("cat.rabbit_hole")
+    rabbit_hole.__path__ = []
+    sys.modules["cat.rabbit_hole"] = rabbit_hole
+    phases_mod = types.ModuleType("cat.rabbit_hole.phases")
+    phases_mod.PHASE_EMBEDDING = "embedding"
+    phases_mod.IngestionPhase = type("IngestionPhase", (), {})
+    phases_mod.IngestionSource = type("IngestionSource", (), {})
+    phases_mod.PhaseResult = type("PhaseResult", (), {})
+    sys.modules["cat.rabbit_hole.phases"] = phases_mod
 
 
 def _install_neo4j_stub():
@@ -233,7 +251,6 @@ def _make_handler(handler_mod):
         neo4j_password="p",
     )
     handler.agent_id = "agent_reload_test"
-    handler.create_derived_graph_for_source = AsyncMock()
     return handler
 
 
@@ -251,10 +268,11 @@ def _make_settings_handler(handler_mod, *, active_gen="gen_old", new_gen="gen_ne
     return handler
 
 
-def test_hook_calls_derived_graph_after_reload_order():
+def test_phases_hook_registers_after_reload_order():
     """Reproduces the loader's glob order (main BEFORE graphrag_handler) and
-    proves the lazy in-function import resolves the CURRENT class, so the hook
-    fires with a handler of that class (the FX-7 failure mode)."""
+    proves the lazy in-function import resolves the CURRENT class, so the
+    graph phases are registered for a handler of that class (the FX-7 failure
+    mode: no phase would ever be registered)."""
     importlib.import_module(f"{PKG}.main")  # binds main.GraphRAGHandler = class A
     handler_mod = importlib.import_module(f"{PKG}.graphrag_handler")
     importlib.reload(handler_mod)  # class B now lives in the module
@@ -266,22 +284,20 @@ def test_hook_calls_derived_graph_after_reload_order():
     handler = _make_handler(handler_mod)
     cat = types.SimpleNamespace(vector_memory_handler=handler)
 
-    asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
+    phases = main.rabbithole_ingestion_phases(["builtin"], cat)
+    assert [getattr(p, "id", p) for p in phases] == [
+        "builtin", "graph_spacy_extraction", "graph_llm_extraction",
+    ], phases
 
-    handler.create_derived_graph_for_source.assert_awaited_once_with(
-        "file.txt", [], cat
-    )
 
-
-def test_hook_skips_non_graphrag_handler():
-    """The isinstance gate still rejects non-GraphRAG handlers (no attribute
-    access, no call)."""
+def test_phases_hook_skips_non_graphrag_handler():
+    """The isinstance gate rejects non-GraphRAG handlers: no graph phase."""
     main = importlib.import_module(f"{PKG}.main")
 
     other = type("OtherHandler", (), {})()
     cat = types.SimpleNamespace(vector_memory_handler=other)
 
-    asyncio.run(main.after_rabbithole_stored_documents("file.txt", [], cat))
+    assert main.rabbithole_ingestion_phases(["builtin"], cat) == ["builtin"]
 
 
 def test_settings_hook_schedules_recompute_after_reload_order():
@@ -410,8 +426,8 @@ def main():
     _make_package()
 
     tests = [
-        test_hook_calls_derived_graph_after_reload_order,
-        test_hook_skips_non_graphrag_handler,
+        test_phases_hook_registers_after_reload_order,
+        test_phases_hook_skips_non_graphrag_handler,
         test_settings_hook_schedules_recompute_after_reload_order,
         test_settings_hook_skips_when_no_concept_change,
         test_settings_hook_skips_when_marker_already_active,

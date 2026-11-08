@@ -1556,10 +1556,8 @@ async def _op_graph_part_a(ccat, handler, collection: str) -> bool:
             )
             for d in src_docs
         ]
-        # Structure only: the LLM concept step is part B's.
-        await handler.create_derived_graph_for_source(
-            source, points, run_concepts=False
-        )
+        # Structure only (the LLM concept step is part B's).
+        await handler.create_derived_graph_for_source(source, points)
 
     return True
 

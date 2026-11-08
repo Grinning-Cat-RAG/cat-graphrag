@@ -556,16 +556,15 @@ if __name__ == "__main__":
         )
         disabled.agent_id = "agent_test"
 
-        with patch.object(type(disabled), "_drain_source_tasks_counted", new=AsyncMock()), \
-             patch.object(
+        with patch.object(
                  type(disabled),
-                 "get_source_points_by_collection",
-                 new=AsyncMock(return_value={"declarative": _points()}),
+                 "get_source_points",
+                 new=AsyncMock(return_value=_points()),
              ), \
              patch.object(
                  type(disabled), "_extract_concept_relations", new=AsyncMock()
              ) as extract:
-            outcome = await disabled.run_llm_extraction_phase("src-i")
+            outcome = await disabled.run_llm_extraction_phase("src-i", "declarative")
 
         assert outcome["status"] == "skipped", outcome
         assert outcome["status"] != "done", outcome
@@ -766,12 +765,12 @@ if __name__ == "__main__":
 
         with patch.object(
             type(handler),
-            "_drain_source_tasks_counted",
-            new=AsyncMock(return_value=None),
+            "purge_source_graph_artifacts",
+            new=AsyncMock(return_value=1),
         ), patch.object(
             type(handler),
-            "get_source_points_by_collection",
-            new=AsyncMock(return_value={"declarative": [point]}),
+            "get_source_points",
+            new=AsyncMock(return_value=[point]),
         ), patch.object(
             type(handler),
             "_create_similarity_relationships",
@@ -781,7 +780,7 @@ if __name__ == "__main__":
             "_extract_document_graph",
             new=AsyncMock(return_value=None),
         ):
-            outcome = await handler.run_spacy_extraction_phase("src-spacy")
+            outcome = await handler.run_spacy_extraction_phase("src-spacy", "declarative")
 
         assert outcome["status"] == "done", outcome
         assert outcome["status"] != "error", outcome
@@ -795,23 +794,26 @@ if __name__ == "__main__":
         assert "'src-spacy'" in message, message
         print("PASS (o) spaCy zero entities -> done + empty-extraction warning")
 
-    async def test_p_spacy_no_points_stays_not_ready():
-        """The "could not run" case is unchanged: no stored points -> retry."""
+    async def test_p_spacy_no_points_is_an_error():
+        """No stored points: the embedding phase stores them before the graph
+        phases run, so their absence is an error (a wait would hold the lock of
+        the source for the whole not-ready budget). Nothing is purged."""
         handler = _make_handler()
 
         with patch.object(
             type(handler),
-            "_drain_source_tasks_counted",
-            new=AsyncMock(return_value=None),
-        ), patch.object(
+            "purge_source_graph_artifacts",
+            new=AsyncMock(return_value=0),
+        ) as purge, patch.object(
             type(handler),
-            "get_source_points_by_collection",
-            new=AsyncMock(return_value={}),
+            "get_source_points",
+            new=AsyncMock(return_value=[]),
         ):
-            outcome = await handler.run_spacy_extraction_phase("src-empty")
+            outcome = await handler.run_spacy_extraction_phase("src-empty", "declarative")
 
-        assert outcome == {"status": "not_ready", "retry_after": 5}, outcome
-        print("PASS (p) spaCy no points -> not_ready (unchanged)")
+        assert outcome["status"] == "error" and "src-empty" in outcome["reason"], outcome
+        purge.assert_not_awaited()
+        print("PASS (p) spaCy no points -> error, nothing purged")
 
     async def test_q_card_binary_segments_alone_are_skipped_input():
         """(a) A source whose store order puts binary CATALOG card segments
@@ -845,17 +847,15 @@ if __name__ == "__main__":
         )
 
         with patch.object(
-            type(handler), "_drain_source_tasks_counted", new=AsyncMock()
-        ), patch.object(
             type(handler),
-            "get_source_points_by_collection",
-            new=AsyncMock(return_value={"declarative": [card, prose]}),
+            "get_source_points",
+            new=AsyncMock(return_value=[card, prose]),
         ), patch.object(
             type(handler),
             "_resolve_agent_llm",
             new=AsyncMock(return_value=object()),
         ), patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
-            outcome = await handler.run_llm_extraction_phase("src-q")
+            outcome = await handler.run_llm_extraction_phase("src-q", "declarative")
 
         assert outcome["status"] == "done", outcome
         assert outcome["processed"] == 1, outcome
@@ -889,17 +889,15 @@ if __name__ == "__main__":
         ]
 
         with patch.object(
-            type(handler), "_drain_source_tasks_counted", new=AsyncMock()
-        ), patch.object(
             type(handler),
-            "get_source_points_by_collection",
-            new=AsyncMock(return_value={"declarative": points}),
+            "get_source_points",
+            new=AsyncMock(return_value=points),
         ), patch.object(
             type(handler),
             "_resolve_agent_llm",
             new=AsyncMock(return_value=object()),
         ), patch.object(graphrag_handler, "StructuredLLM", _FakeStructuredLLM):
-            outcome = await handler.run_llm_extraction_phase("src-r")
+            outcome = await handler.run_llm_extraction_phase("src-r", "declarative")
 
         assert outcome["status"] == "done", outcome
         assert outcome["processed"] == 0, outcome
@@ -1083,7 +1081,7 @@ if __name__ == "__main__":
         await test_m_native_partial_drop_is_error_not_done()
         await test_n_timeout_is_not_ready_then_error()
         await test_o_spacy_zero_entities_is_done_with_warning()
-        await test_p_spacy_no_points_stays_not_ready()
+        await test_p_spacy_no_points_is_an_error()
         await test_q_card_binary_segments_alone_are_skipped_input()
         await test_r_only_binary_points_is_done_with_empty_warning()
         await test_s_extraction_input_is_ordered_by_start_index()

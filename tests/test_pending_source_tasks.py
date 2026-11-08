@@ -11,11 +11,17 @@ nothing and needs no prerequisites.
 Regression: ``add_point_to_tenant`` used to prune FINISHED tasks out of
 ``_pending_source_tasks`` at the end of every call. A chunk whose extraction
 finished before that prune was removed from the per-source list and its result
-was never gathered by ``drain_source_tasks`` — silently missing entities and
-relations for a random subset of chunks. This test drives three points through
-the REAL ``add_point_to_tenant`` (Neo4j session and spaCy extraction replaced by
-test doubles), lets every extraction task finish BEFORE the next prune point,
-then drains: all three results must be written in ONE batch.
+was never gathered — silently missing entities and relations for a random
+subset of chunks. These checks drive points through the REAL
+``add_point_to_tenant`` (Neo4j session and spaCy extraction replaced by test
+doubles) and the REAL spaCy phase body (``run_spacy_extraction_phase``):
+
+- every finished task contributes, in ONE batch write, after the purge;
+- a failed or cancelled chunk makes the phase re-extract every chunk;
+- a failed similarity task does not;
+- the LLM phase never consumes the spaCy batch;
+- the tasks of a source in a chat and in the knowledge base with the same name
+  are separate, and the delete/purge cleanup releases them.
 """
 
 if __name__ == "__main__":
@@ -106,18 +112,19 @@ if __name__ == "__main__":
         handler._write_source_graph = write_source_graph
         return handler
 
-    async def test_finished_before_prune_still_contributes():
-        source = "file.pdf"
-        writes = []
-        handler = _make_handler(writes)
+    class _Point:
+        def __init__(self, pid, content, source):
+            self.id = pid
+            self.vector = None
+            self.payload = {"page_content": content, "metadata": {"source": source}}
 
-        point_ids = [f"chunk-{i}" for i in range(3)]
+    async def _track_points(handler, source, point_ids, chat_id=None):
         for point_id in point_ids:
             await handler.add_point_to_tenant(
-                collection_name="declarative",
+                collection_name="declarative" if chat_id is None else "episodic",
                 content=f"content {point_id}",
                 vector=[0.1, 0.2, 0.3],
-                metadata={"source": source},
+                metadata={"source": source} | ({"chat_id": chat_id} if chat_id else {}),
                 id_point=point_id,
             )
             # Let this point's extraction finish BEFORE the next
@@ -125,99 +132,93 @@ if __name__ == "__main__":
             for _ in range(5):
                 await asyncio.sleep(0)
 
-        tracked = handler._pending_source_tasks.get(source, [])
-        # One extraction + one similarity task per point; NONE may be dropped.
-        assert len(tracked) == 6, f"finished tasks were dropped: {len(tracked)}"
-        assert all(task.done() for task in tracked), "tasks should be finished before drain"
-        assert sum(isinstance(task.result(), dict) for task in tracked) == 3
+    def _stored(handler, source, point_ids, events):
+        async def get_source_points(collection_name, src, chat_id=None):
+            return [_Point(pid, f"content {pid}", source) for pid in point_ids]
 
-        flushed = await handler.drain_source_tasks(source)
-        assert flushed is True, "drain must flush the completed batch"
-        assert len(writes) == 1, f"expected ONE batch write, got {len(writes)}"
-        entities = writes[0][0]
-        assert len(entities) == 3, f"expected 3 entities, got {len(entities)}"
-        assert {e["id"] for e in entities} == {f"entity-{p}" for p in point_ids}
+        async def purge(src, collection_name, chat_id=None):
+            events.append(("purge", src, collection_name, chat_id))
+            handler._drop_source_tasks(src, chat_id)
+            return len(point_ids)
 
-        # Idempotent: a second drain must not write again.
-        assert await handler.drain_source_tasks(source) is False
-        assert len(writes) == 1, "second drain must not duplicate the batch"
+        handler.get_source_points = get_source_points
+        handler.purge_source_graph_artifacts = purge
 
-        # Explicit delete/purge cleanup releases an abandoned source's list.
-        handler._track_source_task("deleted.pdf", asyncio.get_running_loop().create_future())
-        handler._drop_source_tasks("deleted.pdf")
-        assert "deleted.pdf" not in handler._pending_source_tasks
-
-        print("PASS test_finished_before_prune_still_contributes")
-
-    class _Point:
-        def __init__(self, pid, content, source):
-            self.id = pid
-            self.vector = None
-            self.payload = {"page_content": content, "metadata": {"source": source}}
-
-    async def _track_points(handler, source, point_ids):
-        for point_id in point_ids:
-            await handler.add_point_to_tenant(
-                collection_name="declarative",
-                content=f"content {point_id}",
-                vector=[0.1, 0.2, 0.3],
-                metadata={"source": source},
-                id_point=point_id,
-            )
-        for _ in range(5):
-            await asyncio.sleep(0)
-
-    async def test_partial_failure_is_not_a_complete_flush():
-        """A failed or cancelled chunk task must not let the phase skip the
-        re-extraction: the partial batch is written, but drain reports the
-        flush as incomplete and the spaCy phase re-extracts every chunk."""
-        source = "partial.pdf"
+    async def test_finished_before_prune_still_contributes():
+        source = "file.pdf"
         writes = []
         handler = _make_handler(writes)
-        point_ids = ["ok-0", "boom-1", "ok-2"]
-        good_extract = handler._extract_document_graph
-
-        async def flaky_extract(document_id, content, metadata):
-            if document_id.startswith("boom"):
-                raise RuntimeError("spaCy crashed")
-            return await good_extract(document_id, content, metadata)
-
-        handler._extract_document_graph = flaky_extract
+        point_ids = [f"chunk-{i}" for i in range(3)]
         await _track_points(handler, source, point_ids)
 
-        flushed = await handler.drain_source_tasks(source)
-        assert flushed is False, "a partial batch must not count as a complete flush"
-        assert len(writes) == 1 and len(writes[0][0]) == 2, f"partial batch not written: {writes}"
+        tracked = handler._pending_source_tasks.get((source, None), [])
+        # One extraction + one similarity task per point; NONE may be dropped.
+        assert len(tracked) == 6, f"finished tasks were dropped: {len(tracked)}"
+        assert all(task.done() for task in tracked), "tasks should be finished before the phase"
 
-        # Cancelled task: same rule (CancelledError is not an Exception).
-        writes.clear()
-        await _track_points(handler, "cancel.pdf", ["c-0"])
-        pending = asyncio.get_running_loop().create_future()
-        pending.cancel()
-        handler._track_source_task("cancel.pdf", pending)
-        assert await handler.drain_source_tasks("cancel.pdf") is False
-
-        # The phase re-extracts every chunk after an incomplete flush.
-        writes.clear()
-        handler._extract_document_graph = flaky_extract
-        await _track_points(handler, source, point_ids)
+        events = []
+        _stored(handler, source, point_ids, events)
         extracted = []
+        original = handler._extract_document_graph
 
-        async def counting_extract(document_id, content, metadata):
+        async def counting(document_id, content, metadata):
             extracted.append(document_id)
-            return await good_extract(document_id, content, metadata)
+            return await original(document_id, content, metadata)
 
-        handler._extract_document_graph = counting_extract
+        handler._extract_document_graph = counting
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result == {"status": "done", "processed": 3}, result
+        assert events == [("purge", source, "declarative", None)], events
+        assert len(writes) == 1, f"expected ONE batch write, got {len(writes)}"
+        assert {e["id"] for e in writes[0][0]} == {f"entity-{p}" for p in point_ids}
+        assert extracted == [], "a complete batch must not be extracted again"
+        assert (source, None) not in handler._pending_source_tasks, "the phase must consume the tasks"
 
-        async def by_collection(src):
-            return {"declarative": [_Point(pid, f"content {pid}", src) for pid in point_ids]}
+        # A re-run (no task in memory: e.g. after a restart) replaces the graph by re-extracting.
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result == {"status": "done", "processed": 3}, result
+        assert sorted(extracted) == sorted(point_ids) and len(writes) == 2
+        print("PASS test_finished_before_prune_still_contributes")
 
-        handler.get_source_points_by_collection = by_collection
-        result = await handler.run_spacy_extraction_phase(source)
-        assert result["status"] == "done", result
-        assert sorted(extracted) == sorted(point_ids), f"phase did not re-extract: {extracted}"
-        assert result["processed"] == 3, result
-        print("PASS test_partial_failure_is_not_a_complete_flush")
+    async def test_failed_or_cancelled_chunk_reextracts_every_chunk():
+        """A failed or cancelled chunk task must not let the phase skip the
+        re-extraction: the incomplete batch is dropped and every chunk is
+        extracted again, written in ONE batch."""
+        for kind in ("failed", "cancelled"):
+            source = f"{kind}.pdf"
+            writes = []
+            handler = _make_handler(writes)
+            point_ids = ["ok-0", "boom-1", "ok-2"]
+            good_extract = handler._extract_document_graph
+
+            async def flaky_extract(document_id, content, metadata, good=good_extract):
+                if document_id.startswith("boom"):
+                    raise RuntimeError("spaCy crashed")
+                return await good(document_id, content, metadata)
+
+            if kind == "failed":
+                handler._extract_document_graph = flaky_extract
+                await _track_points(handler, source, point_ids)
+                handler._extract_document_graph = good_extract
+            else:
+                await _track_points(handler, source, point_ids)
+                pending = asyncio.get_running_loop().create_future()
+                pending.cancel()
+                handler._pending_source_tasks[(source, None)].append(pending)
+
+            _stored(handler, source, point_ids, [])
+            extracted = []
+
+            async def counting(document_id, content, metadata, good=good_extract):
+                extracted.append(document_id)
+                return await good(document_id, content, metadata)
+
+            handler._extract_document_graph = counting
+            result = await handler.run_spacy_extraction_phase(source, "declarative")
+            assert result["status"] == "done", result
+            assert sorted(extracted) == sorted(point_ids), f"{kind}: phase did not re-extract: {extracted}"
+            assert len(writes) == 1 and len(writes[0][0]) == 3, f"{kind}: {writes}"
+        print("PASS test_failed_or_cancelled_chunk_reextracts_every_chunk")
 
     async def test_llm_phase_leaves_spacy_tasks_alone():
         """The LLM phase must not join/write the spaCy batch: a spaCy write
@@ -226,35 +227,14 @@ if __name__ == "__main__":
         writes = []
         handler = _make_handler(writes)
         await _track_points(handler, source, ["l-0", "l-1"])
-
-        async def by_collection(src):
-            return {"declarative": [_Point("l-0", "content l-0", src)]}
-
-        handler.get_source_points_by_collection = by_collection
-        result = await handler.run_llm_extraction_phase(source)
+        _stored(handler, source, ["l-0"], [])
+        result = await handler.run_llm_extraction_phase(source, "declarative")
         assert result["status"] == "skipped", result
         assert writes == [], f"LLM phase wrote the spaCy batch: {writes}"
-        assert handler._pending_source_tasks.get(source), "LLM phase consumed the spaCy tasks"
+        assert handler._pending_source_tasks.get((source, None)), "LLM phase consumed the spaCy tasks"
         print("PASS test_llm_phase_leaves_spacy_tasks_alone")
 
-    async def test_drain_counts_released_after_phase():
-        """Per-source drain counters are consumed by the phase, not kept for
-        the life of the process."""
-        source = "counts.pdf"
-        writes = []
-        handler = _make_handler(writes)
-        await _track_points(handler, source, ["k-0"])
-
-        async def by_collection(src):
-            return {"declarative": [_Point("k-0", "content k-0", src)]}
-
-        handler.get_source_points_by_collection = by_collection
-        result = await handler.run_spacy_extraction_phase(source)
-        assert result == {"status": "done", "processed": 1}, result
-        assert source not in getattr(handler, "_last_drain_counts", {}), "per-source drain state kept"
-        print("PASS test_drain_counts_released_after_phase")
-
-    async def test_similarity_failure_keeps_flush_complete():
+    async def test_similarity_failure_keeps_the_batch_complete():
         """A failed similarity task loses no extraction product: the batch is
         still complete and the phase must not re-run NER for every chunk."""
         source = "sim.pdf"
@@ -266,16 +246,61 @@ if __name__ == "__main__":
 
         handler._create_similarity_relationships = failing_similarity
         await _track_points(handler, source, ["s-0", "s-1"])
-        flushed = await handler.drain_source_tasks(source)
-        assert flushed is True, "a similarity failure must not mark the batch incomplete"
+        handler._create_similarity_relationships = lambda *a, **k: asyncio.sleep(0)
+        _stored(handler, source, ["s-0", "s-1"], [])
+        extracted = []
+
+        async def counting(document_id, content, metadata):
+            extracted.append(document_id)
+            return None
+
+        handler._extract_document_graph = counting
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result == {"status": "done", "processed": 2}, result
+        assert extracted == [], "a similarity failure must not mark the batch incomplete"
         assert len(writes) == 1 and len(writes[0][0]) == 2, writes
-        print("PASS test_similarity_failure_keeps_flush_complete")
+        print("PASS test_similarity_failure_keeps_the_batch_complete")
+
+    async def test_chat_and_kb_sources_with_the_same_name_are_separate():
+        writes = []
+        handler = _make_handler(writes)
+        await _track_points(handler, "same.pdf", ["kb-0"])
+        await _track_points(handler, "same.pdf", ["chat-0"], chat_id="c1")
+        assert len(handler._pending_source_tasks[("same.pdf", None)]) == 2
+        assert len(handler._pending_source_tasks[("same.pdf", "c1")]) == 2
+
+        _stored(handler, "same.pdf", ["kb-0"], [])
+        await handler.run_spacy_extraction_phase("same.pdf", "declarative")
+        assert ("same.pdf", None) not in handler._pending_source_tasks
+        assert handler._pending_source_tasks.get(("same.pdf", "c1")), "KB phase consumed the chat tasks"
+        assert {e["id"] for e in writes[0][0]} == {"entity-kb-0"}, writes
+
+        # Explicit delete/purge cleanup releases an abandoned source's list.
+        handler._drop_source_tasks("same.pdf", "c1")
+        assert ("same.pdf", "c1") not in handler._pending_source_tasks
+        print("PASS test_chat_and_kb_sources_with_the_same_name_are_separate")
+
+    async def test_tasks_without_points_are_joined_not_leaked():
+        """No stored point: the phase fails, but the tasks it took are joined
+        (nothing keeps a reference to them) and nothing is purged or written."""
+        writes = []
+        handler = _make_handler(writes)
+        await _track_points(handler, "gone.pdf", ["g-0"])
+        events = []
+        _stored(handler, "gone.pdf", [], events)
+        result = await handler.run_spacy_extraction_phase("gone.pdf", "declarative")
+        assert result["status"] == "error", result
+        assert events == [] and writes == [], (events, writes)
+        assert ("gone.pdf", None) not in handler._pending_source_tasks
+        assert not handler._pending_entity_tasks, "tasks left in the flat list"
+        print("PASS test_tasks_without_points_are_joined_not_leaked")
 
     async def main():
         await test_finished_before_prune_still_contributes()
-        await test_partial_failure_is_not_a_complete_flush()
+        await test_failed_or_cancelled_chunk_reextracts_every_chunk()
         await test_llm_phase_leaves_spacy_tasks_alone()
-        await test_drain_counts_released_after_phase()
-        await test_similarity_failure_keeps_flush_complete()
+        await test_similarity_failure_keeps_the_batch_complete()
+        await test_chat_and_kb_sources_with_the_same_name_are_separate()
+        await test_tasks_without_points_are_joined_not_leaked()
 
     asyncio.run(main())

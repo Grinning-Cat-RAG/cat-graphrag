@@ -386,13 +386,13 @@ if __name__ == "__main__":
     async def test_f_phase_purge_keeps_the_source_structure():
         """A graph-phase purge removes only what the graph phases derived. The
         ``SourceFile`` node (document structure: PART_OF/NEXT/HAS_SUMMARY) is
-        built by the EMBEDDING phase, which EffING does not re-run when it
-        recovers a graph phase, so the purge must leave it in place."""
+        built by the EMBEDDING phase, which a re-run of a graph phase does not
+        repeat, so the purge must leave it in place."""
         store = _Store()
         store.seed(docs=3, related=2, entities=2, similar=1, source="file.pdf")
         handler = _make_handler(store)
 
-        await handler.purge_source_graph_artifacts("file.pdf")
+        await handler.purge_source_graph_artifacts("file.pdf", "declarative")
 
         assert "file.pdf" in store.sourcefiles, "phase purge deleted the SourceFile"
         assert store.txns["sourcefile"] == 0, store.txns

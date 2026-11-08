@@ -283,6 +283,7 @@ class EpochMixin:
             MATCH (c:Collection)<-[:BELONGS_TO]-(d:Document)
             WHERE {where_str}
             RETURN d.id AS id, d.content AS content, d.metadata AS metadata, d.{emb} AS embedding
+            ORDER BY d.id
             SKIP $skip
             LIMIT $limit
             """

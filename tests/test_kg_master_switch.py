@@ -11,20 +11,19 @@ the import. Neo4j is mocked with a permissive in-memory fake session that
 accepts every query (the tests only care about the LLM-extraction gate, not
 about the derived-graph Cypher).
 
-What is verified (``enable_knowledge_graph`` no longer gates concept writes):
-- ``create_derived_graph_for_source`` step 8 DOES call
-  ``_extract_concept_relations`` when ``enable_knowledge_graph=False`` but
-  ``enable_concept_relations=True`` (the old gate wrote nothing);
-- the same holds on the vector-db path (no ``stray_cat``): the agent LLM is
-  resolved via ``_resolve_agent_llm`` and the extraction is called;
-- ``concept_relations=False`` writes nothing, regardless of
+What is verified (``enable_knowledge_graph`` does not gate concept writes):
+- the ``graph_llm_extraction`` phase body (``run_llm_extraction_phase``) DOES
+  call ``_extract_concept_relations`` when ``enable_knowledge_graph=False`` but
+  ``enable_concept_relations=True``, with the agent as the LLM provider;
+- ``concept_relations=False`` makes the phase ``skipped``, regardless of
   ``enable_knowledge_graph``;
 - ``recompute_concept_relations`` runs with ``enable_knowledge_graph=False`` and
   returns early only when ``enable_concept_relations=False``;
 - ``enable_student_knowledge_graph`` changes nothing in either direction;
-- points WITHOUT ``chunk_index`` (e.g. the efficient_ingestion engine) fall
-  back to arrival order, so step 8 still reaches the LLM call; the CATALOG card
-  stays excluded.
+- storing points (``add_points_to_tenant``) and building the document
+  structure never call the LLM: the LLM phase is its only owner at ingestion;
+- points WITHOUT ``chunk_index`` (written directly by a plugin) fall back to
+  arrival order for the structure; the CATALOG card stays excluded.
 """
 
 import asyncio
@@ -309,66 +308,64 @@ def _stored_points():
     ]
 
 
-def _stored_points_no_chunk_index():
-    """Points as produced by efficient_ingestion: no chunk_index in metadata."""
-    return [
-        _Point("doc1", chunk_index=None, chunk_level="section"),
-        _Point("doc2", chunk_index=None, chunk_level="paragraph"),
-    ]
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_derived_graph_calls_llm_when_kg_off_cr_on():
-    """Display flag off + CR on: step 8 MUST call _extract_concept_relations."""
+def _run_llm_phase(handler, cat=None):
+    """Run the LLM phase body over two stored points of ``file.pdf``."""
+    async def _points(collection_name, source, chat_id=None):
+        return _stored_points()
+
+    handler.get_source_points = _points
+    return asyncio.run(handler.run_llm_extraction_phase("file.pdf", "declarative", None, cat))
+
+
+def test_llm_phase_calls_llm_when_kg_off_cr_on():
+    """Display flag off + CR on: the phase MUST call _extract_concept_relations
+    with the agent as the LLM provider."""
     handler = _make_handler(kg=False, cr=True)
+    agent = object()
 
     with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
+        type(handler), "_extract_concept_relations", new=AsyncMock(return_value={"status": "done"})
     ) as extract:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points(), stray_cat=object()
-        ))
+        result = _run_llm_phase(handler, agent)
 
+    assert result == {"status": "done"}, result
     extract.assert_awaited_once()
+    assert extract.await_args.kwargs.get("stray_cat") is agent
 
 
-def test_derived_graph_calls_llm_when_kg_and_cr_on():
-    """Display flag on + CR on: step 8 MUST call _extract_concept_relations."""
+def test_llm_phase_calls_llm_when_kg_and_cr_on():
     handler = _make_handler(kg=True, cr=True)
 
     with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
+        type(handler), "_extract_concept_relations", new=AsyncMock(return_value={"status": "done"})
     ) as extract:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points(), stray_cat=object()
-        ))
+        _run_llm_phase(handler, object())
 
     extract.assert_awaited_once()
 
 
-def test_derived_graph_skips_llm_when_cr_off():
-    """CR off: no extraction, regardless of the display flag."""
+def test_llm_phase_skipped_when_cr_off():
+    """CR off: the phase is skipped, no extraction, regardless of the display flag."""
     for kg in (False, True):
         handler = _make_handler(kg=kg, cr=False)
 
         with patch.object(
             type(handler), "_extract_concept_relations", new=AsyncMock()
         ) as extract:
-            asyncio.run(handler.create_derived_graph_for_source(
-                "file.pdf", _stored_points(), stray_cat=object()
-            ))
+            result = _run_llm_phase(handler, object())
 
+        assert result["status"] == "skipped", result
         extract.assert_not_awaited()
 
 
-def test_derived_graph_calls_llm_without_chunk_index():
-    """No chunk_index (efficient_ingestion) + CR on (display flag off): the
-    arrival-order fallback must still reach step 8 and call
-    _extract_concept_relations; the CATALOG card stays excluded."""
+def test_derived_graph_without_chunk_index_excludes_the_card():
+    """No chunk_index: the arrival-order fallback builds the structure; the
+    CATALOG card is not part of it, and no LLM is involved."""
     handler = _make_handler(kg=False, cr=True)
     session = _FakeSession()
     handler._get_session = lambda: session
@@ -382,31 +379,12 @@ def test_derived_graph_calls_llm_without_chunk_index():
     with patch.object(
         type(handler), "_extract_concept_relations", new=AsyncMock()
     ) as extract:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", points, stray_cat=object()
-        ))
-
-    extract.assert_awaited_once()
-
-    # The CATALOG card must not be part of the derived graph (PART_OF links).
-    part_of_params = [params for q, params in session.queries if "PART_OF" in q]
-    assert part_of_params, "expected a PART_OF query"
-    assert "card1" not in part_of_params[0]["point_ids"]
-
-
-def test_derived_graph_skips_llm_without_chunk_index_when_cr_off():
-    """No chunk_index + CR off: the fallback must NOT call
-    _extract_concept_relations."""
-    handler = _make_handler(kg=True, cr=False)
-
-    with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
-    ) as extract:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points_no_chunk_index(), stray_cat=object()
-        ))
+        asyncio.run(handler.create_derived_graph_for_source("file.pdf", points))
 
     extract.assert_not_awaited()
+    part_of_params = [params for q, params in session.queries if "PART_OF" in q]
+    assert part_of_params, "expected a PART_OF query"
+    assert part_of_params[0]["point_ids"] == ["doc1", "doc2"], part_of_params[0]
 
 
 def test_recompute_runs_when_kg_off():
@@ -453,53 +431,10 @@ class _FakeLLM:
         self.name = name
 
 
-def test_derived_graph_calls_llm_without_stray_cat():
-    """Display flag off + CR on, NO stray_cat (a caller that owns step 8 but
-    has no cat, e.g. a recompute): step 8 must resolve the agent LLM via
-    _resolve_agent_llm and call _extract_concept_relations."""
-    handler = _make_handler(kg=False, cr=True)
-    fake_llm = _FakeLLM()
-
-    with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
-    ) as extract, patch.object(
-        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=fake_llm)
-    ) as resolve:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points()
-        ))
-
-    resolve.assert_awaited_once()
-    extract.assert_awaited_once()
-    # the resolved LLM must flow into the extraction call
-    _, kwargs = extract.await_args
-    assert kwargs.get("llm") is fake_llm
-
-
-def test_derived_graph_run_concepts_false_skips_llm():
-    """``run_concepts=False`` builds the structure graph but never resolves or
-    calls the LLM: the caller declares that another path owns step 8."""
-    handler = _make_handler(kg=False, cr=True)
-
-    with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
-    ) as extract, patch.object(
-        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
-    ) as resolve:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points(), run_concepts=False
-        ))
-
-    resolve.assert_not_awaited()
-    extract.assert_not_awaited()
-
-
 def test_add_points_to_tenant_never_runs_llm_step():
-    """``add_points_to_tenant`` is a storage call on EVERY path (classic
-    RabbitHole, EffING embedding phase, resume/revalidation sweeps): the LLM
-    step has exactly one owner per path (the classic hook, the
-    ``graph_llm_extraction`` phase, ``--graph`` part B), so a fresh handler
-    storing a real-vector batch must not call the LLM."""
+    """``add_points_to_tenant`` is a storage call (the embedding phase, a plugin
+    writing points): the LLM step has exactly one owner at ingestion (the
+    ``graph_llm_extraction`` phase), so storing a batch must not call the LLM."""
     handler = _make_handler(kg=False, cr=True)
     points = []
     for i in range(2):
@@ -516,29 +451,9 @@ def test_add_points_to_tenant_never_runs_llm_step():
     ) as resolve, patch.object(
         type(handler), "add_point_to_tenant", new=AsyncMock()
     ), patch.object(
-        type(handler), "_is_empty_vector_staging_pass", new=AsyncMock(return_value=False)
-    ), patch.object(
         _plugin("graphrag_handler"), "UpdateResult", lambda **kwargs: kwargs
     ):
         asyncio.run(handler.add_points_to_tenant("declarative", points))
-
-    resolve.assert_not_awaited()
-    extract.assert_not_awaited()
-
-
-def test_derived_graph_skips_llm_without_stray_cat_when_cr_off():
-    """CR off, NO stray_cat: step 8 must NOT resolve the LLM and must NOT call
-    _extract_concept_relations."""
-    handler = _make_handler(kg=True, cr=False)
-
-    with patch.object(
-        type(handler), "_extract_concept_relations", new=AsyncMock()
-    ) as extract, patch.object(
-        type(handler), "_resolve_agent_llm", new=AsyncMock(return_value=_FakeLLM())
-    ) as resolve:
-        asyncio.run(handler.create_derived_graph_for_source(
-            "file.pdf", _stored_points()
-        ))
 
     resolve.assert_not_awaited()
     extract.assert_not_awaited()
@@ -548,24 +463,18 @@ def test_student_flag_changes_nothing():
     """enable_student_knowledge_graph is display-only: it must not affect the
     concept-write gate in either direction."""
     for student in (False, True):
-        # CR on: extraction still runs with either student value.
         handler = _make_handler(kg=False, cr=True, student=student)
         with patch.object(
-            type(handler), "_extract_concept_relations", new=AsyncMock()
+            type(handler), "_extract_concept_relations", new=AsyncMock(return_value={"status": "done"})
         ) as extract:
-            asyncio.run(handler.create_derived_graph_for_source(
-                "file.pdf", _stored_points(), stray_cat=object()
-            ))
+            _run_llm_phase(handler, object())
         extract.assert_awaited_once()
 
-        # CR off: extraction still skipped with either student value.
         handler = _make_handler(kg=True, cr=False, student=student)
         with patch.object(
             type(handler), "_extract_concept_relations", new=AsyncMock()
         ) as extract:
-            asyncio.run(handler.create_derived_graph_for_source(
-                "file.pdf", _stored_points(), stray_cat=object()
-            ))
+            _run_llm_phase(handler, object())
         extract.assert_not_awaited()
 
 
@@ -583,16 +492,12 @@ def main():
     graphrag_handler = _plugin("graphrag_handler")  # noqa: E402
 
     tests = [
-        test_derived_graph_calls_llm_when_kg_off_cr_on,
-        test_derived_graph_calls_llm_when_kg_and_cr_on,
-        test_derived_graph_skips_llm_when_cr_off,
-        test_derived_graph_calls_llm_without_chunk_index,
-        test_derived_graph_skips_llm_without_chunk_index_when_cr_off,
+        test_llm_phase_calls_llm_when_kg_off_cr_on,
+        test_llm_phase_calls_llm_when_kg_and_cr_on,
+        test_llm_phase_skipped_when_cr_off,
+        test_derived_graph_without_chunk_index_excludes_the_card,
         test_recompute_runs_when_kg_off,
         test_recompute_returns_early_when_cr_off,
-        test_derived_graph_calls_llm_without_stray_cat,
-        test_derived_graph_skips_llm_without_stray_cat_when_cr_off,
-        test_derived_graph_run_concepts_false_skips_llm,
         test_add_points_to_tenant_never_runs_llm_step,
         test_student_flag_changes_nothing,
     ]

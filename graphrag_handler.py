@@ -107,6 +107,9 @@ def _supports_extra_body(llm: Any) -> bool:
 #: Name prefix of the background similarity tasks (see ``add_point_to_tenant``).
 _SIMILARITY_TASK_PREFIX = "graphrag-similarity:"
 
+#: Points read per query when every point of a collection is listed (``get_all_tenant_points`` without a limit).
+_PAGE_SIZE = 1000
+
 
 def _is_openrouter(llm: Any) -> bool:
     """Whether ``llm`` targets OpenRouter, the only API that knows ``reasoning``.
@@ -307,13 +310,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._graph_decay_factor=graph_decay_factor
         self._connection_pool_size=connection_pool_size
         self._enable_concept_relations = enable_concept_relations
-        # Per-source LLM-extraction attempt counter (process-local). The diary
-        # ``attempt`` is not exposed to the phase body (EffING passes only
-        # completed phases to ``ingestion_phase_run`` and the handler has no
-        # scope to read the current ``processing`` entry), so the first
-        # ``not_ready`` -> ``error`` transition is tracked here. Reset when the
-        # extraction succeeds (or terminally fails) so a later re-ingestion
-        # starts a fresh budget.
+        # Per-source LLM-extraction attempt counter (process-local). The core
+        # retries a ``not_ready`` phase within its budget without telling the
+        # phase which attempt it is, so the first ``not_ready`` -> ``error``
+        # transition is tracked here. Reset when the extraction succeeds (or
+        # terminally fails) so a later re-ingestion starts a fresh budget.
         self._concept_attempts: Dict[str, int] = {}
         self._concept_relations_prompt = concept_relations_prompt
         self._concept_definitions = parse_definitions(concept_definitions or DEFAULT_CONCEPT_DEFINITIONS)
@@ -330,10 +331,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self._driver: Optional[AsyncDriver] = None
         self._pending_entity_tasks: List[asyncio.Task] = []
         # Per-source view of the same background tasks (T22): maps a source
-        # name to the tasks spawned for its points, so the graph-building
+        # ``(name, chat_id)`` to the tasks spawned for its points, so the spaCy
         # phase can join ONLY this source's work. Tasks are also in the flat
         # ``_pending_entity_tasks`` list (close() drains both).
-        self._pending_source_tasks: Dict[str, List[asyncio.Task]] = {}
+        self._pending_source_tasks: Dict[Tuple[str, Optional[str]], List[asyncio.Task]] = {}
         # Neo4j write transactions are serialised per tenant by the tenant
         # write lock (see tenant_write_lock.py) and, on the graph path, by the
         # one-transaction-per-source writer (source_graph_writer.py). This
@@ -403,69 +404,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """Check if a vector has non-zero and finite L2-norm."""
         _l2_sq = sum(x * x for x in vector)
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
-
-    @staticmethod
-    def _is_empty_mapping(vector) -> bool:
-        """Whether the point carries EffING's ``vector={}`` empty mapping.
-
-        The staging pass writes ``vector={}`` (a truthy-type but empty
-        ``dict``), NOT a numeric zero-norm vector: ``_store_empty_vectors``
-        builds ``PointStruct(..., vector={})``. The classic core never does
-        this — ``RabbitHole.store_documents`` always writes the list returned
-        by ``embedder.embed_documents`` (a zero-norm *list* on a fallback), and
-        the multimodal image hook either embeds the image or drops it. So an
-        empty mapping can only come from the two-phase machine.
-        """
-        return isinstance(vector, dict) and not vector
-
-    async def _is_empty_vector_staging_pass(
-        self, source: Optional[str], metadata: Dict | None, vector=None
-    ) -> bool:
-        """Whether this write belongs to EffING's empty-vector staging pass.
-
-        The efficient engine stores every chunk TWICE: once in the
-        ``parsing_chunking`` phase with ``vector={}`` (``_store_empty_vectors``)
-        and again in the ``embedding`` phase with real vectors (or
-        payload-only for images). Graph extraction is vector-independent, so
-        it must run on the second pass only.
-
-        The discriminator is the CONJUNCTION of two signals:
-
-        1. the point carries the empty mapping ``vector={}`` (see
-           :meth:`_is_empty_mapping`) — written ONLY by EffING's staging pass;
-           and
-        2. the source's recorded phase is ``parsing_chunking`` — EffING sets
-           it before ``_run_parsing_phase`` (``set_phase``), and its
-           ``embedding`` pass (which may legitimately still carry ``{}`` for a
-           payload-only image) is a different phase.
-
-        The ``resume_owner`` lease is deliberately NOT used: the host never
-        clears it on a terminal status (only ``resume_created``), and the core
-        ingestion rewrites ``phase=parsing_chunking`` for EVERY ingestion, so a
-        classic re-ingest after an EffING ingest inherited
-        ``resume_owner``+``parsing_chunking`` and the graph was silently
-        skipped. The empty mapping is an intrinsic property of the write and
-        cannot fire on the classic path (always a list, zero-norm included).
-
-        Vector VALIDITY is still not the discriminator: a legitimate
-        payload-only / zero-norm vector (list) MUST build the graph.
-
-        No status doc / no empty mapping (classic path, direct writes) means
-        "not a staging pass": build the graph, exactly as before.
-        """
-        if not source or not self._is_empty_mapping(vector):
-            return False
-        try:
-            from cat.plugins.cat_efficient_ingestion import registry
-
-            chat_id = (metadata or {}).get("chat_id")
-            scope = str(chat_id) if chat_id else "agent"
-            doc = await registry.get_status(self.agent_id, scope, source)
-        except Exception:  # noqa: BLE001 - never let the discriminator break a write
-            return False
-        if not doc:
-            return False
-        return doc.get("phase") == registry.PHASE_PARSING_CHUNKING
 
     @staticmethod
     def _next_generation(gen: str) -> str:
@@ -1387,7 +1325,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector: Iterable,
         metadata: Dict = None,
         id_point: str | None = None,
-        skip_graph: bool = False,
         point_index: int | None = None,
         **kwargs,
     ) -> PointStruct | None:
@@ -1505,38 +1442,28 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     embedding=vector_list,
                 )
 
-        # Start entity extraction in the background — on every point EXCEPT the
-        # empty-vector staging pass. The efficient engine stores every chunk
-        # twice: first with EMPTY vectors (``_store_empty_vectors``, the
-        # parsing_chunking phase), then again with the real vectors after the
-        # embedding phase deletes and re-adds the points. Extraction is
-        # vector-independent, so without this gate it runs on BOTH passes and
-        # duplicates the whole NER/linking graph work per document.
-        #
-        # The gate is the PASS, not vector validity: a legitimate payload-only
-        # document (zero/empty vector, e.g. an image under a non-multimodal
-        # embedder) MUST still build the graph. ``skip_graph`` is set by
-        # ``add_points_to_tenant`` from ``_is_empty_vector_staging_pass`` (the
-        # recorded ingestion phase); a direct/classic write defaults to False.
-        if not skip_graph and self._enable_entity_extraction and self._entity_extractor:
+        # Start entity extraction in the background, whatever the vector: a
+        # payload-only document (zero/empty vector, e.g. an image under a
+        # non-multimodal embedder) still builds the graph.
+        if self._enable_entity_extraction and self._entity_extractor:
             # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
             # chunk of the source may extract in parallel. It returns the
-            # extracted batch; the source's ONE write happens in
-            # ``drain_source_tasks`` -> ``_write_source_graph`` when the batch
-            # is joined (never one concurrent write transaction per chunk).
+            # extracted batch; the source's ONE write happens in the spaCy
+            # phase (``run_spacy_extraction_phase`` -> ``_write_source_graph``)
+            # when the batch is joined (never one write transaction per chunk).
             task = asyncio.create_task(
                 self._extract_document_graph(point_id, content, metadata)
             )
             self._pending_entity_tasks.append(task)
-            self._track_source_task((metadata or {}).get("source"), task)
+            self._track_source_task(metadata, task)
 
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
         # Only when the vector is valid: a zero/non-finite vector would produce
         # meaningless (or failing) vector-similarity edges.
         if vector_valid:
             # Same detached-context rule as entity extraction above.
-            # Named so ``_drain_source_tasks_counted`` can tell a similarity
-            # failure (no extraction product lost) from an extraction failure.
+            # Named so ``_gather_source_tasks`` can tell a similarity failure
+            # (no extraction product lost) from an extraction failure.
             sim_task = asyncio.create_task(
                 detached_write_task(
                     self._create_similarity_relationships(point_id, vector_list, collection_name)
@@ -1544,15 +1471,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 name=f"{_SIMILARITY_TASK_PREFIX}{point_id}",
             )
             self._pending_entity_tasks.append(sim_task)
-            self._track_source_task((metadata or {}).get("source"), sim_task)
+            self._track_source_task(metadata, sim_task)
 
         # Clean up completed tasks in the FLAT view only (close() bookkeeping).
-        # The per-source view is deliberately NOT pruned here: ``drain_source_tasks``
+        # The per-source view is deliberately NOT pruned here: the spaCy phase
         # is what consumes those tasks and gathers their results into the single
         # per-source write, so dropping a FINISHED task at this point would
         # silently lose that chunk's entities/relations. A source's list is
-        # released when it is drained (pop), at close(), or when the source is
-        # explicitly deleted/purged (``_drop_source_tasks``).
+        # released when its phase takes it (pop), at close(), or when the source
+        # is explicitly deleted/purged (``_drop_source_tasks``).
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
 
         return PointStruct(
@@ -1566,186 +1493,104 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             vector=vector_list,
         )
 
-    # ========== GRAPH-BUILDING PHASE (T21-T23) ==========
+    # ========== GRAPH PHASES (phases.py) ==========
 
-    def _track_source_task(self, source: Optional[str], task: asyncio.Task) -> None:
-        """Record a background task under the source that spawned it.
+    @staticmethod
+    def _source_key(source: Optional[str], chat_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """The key of a source's tasks: its name and its chat (``None`` for the knowledge base). A file with the
+        same name in the knowledge base and in a chat are two sources."""
+        return source, (str(chat_id) if chat_id else None)
 
-        The same task stays in the flat ``_pending_entity_tasks`` list (so
-        ``close()`` still drains it); this dict is the per-source view the
-        graph-building phase uses to join ONLY one source's work.
+    def _track_source_task(self, metadata: Optional[Dict], task: asyncio.Task) -> None:
+        """Record a background task under the source (and chat) of the point that spawned it.
 
-        Tasks stay here until ``drain_source_tasks`` pops the list — including
-        tasks that already FINISHED. Their result is the graph payload, so it
-        must survive until the batch write, not be pruned on completion.
+        The same task stays in the flat ``_pending_entity_tasks`` list (so ``close()`` still drains it); this dict is
+        the per-source view the spaCy phase uses to join ONLY one source's work. Tasks stay here until the phase takes
+        them (pop), including the FINISHED ones: their result is the graph payload, kept until the batch write.
         """
+        source = (metadata or {}).get("source")
         if source:
-            self._pending_source_tasks.setdefault(source, []).append(task)
+            key = self._source_key(source, (metadata or {}).get("chat_id"))
+            self._pending_source_tasks.setdefault(key, []).append(task)
 
-    def _drop_source_tasks(self, source: Optional[str]) -> None:
+    def _drop_source_tasks(self, source: Optional[str], chat_id: Optional[str] = None) -> None:
         """Forget a source's tracked tasks because its graph is being deleted.
 
-        Only the explicit delete/purge paths call this: their results are
-        irrelevant once the source's artifacts are gone. The tasks themselves
-        stay in the flat list so ``close()`` still cancels the running ones;
-        completed ones are pruned there. Together with ``close()`` (whole-dict
-        clear) and ``drain_source_tasks`` (pop) this is what keeps the dict from
-        growing without bound in a long-lived process.
+        Only the explicit delete/purge paths call this: their results are irrelevant once the source's artifacts are
+        gone. The tasks themselves stay in the flat list so ``close()`` still cancels the running ones; completed ones
+        are pruned there. Together with ``close()`` (whole-dict clear) and the spaCy phase (pop) this keeps the dict
+        from growing without bound in a long-lived process.
         """
         if source:
-            self._pending_source_tasks.pop(source, None)
+            self._pending_source_tasks.pop(self._source_key(source, chat_id), None)
 
-    def has_pending_source_tasks(self, source: str) -> bool:
-        """Whether any LIVE background task remains for a source.
+    async def _gather_source_tasks(self, source: str, tasks: List[asyncio.Task]) -> Optional[Dict[str, List[Dict]]]:
+        """Join one source's background tasks and accumulate their extraction batch.
 
-        Done tasks are ignored: the completion gate (T23) must not fail on
-        work that already finished.
+        Returns ``{"entities", "mentions", "relations"}`` when every EXTRACTION task succeeded, ``None`` otherwise (a
+        failed or cancelled chunk would be missing: the caller re-extracts the source). A failed similarity task loses
+        no extraction product: the phase recreates the similarity edges anyway. Failures are logged.
         """
-        tasks = self._pending_source_tasks.get(source) or []
-        return any(not t.done() for t in tasks)
-
-    async def drain_source_tasks(self, source: str) -> bool:
-        """Join one source's background extraction and write it ONCE.
-
-        Extraction tasks are lock-free and run in parallel; their results are
-        accumulated here and flushed through ``_write_source_graph`` in ONE
-        transaction per source. Similarity tasks (which do write) are joined in
-        the same gather; their result is ignored and their failure is only
-        logged (the spaCy phase re-runs similarity anyway).
-
-        Returns ``True`` only when the COMPLETE batch was written, so the phase
-        can skip a redundant re-extraction. When any EXTRACTION task failed or
-        was cancelled, the partial batch is still written (best effort for the
-        classic path) but ``False`` is returned, so the deterministic phase
-        re-extracts every chunk awaited. Task failures are logged; an error of
-        the graph write itself propagates to the caller.
-        """
-        return await self._drain_source_tasks_counted(source) is not None
-
-    async def _drain_source_tasks_counted(
-        self, source: str
-    ) -> Optional[Tuple[int, int]]:
-        """``drain_source_tasks`` returning ``(entities, relations)`` written.
-
-        ``None`` means "no complete batch was written" (same cases where the
-        public method returns ``False``). The spaCy phase uses the counts as its
-        ``processed`` telemetry; no per-source state is kept on the handler.
-        """
-        tasks = self._pending_source_tasks.pop(source, [])
-        if not tasks:
-            return None
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        entities: List[Dict] = []
-        mentions: List[Dict] = []
-        relations: List[Dict] = []
-        failed = 0
+        batch: Dict[str, List[Dict]] = {"entities": [], "mentions": [], "relations": []}
+        complete = True
         for task, r in zip(tasks, results):
             # BaseException: a cancelled task yields CancelledError, which is
             # not an Exception but still loses that chunk's result.
             if isinstance(r, BaseException):
                 log.error(f"[GraphRAG] Background task for source '{source}' failed: {r!r}")
                 get_name = getattr(task, "get_name", None)
-                is_similarity = callable(get_name) and str(get_name()).startswith(
-                    _SIMILARITY_TASK_PREFIX
-                )
+                is_similarity = callable(get_name) and str(get_name()).startswith(_SIMILARITY_TASK_PREFIX)
                 if not is_similarity:
-                    failed += 1
+                    complete = False
             elif isinstance(r, dict) and "entities" in r:
-                entities.extend(r.get("entities") or [])
-                mentions.extend(r.get("mentions") or [])
-                relations.extend(r.get("relations") or [])
+                for key in batch:
+                    batch[key].extend(r.get(key) or [])
+        return batch if complete else None
 
-        if not entities and not relations:
-            return None
+    async def get_source_points(
+        self, collection_name: str, source: str, chat_id: Optional[str] = None
+    ) -> List[Record]:
+        """Every stored point of ONE source (with its vector): in ``collection_name``, of the chat ``chat_id`` when
+        given."""
+        metadata = {"source": source} | ({"chat_id": chat_id} if chat_id else {})
+        points, _ = await self.get_all_tenant_points(collection_name, metadata=metadata, with_vectors=True)
+        return points
 
-        await self._write_source_graph(
-            entities,
-            mentions,
-            relations,
-            operation=f"write source graph for '{source}'",
-        )
-        if failed:
-            return None
-        return len(entities), len(relations)
+    async def run_spacy_extraction_phase(
+        self, source: str, collection_name: str, chat_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The ``graph_spacy_extraction`` phase of one source: its NER + link + similarity graph, REPLACED.
 
-    async def get_source_points_by_collection(self, source: str) -> Dict[str, List[Record]]:
-        """Fetch all stored points of one source, grouped by collection.
+        1. takes the source's background extraction tasks (started by ``add_point_to_tenant`` while the embedding
+           phase stored the points);
+        2. purges the graph the source contributed before (``purge_source_graph_artifacts``): the phase replaces its
+           product, never adds to it (new content, changed spaCy models, a resume after a crash);
+        3. joins the tasks; when they are missing (a resume: they lived in another process) or incomplete (a chunk
+           failed), extracts every stored chunk CONCURRENTLY (spaCy is CPU-bound, no Neo4j locks);
+        4. writes the source's graph in ONE transaction (sequential batches above the guard) and recreates the
+           similarity edges of the points with a valid vector.
 
-        The metadata filter matches the exact JSON fragment the store writes
-        (``"source": "<name>"``), so only points of THIS source are returned.
-        Ensures the versioned generation is resolved first so the embedding
-        property read targets the current generation.
+        Returns ``done`` (with ``processed`` = entities + relations, or an ``empty-extraction`` warning when the
+        content has no entities) or ``error`` when the source has no stored point (the embedding phase stores them
+        before this phase runs). Exceptions propagate: the core records the phase as ``error``. The purge also
+        removes the concepts of the source: the LLM phase depends on this one and runs again after it.
         """
-        await self._ensure_connected()
-        if self._generation is None:
-            gen = await self._read_generation()
-            self._rebuild_for_generation(gen)
-        result: Dict[str, List[Record]] = {}
-        for collection_name in await self.get_collection_names():
-            points, _ = await self.get_all_tenant_points(
-                collection_name, metadata={"source": source}, with_vectors=True
-            )
-            if points:
-                result[collection_name] = points
-        return result
+        tasks = self._pending_source_tasks.pop(self._source_key(source, chat_id), [])
+        points = await self.get_source_points(collection_name, source, chat_id)
+        if not points:
+            if tasks:
+                await self._gather_source_tasks(source, tasks)  # nothing to attach their product to
+            return {"status": "error", "reason": f"no stored points for source '{source}'"}
 
-    async def run_spacy_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
-        """Deterministic, awaited spaCy graph phase for one source (T5).
+        await self.purge_source_graph_artifacts(source, collection_name, chat_id)
+        batch = await self._gather_source_tasks(source, tasks) if tasks else None
 
-        The NER + link + similarity work the old ``after_rabbithole_stored_documents``
-        hook fired-and-forgot, but inline and awaited:
-
-        1. joins the source's background NER/similarity tasks
-           (``_drain_source_tasks_counted``), which flushes the accumulated
-           extraction in ONE graph transaction (or sequential batches above
-           the guard);
-        2. when no complete background batch was available (e.g. a phase
-           retry after a restart, or a failed/cancelled chunk task), extracts
-           every stored chunk CONCURRENTLY (spaCy is
-           CPU-bound, no Neo4j locks) and writes the source's graph in ONE
-           transaction — never one concurrent transaction per chunk;
-        3. re-runs ``_create_similarity_relationships`` for the source's
-           stored points with valid vectors (needs valid vectors — that is
-           why the embedding phase must precede).
-
-        Returns ``{"status": "done"}`` on success and
-        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
-        points are not yet in the store. A phase that RAN and produced ZERO
-        entities is ``done`` with an ``empty-extraction`` warning (the content
-        simply has no entities); its ``processed`` count is 0. Exceptions
-        propagate (the core maps raise -> status=error, fail-hard). All writes
-        are idempotent MERGEs, so re-running after a retry never duplicates
-        data.
-        """
-        drained = await self._drain_source_tasks_counted(source)
-
-        by_collection = await self.get_source_points_by_collection(source)
-        if not by_collection:
-            return {"status": "not_ready", "retry_after": 5}
-
-        all_points: List[Record] = []
-        for collection_name, points in by_collection.items():
-            all_points.extend(points)
-            for p in points:
-                vector = getattr(p, "vector", None)
-                if vector and self._is_valid_vector(vector):
-                    await self._create_similarity_relationships(p.id, vector, collection_name)
-
-        # NER + link. When the background batch already produced the write,
-        # skip the redundant re-extraction. Otherwise extract every chunk
-        # CONCURRENTLY and write the source graph in ONE transaction.
-        processed: Optional[int] = None
-        if drained is not None:
-            entity_count, relation_count = drained
-            processed = entity_count + relation_count
-        elif self._enable_entity_extraction and self._entity_extractor:
-            content_points = [
-                p
-                for p in all_points
-                if (getattr(p, "payload", None) or {}).get("page_content", "")
-            ]
+        extracting = bool(self._enable_entity_extraction and self._entity_extractor)
+        content_points = [p for p in points if (getattr(p, "payload", None) or {}).get("page_content", "")]
+        if batch is None and extracting:
+            await self._ensure_current_embedder()
             extractions = await asyncio.gather(
                 *(
                     self._extract_document_graph(
@@ -1756,109 +1601,79 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     for p in content_points
                 )
             )
-            entities: List[Dict] = []
-            mentions: List[Dict] = []
-            relations: List[Dict] = []
+            batch = {"entities": [], "mentions": [], "relations": []}
             for extracted in extractions:
-                if not extracted:
-                    continue
-                entities.extend(extracted["entities"])
-                mentions.extend(extracted["mentions"])
-                relations.extend(extracted["relations"])
-            processed = len(entities) + len(relations)
-            if entities or relations:
-                await self._write_source_graph(
-                    entities,
-                    mentions,
-                    relations,
-                    operation=f"write source graph for '{source}'",
-                )
-            else:
-                # The phase RAN correctly (spaCy executed) and found nothing:
-                # a content property, not a failure. ``done`` + warning keeps
-                # the phase complete (no retry, dependents not blocked).
-                char_count = sum(
-                    len((getattr(p, "payload", None) or {}).get("page_content", ""))
-                    for p in content_points
-                )
-                log.warning(
-                    f"[GraphRAG] spaCy extraction found no entities in "
-                    f"{char_count} chars of {len(content_points)} chunks for "
-                    f"'{source}'"
-                )
-                return {
-                    "status": "done",
-                    "warnings": [
-                        {
-                            "code": "empty-extraction",
-                            "message": (
-                                f"no entities found in {char_count} chars of "
-                                f"{len(content_points)} chunks for '{source}'"
-                            ),
-                        }
-                    ],
-                    "processed": 0,
-                }
+                if extracted:
+                    for key in batch:
+                        batch[key].extend(extracted.get(key) or [])
+        batch = batch or {"entities": [], "mentions": [], "relations": []}
 
-        if processed is None:
-            return {"status": "done"}
+        if batch["entities"] or batch["relations"]:
+            await self._write_source_graph(
+                batch["entities"], batch["mentions"], batch["relations"],
+                operation=f"write source graph for '{source}'",
+            )
+
+        for p in points:
+            vector = getattr(p, "vector", None)
+            if vector and self._is_valid_vector(vector):
+                await self._create_similarity_relationships(p.id, vector, collection_name)
+
+        processed = len(batch["entities"]) + len(batch["relations"])
+        if extracting and processed == 0:
+            # The phase RAN correctly and found nothing: a content property,
+            # not a failure (``done`` + warning: no retry, dependents run).
+            char_count = sum(len((p.payload or {}).get("page_content", "")) for p in content_points)
+            message = f"no entities found in {char_count} chars of {len(content_points)} chunks for '{source}'"
+            log.warning(f"[GraphRAG] spaCy extraction {message}")
+            return {"status": "done", "warnings": [{"code": "empty-extraction", "message": message}], "processed": 0}
         return {"status": "done", "processed": processed}
 
-    async def run_llm_extraction_phase(self, source: str, cat=None) -> Dict[str, Any]:
-        """Deterministic, awaited LLM graph phase for one source (T5).
+    async def run_llm_extraction_phase(
+        self, source: str, collection_name: str, chat_id: Optional[str] = None, cat=None
+    ) -> Dict[str, Any]:
+        """The ``graph_llm_extraction`` phase of one source: the LLM concept-relations step over its stored points.
 
-        Runs ONLY the LLM concept-relations step (``_extract_concept_relations``)
-        for the source's stored points, gated on ``_enable_concept_relations``.
-        ``enable_knowledge_graph`` is display-only (UI) and does not gate.
-        Independent from the spaCy phase:
-        it consumes ONLY the stored chunks + LLM + definitions/prompt, NOT the
-        spaCy entities, so it can run in any order relative to
-        ``run_spacy_extraction_phase``.
+        Gated on ``_enable_concept_relations`` (``enable_knowledge_graph`` is display-only): with it off the phase
+        is ``skipped``. Runs after the spaCy phase, whose purge removed the source's previous concepts, so its
+        idempotent MERGEs rebuild them. ``cat`` (the agent) provides the LLM.
 
-        Returns ``{"status": "done"}`` on success and
-        ``{"status": "not_ready", "retry_after": <s>}`` when the source's
-        points are not yet in the store OR the LLM outcome is transient
-        (timeout / 429 / 5xx / dropped connection / first empty response).
-        A permanent LLM failure (no LLM configured, repeated empty/unparsable
-        output, partial extraction) returns ``{"status": "error", "reason"}``
-        so the phase is recorded as ``error``, never as a silent ``done``.
-        With ``enable_concept_relations`` off the phase produces no product by
-        definition, so it reports ``{"status": "skipped", "reason"}``; the
-        toggle is part of ``_concept_fingerprint``, so enabling it later
-        re-runs the phase.
-        All writes are idempotent MERGEs, so re-running after a retry never
-        duplicates data.
-
-        It never joins the source's background spaCy tasks: that batch belongs
-        to ``run_spacy_extraction_phase``, and writing it here would record a
-        spaCy write failure as an LLM-phase error.
+        Returns ``done``, ``not_ready`` for a transient LLM outcome (timeout / 429 / 5xx / dropped connection / first
+        empty response: the core retries it within the phase budget), ``error`` for a permanent one (no LLM,
+        repeated empty/unparsable output, partial extraction) and when the source has no stored point.
         """
-        by_collection = await self.get_source_points_by_collection(source)
-        if not by_collection:
-            return {"status": "not_ready", "retry_after": 5}
-
-        all_points: List[Record] = []
-        for collection_name, points in by_collection.items():
-            all_points.extend(points)
-
+        points = await self.get_source_points(collection_name, source, chat_id)
+        if not points:
+            return {"status": "error", "reason": f"no stored points for source '{source}'"}
         if not self._enable_concept_relations:
-            # The feature is off: no product exists to produce, so the phase is
-            # inapplicable (``skipped``), not a silent success.
-            return {
-                "status": "skipped",
-                "reason": "concept-relations extraction disabled",
-            }
+            return {"status": "skipped", "reason": "concept-relations extraction disabled"}
 
-        outcome = await self._extract_concept_relations(
-            source, all_points, stray_cat=cat
-        )
-        if isinstance(outcome, dict):
-            # Pass the body's result through unchanged: ``done`` (with its
-            # real ``processed`` count and any ``empty-extraction`` warning),
-            # ``not_ready``, ``error`` or ``skipped``.
-            return outcome
+        outcome = await self._extract_concept_relations(source, points, stray_cat=cat)
+        return outcome if isinstance(outcome, dict) else {"status": "done"}
 
-        return {"status": "done"}
+    def spacy_phase_settings(self) -> Dict[str, Any]:
+        """The material settings of the spaCy phase (its tag): the models and the two extraction toggles.
+
+        The concept-relations toggle is here too: the spaCy phase owns the purge of the source's graph, concepts
+        included, so turning the concepts off must re-run it (the LLM phase after it is then ``skipped`` and writes
+        nothing), otherwise the concepts extracted before would stay. The technology patterns are left out: saving
+        them refreshes the technology entities of every document (``refresh_technology_entities``), so a re-run of
+        the phase would repeat that work, and the LLM phase after it.
+        """
+        return {
+            "spacy_models": dict(sorted((self._spacy_models or {}).items())),
+            "entity_extraction": bool(self._enable_entity_extraction),
+            "concept_relations": bool(self._enable_concept_relations),
+        }
+
+    def concept_phase_settings(self) -> Dict[str, Any]:
+        """The material settings of the LLM phase (its tag): the concept-relations toggle.
+
+        The definitions and the prompt are left out: saving them recomputes the concepts of every source and switches
+        their generation atomically (``_concept_recompute_job`` in main.py); a re-run of the phase per source would
+        repeat that LLM work.
+        """
+        return {"concept_relations": bool(self._enable_concept_relations)}
 
     async def _extract_and_link_entities(
         self,
@@ -1868,10 +1683,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     ) -> None:
         """Extract ONE document and write it in ONE transaction.
 
-        Kept for the single-document / classic call path. Batch ingestion
-        accumulates every chunk of a source first (see ``drain_source_tasks``
-        and ``run_spacy_extraction_phase``) and calls ``_write_source_graph``
-        ONCE per source instead of once per chunk.
+        Kept for the single-document path (the maintenance graph walk).
+        Ingestion accumulates every chunk of a source first (see
+        ``run_spacy_extraction_phase``) and calls ``_write_source_graph`` ONCE
+        per source instead of once per chunk.
         """
         extracted = await self._extract_document_graph(
             document_id, content, metadata
@@ -2677,64 +2492,62 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         operation_id = random.randint(1, 100000)
 
-        # Discriminate the EMPTY-VECTOR STAGING PASS, not vector validity.
-        # The staging pass (``parsing_chunking``) writes every point with the
-        # empty mapping ``vector={}`` and must not build any graph; the
-        # ``embedding`` pass writes the same points with real vectors OR
-        # payload-only and owns the graph. The phase read is cached per source
-        # (one registry read per unique source/chat scope, not per point); the
-        # empty-mapping signal is per point and cannot appear on the classic
-        # path (see ``_is_empty_mapping``), so a stale ``resume_owner`` lease
-        # can never turn a classic re-ingest into a false staging pass.
-        staging_cache: Dict[tuple, bool] = {}
-        staging_flags: List[bool] = []
-        for point in points:
-            meta = (point.payload or {}).get("metadata", {}) or {}
-            key = (meta.get("source"), meta.get("chat_id"), self._is_empty_mapping(point.vector))
-            if key not in staging_cache:
-                staging_cache[key] = await self._is_empty_vector_staging_pass(
-                    meta.get("source"), meta, point.vector
-                )
-            staging_flags.append(staging_cache[key])
+        if points:
+            await self._ensure_current_embedder()
 
-        for index, (point, is_staging) in enumerate(zip(points, staging_flags)):
+        for index, point in enumerate(points):
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
                 point.payload.get("metadata", {}),  # type: ignore[arg-type]
                 str(point.id),
-                skip_graph=is_staging,
                 point_index=index,
             )
 
-        # Derived structure graph (SourceFile / NEXT / Section / ...) follows
-        # the SAME pass discriminator: skipped only when the whole batch is the
-        # empty-vector staging pass. The LLM concept step is NOT run here.
-        batch_is_staging = bool(points) and all(staging_flags)
-        if not batch_is_staging:
-            sources: Dict[str, List[PointStruct]] = {}
-            for p in points:
-                meta = (p.payload or {}).get("metadata", {}) or {}
-                src = meta.get("source")
-                if src:
-                    sources.setdefault(src, []).append(p)
-            for source, src_points in sources.items():
-                # Structure only: the LLM step has one owner per path (classic
-                # hook / EffING phase / --graph part B); running it here too
-                # called the LLM twice per source on every engine.
-                await self.create_derived_graph_for_source(
-                    source, src_points, run_concepts=False
-                )
+        # Derived structure graph (SourceFile / NEXT / Section / ...). The
+        # entity and concept graph is built by the graph phases (phases.py).
+        sources: Dict[str, List[PointStruct]] = {}
+        for p in points:
+            meta = (p.payload or {}).get("metadata", {}) or {}
+            src = meta.get("source")
+            if src:
+                sources.setdefault(src, []).append(p)
+        for source, src_points in sources.items():
+            await self.create_derived_graph_for_source(source, src_points)
 
         return UpdateResult(status="completed", operation_id=operation_id)
+
+    async def _system_embedder(self) -> Optional[Embeddings]:
+        """The embedder of the system (embedders are system-level), or None when it cannot be resolved."""
+        try:
+            from cat.looking_glass.bill_the_lizard import BillTheLizard
+
+            return await BillTheLizard().embedder()
+        except Exception as e:  # noqa: BLE001 - keep the injected one
+            log.warning(f"[GraphRAG] Could not resolve the system embedder: {e}")
+            return None
+
+    async def _refresh_system_embedder(self) -> None:
+        """Adopt the current system embedder; keep the injected one when it cannot be resolved."""
+        embedder = await self._system_embedder()
+        if embedder is not None:
+            self._embedder = embedder
+
+    async def _ensure_current_embedder(self) -> None:
+        """Before any entity extraction: the entities are embedded with ``self._embedder``, which must be the CURRENT
+        system embedder. No hook injects it outside the parsing and the recall, while both extraction paths run
+        without them: the ``embedding`` phase (an embedder change, a resume) and a spaCy phase re-run on a fresh
+        handler (a settings change, a resume). A no-op when the entities are not embedded."""
+        if self._enable_entity_extraction and self._enable_entity_embeddings:
+            await self._refresh_system_embedder()
 
     @tenant_write_locked("delete tenant points")
     async def delete_tenant_points(self, collection_name: str, metadata: Dict | None = None) -> UpdateResult:
         await self._ensure_connected()
         # The source is being deleted: any pending extraction result for it is
         # irrelevant (the chunks and their artifacts are going away).
-        self._drop_source_tasks((metadata or {}).get("source"))
+        self._drop_source_tasks((metadata or {}).get("source"), (metadata or {}).get("chat_id"))
 
         operation_id = random.randint(1, 100000)
 
@@ -2911,13 +2724,18 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return UpdateResult(status="completed", operation_id=operation_id)
 
     @tenant_write_locked("purge source graph artifacts")
-    async def purge_source_graph_artifacts(self, source: str) -> int:
+    async def purge_source_graph_artifacts(
+        self, source: str, collection_name: str, chat_id: Optional[str] = None
+    ) -> int:
         """Delete the graph artifacts ONE source contributed to this tenant.
 
-        Source-scoped phase purge used by the EffING ``ingestion_phase_purge``
-        hook before an abandoned graph phase is re-run. It removes ONLY what
-        the graph phases derived from ``source`` and leaves:
-          - the chunk Documents themselves (owned by parsing/embedding),
+        The source is ``source`` in ``collection_name`` (the knowledge base, or
+        the episodic memory of the chat ``chat_id``): a file with the same name
+        in the knowledge base and in a chat are two sources. Used by the spaCy
+        phase before it writes the source's graph again (the phase replaces its
+        product) and by the deletion of the graph phases. It removes ONLY what
+        the graph phases derived from the source's Documents and leaves:
+          - the chunk Documents themselves (owned by the embedding phase),
           - entities/relations still referenced by OTHER sources,
           - every other tenant's data.
 
@@ -2928,7 +2746,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
              never candidates);
           2. delete SIMILAR_TO_* edges touching this source's Documents;
           3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
-             that existed only because of it;
+             that existed only because of it. ``source_files`` records names
+             only, so this step is shared by the sources with the same name.
 
         The source's SourceFile node (document structure, built during the
         embedding phase) is kept: it is removed with the source's points.
@@ -2939,9 +2758,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         await self._ensure_connected()
         # The source's artifacts are being purged: drop its pending tasks so a
         # late finished result cannot resurrect the graph that was just removed.
-        self._drop_source_tasks(source)
+        self._drop_source_tasks(source, chat_id)
         tenant_id = self.agent_id
-        meta_fragment = f'"source": {json.dumps(source)}'
+        scope = {
+            "tenant_id": tenant_id,
+            "collection_name": collection_name,
+            "meta": f'"source": {json.dumps(source)}',
+            "chat_meta": f'"chat_id": {json.dumps(chat_id)}' if chat_id else None,
+        }
         async with self._get_session() as session:
             # Resolve the source's Document ids FIRST (read only), then drive
             # every delete below from bounded sequential batches. A single
@@ -2949,12 +2773,13 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # see batched_delete.DELETE_BATCH_MAX_ITEMS.
             result = await session.run(
                 """
-                MATCH (d:Document {tenant_id: $tenant_id})
-                WHERE d.metadata CONTAINS $meta
+                MATCH (c:Collection {name: $collection_name, tenant_id: $tenant_id})<-[:BELONGS_TO]-(d:Document)
+                WHERE d.tenant_id = $tenant_id
+                  AND d.metadata CONTAINS $meta
+                  AND ($chat_meta IS NULL OR d.metadata CONTAINS $chat_meta)
                 RETURN d.id AS id
                 """,
-                tenant_id=tenant_id,
-                meta=meta_fragment,
+                **scope,
             )
             document_ids = [
                 record["id"] async for record in result if record["id"] is not None
@@ -3072,9 +2897,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
             await delete_in_batches(related_ids, _strip_related)
             # The SourceFile node (document structure) is NOT a graph-phase
-            # product: the embedding phase builds it, and EffING does not
-            # re-run embedding when it recovers a graph phase. It goes away
-            # with the source's points (both point deletes prune orphan SourceFiles).
+            # product: the embedding phase builds it, and a re-run of a graph
+            # phase does not re-run the embedding. It goes away with the
+            # source's points (both point deletes prune orphan SourceFiles).
         log.info(
             f"[GraphRAG] Purged graph artifacts for source '{source}' "
             f"({doc_count} document(s), tenant {tenant_id})"
@@ -3615,10 +3440,29 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         metadata: Dict | None = None,
         with_vectors: bool = True,
     ) -> Tuple[List[Record], int | str | None]:
+        """The points of ``collection_name`` (filtered by ``metadata``), ordered by id.
+
+        Core contract: ``limit=None`` returns EVERY point (read here page by
+        page) and no next offset; with a limit, one page from ``offset`` and
+        the offset of the next page (None at the end). The core relies on it:
+        its embedding phase replaces the points of a source, and the
+        vector-memory transfer copies a whole collection.
+        """
+        if limit is None:
+            every: List[Record] = []
+            next_offset: int | str | None = offset
+            while True:
+                page, next_offset = await self.get_all_tenant_points(
+                    collection_name, _PAGE_SIZE, next_offset, metadata, with_vectors
+                )
+                every.extend(page)
+                if next_offset is None:
+                    return every, None
+
         await self._ensure_connected()
 
         skip = int(offset) if offset and offset.isdigit() else 0
-        query_limit = limit or 1000
+        query_limit = limit
 
         where_clauses = ["d.tenant_id = $tenant_id", "c.name = $collection_name"]
         params: Dict = {
@@ -3818,16 +3662,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self,
         source: str,
         stored_points: List[PointStruct],
-        stray_cat=None,
-        run_concepts: bool = True,
     ) -> None:
         """
-        Create derived graph nodes and relations after all documents for a
-        source have been ingested.
-
-        ``run_concepts=False`` builds the structure only (steps 1-7) and skips
-        the LLM concept step 8: the caller declares that another path owns it
-        (``add_points_to_tenant`` on every engine, ``--graph`` part A3).
+        Create the document-structure graph of a source from its stored points.
+        The entity and concept graph is built by the graph phases (phases.py).
 
         Handles chunkers with different metadata profiles gracefully — only
         creates structure that the available metadata supports.
@@ -3872,11 +3710,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 })
 
         if not regular_points:
-            # Fallback: some ingestion engines (e.g. efficient_ingestion) do not
-            # set chunk_index on point metadata.  Derive chunk order from the
-            # arrival order of the points instead, so the derived graph (and the
-            # LLM concept/relation extraction in step 8) still runs.  The CATALOG
-            # card stays excluded.
+            # Fallback: points written without chunk_index (e.g. by a plugin
+            # calling the vector handler directly). Derive chunk order from the
+            # arrival order of the points instead, so the derived graph still
+            # runs. The CATALOG card stays excluded.
             for p in stored_points:
                 meta = (p.payload or {}).get("metadata", {}) or {}
                 if meta.get("is_catalogue_card"):
@@ -4019,45 +3856,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             f"card={'yes' if catalogue_id else 'no'}"
         )
 
-        # 8 — LLM-based concept relation extraction (gated on
-        # enable_concept_relations; enable_knowledge_graph is display-only).
-        # ONE owner per path: the classic ``after_rabbithole_stored_documents``
-        # hook, the EffING ``graph_llm_extraction`` phase, ``--graph`` part B.
-        # Storage-only callers pass run_concepts=False. Without a stray_cat the
-        # agent LLM is resolved from the saved agent config.
-        if run_concepts and self._enable_concept_relations:
-            try:
-                if stray_cat is not None:
-                    outcome = await self._extract_concept_relations(
-                        source, stored_points, stray_cat
-                    )
-                else:
-                    # No stray_cat: resolve the agent LLM explicitly so a
-                    # missing LLM is a configuration ERROR, never a silent no-op.
-                    llm = await self._resolve_agent_llm()
-                    if llm is not None:
-                        outcome = await self._extract_concept_relations(
-                            source, stored_points, llm=llm
-                        )
-                    else:
-                        outcome = {
-                            "status": "error",
-                            "reason": "no LLM configured for graph concept extraction",
-                        }
-                if isinstance(outcome, dict) and outcome.get("status") != "done":
-                    log.error(
-                        f"[GraphRAG] Concept relation extraction for '{source}' "
-                        f"did not complete: status={outcome.get('status')} "
-                        f"reason={outcome.get('reason')}"
-                    )
-            except Exception as e:
-                log.error(f"[GraphRAG] Concept relation extraction failed: {e}")
-
     async def _resolve_agent_llm(self) -> Optional[Any]:
         """Resolve the agent's configured LLM without a ``StrayCat`` reference.
 
         Used when the LLM concept step runs without a ``stray_cat`` (e.g. the
-        concept recompute and the EffING phase body). The LLM
+        concept recompute). The LLM
         is resolved through the official ``ServiceProvider`` against the agent's
         saved ``llm`` config — the same mechanism ``CheshireCat.create`` uses — so
         any configured LLM class works (not just the probe's OpenRouterLLM).
@@ -4821,30 +4624,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return {"concepts": concepts, "relations": relations}
 
     # ── Concept-generation lifecycle (todos 8-13, concurrency/atomicity) ─────
-
-    def _spacy_fingerprint(self) -> str:
-        """Stable SHA-256 fingerprint of the effective spaCy extraction config.
-
-        Normalizes the model map (``sort_keys=True``) and the whitespace-
-        stripped technology terminology (``extra_technology_patterns``), so
-        cosmetic edits (line order, indentation, trailing whitespace) do NOT
-        produce a spurious generation change — mirroring
-        ``_concept_fingerprint``. ``enable_entity_extraction`` is included
-        because it gates the per-point extraction (turning it off leaves no
-        spaCy entities at all), so it is material for the phase. The resulting
-        token is the material marker for the ``graph_spacy_extraction`` phase.
-        """
-        payload = (
-            "MODELS:" + json.dumps(self._spacy_models, sort_keys=True)
-            + "|PATTERNS:"
-            + json.dumps(
-                [p.strip() for p in (self._extra_technology_patterns or [])],
-                sort_keys=True,
-            )
-            + "|ENTITY_EXTRACTION:"
-            + json.dumps(bool(self._enable_entity_extraction))
-        )
-        return hashlib.sha256(payload.encode()).hexdigest()
 
     async def _resolve_agent_llm_identity(self) -> str:
         """Stable, secret-free identifier of the agent's configured LLM.
