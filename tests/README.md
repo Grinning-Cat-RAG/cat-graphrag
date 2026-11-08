@@ -36,9 +36,6 @@ Requirements per script:
   `SKIP live execution` and the static audit is the fallback;
 - `test_backfill_duplicates.py` — a CLI that needs a live Neo4j: pass
   `--password` (plus `--uri`/`--user`/`--tenant` as needed);
-- `test_maintenance_lizard_bootstrap.py` — needs the plugin DEPLOYED as
-  `cat.plugins.cat_graphrag`, i.e. run it inside the Cat container with the
-  plugin installed, not from a bare host checkout;
 - `test_derived_graph_unconditional.py`, `test_phase_fingerprint.py` — load the
   REAL `cat` package: run them from `grinning-cat-core` with the plugin's
   dependencies (`neo4j`, `spacy`, `langdetect`) installed;
@@ -46,27 +43,21 @@ Requirements per script:
   a Redis Stack on `localhost:6379`; the stateful one also needs `hypothesis`
   and accepts `--examples N` and `--mutate llm-dependency|no-purge` (a wrong
   rule injected on purpose: the run must then report the mutation as caught);
+- `test_ingestion_lane.py` — the REAL core and Redis: the heavy steps of an
+  ingestion run on the core's ingestion lane (a one-worker lane), a chat
+  message's analysis stays off it;
+- `test_maintenance_cli.py`, `test_maintenance_cli_stateful.py` — the
+  maintenance CLI on the REAL core RabbitHole (`reingest_source` /
+  `rerun_source`, rows, locks, phase engine, automatic resume) and a Redis
+  Stack on `localhost:6379`; the stateful one also needs `hypothesis` and
+  accepts `--examples N` and `--mutate no-reset|no-legacy`;
 - `test_graph_purge_live.py` — the REAL core, Redis, and a live Neo4j 5
   (`--uri`, `--password` or `NEO4J_PASSWORD`; without a password it reports
-  `SKIP`): the source-scoped purge and the paged point listing.
+  `SKIP`): the source-scoped purge, the paged point listing, the tenant wipe of
+  the maintenance `--graph` and the graph checks of `--verify`.
 
 The core's virtualenv does not ship the plugin's dependencies: either install
 them there, or append the plugin's own `.venv` site-packages AFTER the core's
 (so the core's packages win), e.g. with a small runner that does
 `sys.path.append(<plugin>/.venv/lib/python3.13/site-packages)` and then
 `runpy.run_path(<harness>, run_name="__main__")`.
-- `test_maintenance_resume_cli.py`, `test_reingest_clears_diary.py`,
-  `test_reingest_enumeration.py`, `test_maintenance_exit_summary.py`,
-  `test_ingestion_safety_fixes.py`, `test_maintenance_decoupling.py` — need the
-  REAL EffING: inside the Cat container, or from an EffING-enabled
-  `grinning-cat-core` checkout with `EFFING_DIR` and `MULTIMODAL_DIR` pointing at
-  checkouts of `cat-efficient-ingestion` and `cat-multimodal-ingestion`
-  (registered by `effing_checkout.py`; a missing checkout is a FAIL, never a
-  skip):
-
-  ```bash
-  cd ../grinning-cat-core
-  EFFING_DIR=/path/to/cat-efficient-ingestion \
-  MULTIMODAL_DIR=/path/to/cat-multimodal-ingestion PYTHONPATH=. \
-      .venv/bin/python /path/to/cat-graphrag/tests/test_maintenance_resume_cli.py
-  ```

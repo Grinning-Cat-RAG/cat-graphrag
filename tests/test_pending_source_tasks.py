@@ -21,7 +21,9 @@ doubles) and the REAL spaCy phase body (``run_spacy_extraction_phase``):
 - a failed similarity task does not;
 - the LLM phase never consumes the spaCy batch;
 - the tasks of a source in a chat and in the knowledge base with the same name
-  are separate, and the delete/purge cleanup releases them.
+  are separate, and the delete/purge cleanup releases them;
+- the tasks of points the source no longer has (replaced by a new upload) are
+  left out; a current point without its extraction makes the phase re-extract.
 """
 
 if __name__ == "__main__":
@@ -295,6 +297,54 @@ if __name__ == "__main__":
         assert not handler._pending_entity_tasks, "tasks left in the flat list"
         print("PASS test_tasks_without_points_are_joined_not_leaked")
 
+    async def test_tasks_of_replaced_points_are_left_out():
+        """Points written outside an ingestion and then uploaded again: the tasks of the replaced points are in the
+        source's list too. Their product is stale (it would bring back the old content's graph): only the current
+        points' extraction is written; a current point without its extraction makes the phase re-extract."""
+        source = "replaced.pdf"
+        writes = []
+        handler = _make_handler(writes)
+        await _track_points(handler, source, ["old-0", "old-1"])
+        await _track_points(handler, source, ["new-0"])
+        _stored(handler, source, ["new-0"], [])
+        extracted = []
+        good = handler._extract_document_graph
+
+        async def counting(document_id, content, metadata):
+            extracted.append(document_id)
+            return await good(document_id, content, metadata)
+
+        handler._extract_document_graph = counting
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result == {"status": "done", "processed": 1}, result
+        assert [e["id"] for e in writes[0][0]] == ["entity-new-0"], writes
+        assert extracted == [], "the current point had its extraction: nothing to extract again"
+
+        writes.clear()
+        handler._extract_document_graph = good
+        await _track_points(handler, source, ["new-0"])
+        _stored(handler, source, ["new-0", "new-1"], [])  # new-1 has no extraction in memory
+        handler._extract_document_graph = counting
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result == {"status": "done", "processed": 2}, result
+        assert sorted(extracted) == ["new-0", "new-1"], extracted
+        assert sorted(e["id"] for e in writes[0][0]) == ["entity-new-0", "entity-new-1"], writes
+
+        # a chunk whose extraction found nothing (no result) is extracted all the same: no re-extraction
+        writes.clear()
+        extracted.clear()
+
+        async def nothing(document_id, content, metadata):
+            return None
+
+        handler._extract_document_graph = nothing
+        await _track_points(handler, source, ["empty-0"])
+        _stored(handler, source, ["empty-0"], [])
+        handler._extract_document_graph = counting
+        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        assert result["status"] == "done" and extracted == [] and writes == [], (result, extracted, writes)
+        print("PASS test_tasks_of_replaced_points_are_left_out")
+
     async def main():
         await test_finished_before_prune_still_contributes()
         await test_failed_or_cancelled_chunk_reextracts_every_chunk()
@@ -302,5 +352,6 @@ if __name__ == "__main__":
         await test_similarity_failure_keeps_the_batch_complete()
         await test_chat_and_kb_sources_with_the_same_name_are_separate()
         await test_tasks_without_points_are_joined_not_leaked()
+        await test_tasks_of_replaced_points_are_left_out()
 
     asyncio.run(main())

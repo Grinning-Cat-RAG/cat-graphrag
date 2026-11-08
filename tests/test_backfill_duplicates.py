@@ -115,10 +115,19 @@ if __name__ == "__main__":
         )
 
 
+    async def _extract_and_link(handler, document_id, content, metadata):
+        """One document through the write path of the spaCy phase: its extraction, then one source-graph write."""
+        extracted = await handler._extract_document_graph(document_id, content, metadata)
+        if extracted:
+            await handler._write_source_graph(
+                extracted["entities"], extracted["mentions"], extracted["relations"],
+                operation=f"extract/link entities for document {document_id}",
+            )
+
     def _stub_ner(mod, handler, name, etype, confidence):
         """Replace the spaCy NER call with a deterministic extraction.
 
-        The REAL ``_extract_and_link_entities`` write path (id-MERGE, name-only
+        The REAL write path of the spaCy phase (``_extract_document_graph`` + ``_write_source_graph``) (id-MERGE, name-only
         hash, types/metadata accumulation, untag-on-match) is exercised against
         live Neo4j; only the external spaCy model dependency is substituted.
         """
@@ -149,7 +158,8 @@ if __name__ == "__main__":
             await _seed_doc(db, tenant, "doc-a", "We use GraphRAG in the pipeline.")
             await _ensure_names(mod, handler, tenant)
             _stub_ner(mod, handler, "GraphRAG", mod.EntityType.TECHNOLOGY, 0.85)
-            await handler._extract_and_link_entities(
+            await _extract_and_link(
+                handler,
                 "doc-a", "We use GraphRAG in the pipeline.", {}
             )
             await handler._store_concept_relations(
@@ -195,7 +205,8 @@ if __name__ == "__main__":
             )
             assert before is not None and before["g"] == "gen1", "concept-created node must be tagged"
             _stub_ner(mod, handler, "GraphWay", mod.EntityType.TECHNOLOGY, 0.85)
-            await handler._extract_and_link_entities(
+            await _extract_and_link(
+                handler,
                 "doc-b", "We use GraphWay everywhere.", {}
             )
             node = await db.single(
@@ -225,7 +236,7 @@ if __name__ == "__main__":
             await _seed_doc(db, tenant, "doc-c2", "GraphVault is central.")
             await _ensure_names(mod, handler, tenant)
             _stub_ner(mod, handler, "GraphVault", mod.EntityType.TECHNOLOGY, 0.7)
-            await handler._extract_and_link_entities("doc-c", "We use GraphVault daily.", {})
+            await _extract_and_link(handler, "doc-c", "We use GraphVault daily.", {})
             await handler._store_concept_relations(
                 tenant,
                 {"concepts": [{"text": "GraphVault", "type": "CONCEPT"}], "relations": []},
@@ -598,7 +609,8 @@ if __name__ == "__main__":
                 {"concepts": [{"text": "GraphViz", "type": "DEFINITION"}], "relations": []},
                 source="src-j", document_ids=["doc-j1"], concept_gen="gen1",
             )
-            await handler._extract_and_link_entities(
+            await _extract_and_link(
+                handler,
                 "doc-j1", "We use GraphViz for retrieval.", {}
             )
 

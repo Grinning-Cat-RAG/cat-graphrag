@@ -106,6 +106,7 @@ def _supports_extra_body(llm: Any) -> bool:
 
 #: Name prefix of the background similarity tasks (see ``add_point_to_tenant``).
 _SIMILARITY_TASK_PREFIX = "graphrag-similarity:"
+_EXTRACTION_TASK_PREFIX = "graphrag-extraction:"
 
 #: Points read per query when every point of a collection is listed (``get_all_tenant_points`` without a limit).
 _PAGE_SIZE = 1000
@@ -222,6 +223,20 @@ def _normalize_entity_name(name: str) -> str:
     """
     normalized = name.lower().strip()
     return re.sub(r"^(the|a|an)\s+", "", normalized)
+
+
+def _stored_metadata(raw: Any) -> Dict:
+    """The metadata of a stored Document as its caller stored it: parsed from the JSON property, without the
+    ``tenant_id`` the handler used to add to it (the tenant is a property of the Document, never caller metadata:
+    the core takes the metadata shared by the points of a source for its upload metadata)."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k != "tenant_id"}
 
 
 def _merge_entity_metadata(existing_raw: Optional[str], incoming: Dict) -> Dict:
@@ -811,12 +826,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             )
             return
 
-        # 2. Re-embed all contents with the new embedder (non-blocking).
+        # 2. Re-embed all contents with the new embedder, on the core's
+        # ingestion lane (bulk background work, never the chats' threads).
         # LOCK SCOPE: the embedding runs OUTSIDE the tenant write lock. The
         # lock covers only the Neo4j writes below — holding it across the
         # embedder call made other writers wait minutes and abort.
+        from cat.rabbit_hole import run_in_ingestion_executor
+
         contents = [content for _, content, _ in docs]
-        vectors = await asyncio.to_thread(new_embedder.embed_documents, contents)
+        vectors = await run_in_ingestion_executor(new_embedder.embed_documents, contents)
 
         # 3. Write embedding_{new_gen} on each Document (single batch UNWIND).
         payload = []
@@ -1374,14 +1392,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "still find it) and the embedding can be backfilled later."
             )
 
-        metadata = metadata or {}
-        metadata["tenant_id"] = self.agent_id
         # Neo4j does not support Map-type node properties (only primitives /
         # arrays of primitives are allowed).  Serialise to a JSON string so the
         # CREATE never raises ClientError.Statement.TypeError.  All retrieve
         # helpers already call json.loads() when they get back a string, so this
         # is fully backward-compatible.
-        metadata_json = json.dumps(metadata)
+        metadata_json = json.dumps(metadata or {})
 
         # Resolve the current generation's embedding property name (versioned
         # schema, todo 11 P4). The write must target the SAME property the
@@ -1451,8 +1467,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # extracted batch; the source's ONE write happens in the spaCy
             # phase (``run_spacy_extraction_phase`` -> ``_write_source_graph``)
             # when the batch is joined (never one write transaction per chunk).
+            # Named after the point: the phase keeps only the product of the source's CURRENT points.
             task = asyncio.create_task(
-                self._extract_document_graph(point_id, content, metadata)
+                self._extract_document_graph(point_id, content, metadata),
+                name=f"{_EXTRACTION_TASK_PREFIX}{point_id}",
             )
             self._pending_entity_tasks.append(task)
             self._track_source_task(metadata, task)
@@ -1524,29 +1542,45 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if source:
             self._pending_source_tasks.pop(self._source_key(source, chat_id), None)
 
-    async def _gather_source_tasks(self, source: str, tasks: List[asyncio.Task]) -> Optional[Dict[str, List[Dict]]]:
-        """Join one source's background tasks and accumulate their extraction batch.
+    async def _gather_source_tasks(
+        self, source: str, tasks: List[asyncio.Task], point_ids: Optional[set] = None
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Join one source's background tasks and accumulate the extraction batch of its points ``point_ids``.
 
-        Returns ``{"entities", "mentions", "relations"}`` when every EXTRACTION task succeeded, ``None`` otherwise (a
-        failed or cancelled chunk would be missing: the caller re-extracts the source). A failed similarity task loses
-        no extraction product: the phase recreates the similarity edges anyway. Failures are logged.
+        The tasks may include the extraction of points the source no longer has (replaced by a new upload since they
+        were stored, e.g. points written outside an ingestion and then uploaded again): their product is stale and
+        left out. Returns ``{"entities", "mentions", "relations"}`` when every point of ``point_ids`` has its
+        extraction, ``None`` otherwise (a failed, cancelled or missing chunk: the caller re-extracts the source). A
+        failed similarity task loses no extraction product: the phase recreates the similarity edges anyway. Failures
+        are logged. Without ``point_ids`` the tasks are only joined.
         """
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if t not in tasks]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         batch: Dict[str, List[Dict]] = {"entities": [], "mentions": [], "relations": []}
+        extracted: set = set()
         complete = True
         for task, r in zip(tasks, results):
+            get_name = getattr(task, "get_name", None)
+            name = str(get_name()) if callable(get_name) else ""
+            if name.startswith(_SIMILARITY_TASK_PREFIX):
+                if isinstance(r, BaseException):
+                    log.error(f"[GraphRAG] Similarity task for source '{source}' failed: {r!r}")
+                continue
+            point_id = name[len(_EXTRACTION_TASK_PREFIX):] if name.startswith(_EXTRACTION_TASK_PREFIX) else None
+            if point_ids is not None and point_id is not None and point_id not in point_ids:
+                continue  # a point the source no longer has
             # BaseException: a cancelled task yields CancelledError, which is
             # not an Exception but still loses that chunk's result.
             if isinstance(r, BaseException):
-                log.error(f"[GraphRAG] Background task for source '{source}' failed: {r!r}")
-                get_name = getattr(task, "get_name", None)
-                is_similarity = callable(get_name) and str(get_name()).startswith(_SIMILARITY_TASK_PREFIX)
-                if not is_similarity:
-                    complete = False
-            elif isinstance(r, dict) and "entities" in r:
+                log.error(f"[GraphRAG] Extraction task for source '{source}' failed: {r!r}")
+                complete = False
+                continue
+            extracted.add(point_id)
+            if isinstance(r, dict) and "entities" in r:
                 for key in batch:
                     batch[key].extend(r.get(key) or [])
+        if point_ids is not None and not point_ids <= extracted:
+            complete = False
         return batch if complete else None
 
     async def get_source_points(
@@ -1567,8 +1601,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
            phase stored the points);
         2. purges the graph the source contributed before (``purge_source_graph_artifacts``): the phase replaces its
            product, never adds to it (new content, changed spaCy models, a resume after a crash);
-        3. joins the tasks; when they are missing (a resume: they lived in another process) or incomplete (a chunk
-           failed), extracts every stored chunk CONCURRENTLY (spaCy is CPU-bound, no Neo4j locks);
+        3. joins the tasks, keeping the product of the source's CURRENT points only; when a current point has none
+           (a resume: the tasks lived in another process) or a chunk failed, extracts every stored chunk CONCURRENTLY
+           (spaCy is CPU-bound, no Neo4j locks);
         4. writes the source's graph in ONE transaction (sequential batches above the guard) and recreates the
            similarity edges of the points with a valid vector.
 
@@ -1585,10 +1620,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return {"status": "error", "reason": f"no stored points for source '{source}'"}
 
         await self.purge_source_graph_artifacts(source, collection_name, chat_id)
-        batch = await self._gather_source_tasks(source, tasks) if tasks else None
+        content_points = [p for p in points if (getattr(p, "payload", None) or {}).get("page_content", "")]
+        batch = (
+            await self._gather_source_tasks(source, tasks, {str(p.id) for p in content_points}) if tasks else None
+        )
 
         extracting = bool(self._enable_entity_extraction and self._entity_extractor)
-        content_points = [p for p in points if (getattr(p, "payload", None) or {}).get("page_content", "")]
         if batch is None and extracting:
             await self._ensure_current_embedder()
             extractions = await asyncio.gather(
@@ -1675,31 +1712,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """
         return {"concept_relations": bool(self._enable_concept_relations)}
 
-    async def _extract_and_link_entities(
-        self,
-        document_id: str,
-        content: str,
-        metadata: Dict,
-    ) -> None:
-        """Extract ONE document and write it in ONE transaction.
-
-        Kept for the single-document path (the maintenance graph walk).
-        Ingestion accumulates every chunk of a source first (see
-        ``run_spacy_extraction_phase``) and calls ``_write_source_graph`` ONCE
-        per source instead of once per chunk.
-        """
-        extracted = await self._extract_document_graph(
-            document_id, content, metadata
-        )
-        if not extracted:
-            return
-        await self._write_source_graph(
-            extracted["entities"],
-            extracted["mentions"],
-            extracted["relations"],
-            operation=f"extract/link entities for document {document_id}",
-        )
-
     async def _extract_document_graph(
         self,
         document_id: str,
@@ -1751,13 +1763,14 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 "confidence": entity.confidence,
             })
 
-        # Batch-embed all entity names in one call (non-blocking via thread)
+        # Batch-embed all entity names in one call, on the core's ingestion lane
+        # (part of an ingestion: de-prioritized threads, never the chats' ones)
         if self._enable_entity_embeddings and self._embedder is not None:
             try:
+                from cat.rabbit_hole import run_in_ingestion_executor
+
                 names = [ent["name"] for ent in entities_batch]
-                embeddings = await asyncio.to_thread(
-                    self._embedder.embed_documents, names
-                )
+                embeddings = await run_in_ingestion_executor(self._embedder.embed_documents, names)
                 for ent, emb in zip(entities_batch, embeddings):
                     if self._is_valid_vector(emb):
                         ent["embedding"] = emb
@@ -2723,6 +2736,33 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    @tenant_write_locked("wipe tenant graph")
+    async def wipe_tenant_graph(self) -> None:
+        """Delete everything the graph phases derived for this tenant: the entity edges (MENTIONS, PROVENANCE), the
+        similarity edges (SIMILAR_TO_*), the RELATED_TO edges, then every entity left without edges.
+
+        Used by the maintenance rebuild of the graph (``--graph``), which then runs the graph phases of every source
+        again: unlike the per-source purge, it also removes what no source owns anymore (e.g. the leftovers of a
+        source deleted before the graph phases existed). The Documents, the SourceFile / Collection structure and the
+        other tenants are untouched. Every statement deletes in batches of its own transactions: a large tenant
+        exceeds the transaction memory of Neo4j in a single one.
+        """
+        await self._ensure_connected()
+        statements = [
+            "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]-() "
+            "CALL (r) { DELETE r } IN TRANSACTIONS OF 5000 ROWS",
+            "MATCH (:Document {tenant_id: $tenant_id})-[r:MENTIONS|PROVENANCE]->() "
+            "CALL (r) { DELETE r } IN TRANSACTIONS OF 5000 ROWS",
+            "MATCH (:Document {tenant_id: $tenant_id})-[r]->(:Document {tenant_id: $tenant_id}) "
+            "WHERE type(r) STARTS WITH 'SIMILAR_TO_' "
+            "CALL (r) { DELETE r } IN TRANSACTIONS OF 5000 ROWS",
+            "MATCH (e:Entity {tenant_id: $tenant_id}) WHERE NOT (e)--() "
+            "CALL (e) { DELETE e } IN TRANSACTIONS OF 5000 ROWS",
+        ]
+        async with self._get_session() as session:
+            for statement in statements:
+                await (await session.run(cast(LiteralString, statement), tenant_id=self.agent_id)).consume()
+
     @tenant_write_locked("purge source graph artifacts")
     async def purge_source_graph_artifacts(
         self, source: str, collection_name: str, chat_id: Optional[str] = None
@@ -3020,7 +3060,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 payload={
                     "id": r["id"],
                     "page_content": r["content"],
-                    "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
+                    "metadata": _stored_metadata(r["metadata"]),
                 },
                 vector=r["embedding"]
             )
@@ -3341,14 +3381,6 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 return min(1.0, max(es, vs) * applied_boost)
             return es or vs
 
-        def load_metadata(metadata: Dict | str) -> Dict:
-            if isinstance(metadata, dict):
-                return metadata
-            try:
-                return json.loads(metadata)
-            except json.JSONDecodeError:
-                return {}
-
         # registry: doc_id → {data, entity_score, vector_score, is_direct}
         registry: Dict[str, Dict] = {
             r["id"]: {
@@ -3388,7 +3420,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             DocumentRecall(
                 document=LangChainDocument(
                     page_content=info.get("data", {}).get("content", ""),
-                    metadata=load_metadata(info.get("data", {}).get("metadata", {})),
+                    metadata=_stored_metadata(info.get("data", {}).get("metadata", {})),
                     id=doc_id,
                 ),
                 vector=info.get("data", {}).get("embedding", []),
@@ -3417,7 +3449,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         documents = []
         for r in records:
-            metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
+            metadata_dict = _stored_metadata(r["metadata"])
             documents.append(DocumentRecall(
                 document=LangChainDocument(
                     page_content=r["content"],
@@ -3493,7 +3525,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         points = []
         for r in records:
-            metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (r["metadata"] or {})
+            metadata_dict = _stored_metadata(r["metadata"])
             points.append(Record(
                 id=r["id"],
                 payload={
@@ -3618,7 +3650,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         scored_points = []
         for r in records:
-            metadata_dict = json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"]
+            metadata_dict = _stored_metadata(r["metadata"])
             scored_points.append(ScoredPoint(
                 id=r["id"],
                 score=r["score"],

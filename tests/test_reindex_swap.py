@@ -106,6 +106,19 @@ def _install_cat_stub():
     crud_mod.distributed_lock = _noop_distributed_lock
     sys.modules["cat.db.crud"] = crud_mod
 
+    # cat.rabbit_hole.run_in_ingestion_executor: the core's ingestion lane; here a plain worker thread (what the
+    # core does with the lane disabled)
+    rabbit_hole_mod = types.ModuleType("cat.rabbit_hole")
+
+    async def _run_in_ingestion_executor(func, *args, **kwargs):
+        import asyncio as _asyncio
+        import functools as _functools
+
+        return await _asyncio.get_running_loop().run_in_executor(None, _functools.partial(func, *args, **kwargs))
+
+    rabbit_hole_mod.run_in_ingestion_executor = _run_in_ingestion_executor
+    sys.modules["cat.rabbit_hole"] = rabbit_hole_mod
+
     looking = types.ModuleType("cat.looking_glass")
     looking.__path__ = []
     sys.modules["cat.looking_glass"] = looking

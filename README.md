@@ -114,7 +114,7 @@ The core RabbitHole ingests every source through recorded **phases** (`parsing_c
 
 How a source goes through them:
 
-- **upload / re-upload**: the embedding phase stores the points; `add_point_to_tenant` starts the per-chunk extraction in the background; the spaCy phase joins it, so the source's graph is written **once**. A re-upload replaces the points, and the spaCy phase replaces the graph: nothing of the previous content survives.
+- **upload / re-upload**: the embedding phase stores the points; `add_point_to_tenant` starts the per-chunk extraction in the background; the spaCy phase joins it, so the source's graph is written **once**. A re-upload replaces the points, and the spaCy phase replaces the graph: nothing of the previous content survives (the extraction of points the source no longer has is left out; a current point without its extraction makes the phase re-extract every chunk).
 - **embedder change**: the core runs the embedding again on the kept chunks, then both graph phases. The handler adopts the current system embedder before the extraction starts, so entity embeddings never use a stale one.
 - **settings change**: a change of the spaCy models or of a toggle moves the tag, and the core's automatic resume runs the phases again on every completed source (a source in error waits for a new upload or the maintenance, by the core's choice). The **technology patterns** and the **concept definitions / relation definitions / prompt** are deliberately out of the tags: saving them already triggers a dedicated job (`refresh_technology_entities`, and the concept recompute with its atomic generation flip), so a per-source re-run would repeat the same work, LLM calls included. `enable_concept_relations` is in the spaCy tag too: the spaCy phase owns the purge of the source's graph, concepts included, so turning the concepts off removes them.
 - **crash / restart**: the core resumes the source from the phase that was running; with no extraction task in memory, the spaCy phase re-extracts every stored chunk (purge first, so the result is the same).
@@ -151,7 +151,7 @@ Toggles and phase markers:
 
 Both phases write to the SAME `Entity` nodes, which is why the LLM phase is NOT extracted into a separate plugin. The contract is internal to this plugin:
 
-- the spaCy NER step (`_extract_and_link_entities`) writes shared Entity nodes and `REMOVE`s the `concept_gen` / `concept_gen_active` tags from them;
+- the spaCy phase (`_write_source_graph`) writes shared Entity nodes and `REMOVE`s the `concept_gen` / `concept_gen_active` tags from them;
 - the LLM concept-relations step tags its own Entity nodes with `concept_gen`;
 - the stale-concept GC (`_gc_stale_concept_nodes`) only deletes nodes marked `concept_gen_active = false` AND with no remaining `MENTIONS` edge — the `NOT (e)<-[:MENTIONS]-()` guard protects shared spaCy nodes, so an entity that spaCy picked up keeps its `MENTIONS` edge and is never deleted when the LLM generation flips.
 
@@ -378,7 +378,7 @@ This handler is designed for a remote database backend and uses the Neo4j async 
 
 ### Background tasks are used during ingestion
 
-Entity extraction and similarity-link creation are scheduled asynchronously when new memories are added; the `graph_spacy_extraction` phase joins the extraction of its source and writes it once. Points written outside an ingestion (e.g. by another plugin calling the vector handler directly) start the same background extraction, which is written only when a spaCy phase of that source runs.
+Entity extraction and similarity-link creation are scheduled asynchronously when new memories are added; the `graph_spacy_extraction` phase joins the extraction of its source and writes it once. The CPU-heavy steps of an ingestion (the spaCy analysis of a chunk, the embedding of its entities, the re-embedding of the tenant on a change of the embedder) run on the core's ingestion lane (`run_in_ingestion_executor`: `CAT_INGESTION_WORKERS` de-prioritized threads, `CAT_INGESTION_NICENESS`), never on the threads serving the chats (with the lane disabled, `CAT_INGESTION_WORKERS<=0`, they share the default executor, as the core's own parsing and embedding do); the analysis of a chat message and the one-off loading of a spaCy model stay off it. Points written outside an ingestion (e.g. by another plugin calling the vector handler directly) start the same background extraction, which is written only when a spaCy phase of that source runs.
 
 ---
 
@@ -416,56 +416,83 @@ A few things are worth knowing before production use:
 
 ### Maintenance CLI
 
-`maintenance_agent.py` runs inside the Cat container and drives the ingestion
-engine and the GraphRAG graph rebuild. Scope is `--agent <id>` (repeatable; an
-explicit id is the only way to target a protected/`__*__` agent) or `--all`
-(protected agents always skipped). Ops are combinable: `--reingest`,
-`--reembed`, `--resume-failed`, `--graph`.
+`maintenance_agent.py` runs inside the Cat container, as a process of its own,
+and drives the core's public ingestion API (`RabbitHole.reingest_source` /
+`rerun_source`): every source goes through the same phase engine as an upload,
+under the lock of the source, with its state updated. Scope is `--agent <id>`
+(repeatable; an explicit id is the only way to target a protected/`__*__`
+agent) or `--all` (protected agents always skipped). Ops are combinable and run
+in this order:
+
+| Op | What runs again |
+|---|---|
+| `--reingest` | every phase of every source, from the bytes kept for it |
+| `--reembed` | the embedding of every source, on its stored chunks, and the phases depending on it (all invalidated together: if the CLI dies midway, the automatic resume still finds them to do) |
+| `--resume-failed` | the failed phases of every source in error, with the phases depending on them (the completed ones are kept), as the core's `POST /ingestion/retry`; a source in error with phases still to do (e.g. left by a `--graph` that died) runs them; a source that failed before any phase (e.g. a download) is reported: it needs a new upload |
+| `--graph` | GraphRAG agents: wipe of the tenant graph, then the graph phases of every source and the alignment of the concept generation marker; it runs whatever the concept toggle |
+
+`--collection declarative` (default: the knowledge base) or `episodic` (the
+sources uploaded in the chats) picks the sources; `--graph` always covers both,
+since its wipe is tenant-wide. A source ingested before the ingestion states
+existed (points in the vector memory, no state) has no stored chunks: `--reingest`,
+`--reembed` and `--graph` reingest it, which gives it a state. A source whose
+bytes were not kept (a file ingested without storing it) cannot be reingested:
+it is reported `source-not-kept` (exit 1) and left untouched; under `--graph`
+its graph is wiped like every other and cannot be rebuilt (its text and
+vectors stay).
 
 ```bash
-# Re-embed only (chunk reuse) for one agent
+# Re-embed only (the stored chunks are reused) for one agent
 docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --reembed --yes
 
-# Re-ingest from scratch (points-first wipe, then re-parse + re-embed)
+# Re-ingest from scratch for all agents
 docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --reingest --yes
 
-# Resume ONLY the failed phases (keeps complete phases, no purge/re-parse/re-embed)
+# Run again ONLY the failed phases
 docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --resume-failed --yes
 
-# Rebuild the GraphRAG graph (wipe-then-rebuild)
+# Rebuild the GraphRAG graph
 docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --agent <id> --graph --yes
 
-# Show the resolved plan without touching anything (exits 2)
+# Show the plan without touching anything (exits 2)
 docker exec cheshire_cat_core python /app/cat/plugins/cat_graphrag/scripts/maintenance_agent.py --all --resume-failed --dry-run
 ```
 
-Safety contract: the default mode is **dry-run** — it prints the resolved plan
-(agent, source, failed phases, kept-phase count for `--resume-failed`) and
-exits **2** with zero writes; every mutating op requires `--yes`; agents are
-processed sequentially with per-agent and per-source `try/except` isolation;
-`--json` emits machine-readable plan/summary lines.
+Safety contract: `--dry-run` prints the plan (per agent and op the steps, and
+the sources in error with their failed phases for `--resume-failed`) and exits
+**2** with zero writes and without loading any agent; without `--yes` the same
+plan is printed and the run aborts with **2**. Agents are processed one at a
+time; a failing source never stops the others and a failing op never stops the
+next one. The outcome of every op counts the sources completed, the ones deleted
+meanwhile (`gone`) and the failures (with the failed phases and their reasons);
+`--json` prints the plan, every op outcome and the final summary as one JSON
+document per line.
 
-Exit codes: **0** = all resumed/ops cleanly, **1** = partial failure (some
-source/agent/op failed, or a `--verify` check failed), **2** = aborted
-(dry-run or missing `--yes`, or EffING is not importable).
+`--verify` (read-only) checks that every source of the collection is completed
+with the current tag of every phase (nothing left for the automatic resume) and,
+for a GraphRAG agent, that every Document has the embedding of the current
+generation, that no entity is left without edges and that the visible concept
+generation is the one of the current settings.
 
-`--resume-failed` deletes only the diary entries whose state is `error`
-(including collateral `dependency <x> is error` rows), keeps every `complete`
-entry with its `tag`/`started_at`, writes `status=processing`/`error=None`,
-and re-dispatches only the cleared phases via
-`reembed_sources(..., stale_after=0.0)`. A source with no failed phase is
-reported `nothing-to-resume` and left untouched; a disabled
-`graph_llm_extraction` phase ends `skipped`, never `error`.
+Exit codes: **0** = every op succeeded (and `--verify` passed), **1** = partial
+failure (a source or an op failed, or a `--verify` check failed), **2** =
+aborted (dry-run, missing `--yes`, unknown agent, or `--graph` without the
+plugin deployed).
 
 ### Maintenance script coordination
 
-Before each per-agent run `maintenance_agent.py` writes
-`agents:<agent_id>:ingestion:maintenance` (`{"owner": "maintenance",
-"started_at": ...}`, TTL 2h, refreshed per source) through `cat.db.crud`, and
-deletes it in a `finally` (success or failure). While the marker exists the
-EffING periodic sweep skips that agent, so the app never steals/retries rows
-the CLI is rebuilding. A crashed CLI's marker expires by TTL; a failed delete
-never blocks the sweep forever.
+While an agent is processed it is in maintenance
+(`crud_ingestions.set_maintenance`, TTL 2h, refreshed before every source;
+cleared in a `finally`, on success or failure): the automatic resume of the
+server leaves the agent alone meanwhile. If the CLI process dies the marker
+expires on its own, then the resume takes over what it left in flight.
+`--graph` resets the graph entries of the diaries BEFORE its wipe: if it dies
+or fails at any later point the sources are stale, and the resume runs their
+graph phases again (sources without a state are not in the resume: run
+`--graph` again). An ingestion of the server running on a source meanwhile is
+waited for (the lock of the source). A save of the concept settings during
+`--graph` flips the concept marker on its own: the CLI then does not bring the
+older generation back and reports `concept-marker-conflict` (exit 1).
 
 ---
 

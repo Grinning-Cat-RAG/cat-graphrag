@@ -407,6 +407,13 @@ if __name__ == "__main__":
         result = phases_mod.to_result("x", {"status": "not_ready", "retry_after": 2, "processed": True})
         assert result.retry_after == 2.0 and result.processed is None, result
 
+    async def test_stored_metadata_read_back():
+        """The metadata of a Document read back are the caller's: parsed, never the handler's tenant_id."""
+        read = handler_mod._stored_metadata
+        assert read(json.dumps({"source": "a.pdf", "tenant_id": "t"})) == {"source": "a.pdf"}
+        assert read({"source": "a.pdf", "tenant_id": "t"}) == {"source": "a.pdf"}
+        assert read("not json") == {} and read(None) == {} and read(json.dumps([1])) == {}
+
     # ── EffING leftovers ─────────────────────────────────────────────────────
     async def test_no_effing_leftovers():
         for name in (
@@ -420,14 +427,16 @@ if __name__ == "__main__":
             assert not hasattr(handler_mod.GraphRAGHandler, name), f"GraphRAGHandler.{name} is still defined"
         with open(os.path.join(gf.PLUGIN_DIR, "plugin.json"), encoding="utf-8") as fh:
             assert "cat_efficient_ingestion" not in json.load(fh).get("dependencies", [])
+        this_file = os.path.abspath(__file__)
         for root, _, files in os.walk(gf.PLUGIN_DIR):
-            if any(part in root for part in (".git", ".venv", "tests", "__pycache__", "scripts")):
+            if any(part in root for part in (".git", ".venv", "__pycache__")):
                 continue
             for file in files:
-                if file.endswith((".py", ".json")):
-                    with open(os.path.join(root, file), encoding="utf-8") as fh:
+                path = os.path.join(root, file)
+                if file.endswith((".py", ".json", ".md")) and os.path.abspath(path) != this_file:
+                    with open(path, encoding="utf-8") as fh:
                         text = fh.read()
-                    for word in ("cat_efficient_ingestion", "EffING"):
+                    for word in ("cat_efficient_ingestion", "EffING", "EFFING_DIR", "reembed_sources"):
                         assert word not in text, f"{word!r} still referenced in {os.path.join(root, file)}"
 
     TESTS = [v for k, v in dict(globals()).items() if k.startswith("test_") and asyncio.iscoroutinefunction(v)]

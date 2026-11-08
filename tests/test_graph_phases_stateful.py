@@ -38,7 +38,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mutate", choices=["llm-dependency", "no-purge"], default=None)
-    parser.add_argument("--examples", type=int, default=60)
+    parser.add_argument("--examples", type=int, default=120)
     args = parser.parse_args()
 
     main, handler_mod, phases_mod = gf.bootstrap("_graphrag_stateful")
@@ -60,6 +60,8 @@ if __name__ == "__main__":
 
     SOURCES = [("a.pdf", None), ("b.pdf", None), ("c.pdf", "chat-1")]
     WORDS = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace"]
+    # a fault in one operation out of four: rare enough that most operations complete and interleave
+    RARE = st.sampled_from([False, False, False, True])
     contents = st.lists(
         st.lists(st.sampled_from(WORDS), min_size=0, max_size=3).map(lambda ws: " met ".join(ws) or "nothing here"),
         min_size=1, max_size=3,
@@ -125,7 +127,7 @@ if __name__ == "__main__":
                 return
             self.expected[key] = "error" if failed else "completed"
 
-        @rule(source=st.sampled_from(SOURCES), chunks=contents, fail=st.booleans(), crash=st.booleans())
+        @rule(source=st.sampled_from(SOURCES), chunks=contents, fail=RARE, crash=RARE)
         def upload(self, source, chunks, fail, crash):
             name, chat = source
             self.files[(chat, name)] = chunks
@@ -174,7 +176,7 @@ if __name__ == "__main__":
 
         def _resume(self):
             """The automatic resume: sources in flight, and completed sources whose tags changed."""
-            tags = run(engine.current_tags(self.rh, self.cat))
+            tags = run(gf.current_tags(self.rh, self.cat))
             for source, status in list(self.expected.items()):
                 row = run(crud_ingestions.get_status(self.agent, source[1], source[0]))
                 stale = any((row["completed_phases"].get(p) or {}).get("tag") != t for p, t in tags.items())

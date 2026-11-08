@@ -46,12 +46,19 @@ def bootstrap(package_name):
     )
 
 
-async def create_agent(agent_id):
-    """An agent the engine considers alive (its settings key exists)."""
+async def create_agent(agent_id, graphrag=False):
+    """An agent the engine considers alive (its settings key exists); with ``graphrag``, the plugin ``cat_graphrag``
+    is active for it and its vector database is the GraphRAG one (what the maintenance CLI reads)."""
     from cat.db import crud
     from cat.db.cruds import settings as crud_settings
 
-    await crud.store(crud_settings.format_key(agent_id), [])
+    settings = []
+    if graphrag:
+        settings = [
+            {"name": "active_plugins", "value": ["cat_graphrag"]},
+            {"name": "Neo4jGraphRAGConfig", "category": "vector_database", "value": {}},
+        ]
+    await crud.store(crud_settings.format_key(agent_id), settings)
 
 
 async def destroy_agent(agent_id):
@@ -129,6 +136,10 @@ class FakeGraphStore:
         self.writes = []  # (operation, n_entities, n_relations) of every successful graph write
         self.purges = []  # (source, collection, chat_id)
         self.embedders_used = []  # the handler's embedder at every chunk extraction
+        self.wipes = 0  # tenant-wide graph wipes
+        self.concept_fingerprint = "fp-1"  # the fingerprint of the current concept settings
+        self.concept_marker = None  # the persisted active concept generation
+        self.concept_gcs = 0
 
     # ── documents ────────────────────────────────────────────────────────────
     def _matches(self, doc, collection, metadata):
@@ -181,6 +192,7 @@ class FakeGraphStore:
         handler._generation = "v1"
         handler._names = {"embedding_prop": "embedding_v1"}
         handler._get_session = lambda: _FakeSession(store)
+        handler._fake_store = store
         handler.create_derived_graph_for_source = noop
         handler.agent_id = handler.agent_id if getattr(handler, "agent_id", None) else "agent_fake"
 
@@ -279,6 +291,36 @@ class FakeGraphStore:
                 store.related.setdefault((concept, words[0], "DESCRIBES"), set()).add(source)
             return {"status": "done", "processed": len(stored_points)}
 
+        async def wipe_tenant_graph():
+            # the Cypher of ``GraphRAGHandler.wipe_tenant_graph`` (run on a live Neo4j by test_graph_purge_live.py):
+            # every entity edge, similarity edge and RELATED_TO goes, then the entities left without edges
+            store.mentions.clear()
+            store.provenance.clear()
+            store.related.clear()
+            store.similar.clear()
+            store.entities.clear()
+            store.wipes += 1
+
+        async def concept_fingerprint():
+            return store.concept_fingerprint
+
+        async def read_concept_gen(tenant_id=None):
+            return store.concept_marker
+
+        async def flip_concept_gen(tenant_id, expected_prev_gen, new_gen):
+            if store.concept_marker != expected_prev_gen:
+                return False
+            store.concept_marker = new_gen
+            return True
+
+        async def gc_stale_concept_nodes(tenant_id):
+            store.concept_gcs += 1
+
+        handler.wipe_tenant_graph = wipe_tenant_graph
+        handler._concept_fingerprint = concept_fingerprint
+        handler._read_concept_gen = read_concept_gen
+        handler._flip_concept_gen = flip_concept_gen
+        handler._gc_stale_concept_nodes = gc_stale_concept_nodes
         handler.get_all_tenant_points = get_all_tenant_points
         handler._create_similarity_relationships = create_similarity
         handler._extract_document_graph = extract
@@ -426,3 +468,163 @@ class FakeRabbitHole:
     async def delete_embedding(self, source, cat):
         meta_filter = {"source": source.name} | ({"chat_id": source.chat_id} if source.chat_id else {})
         await cat.vector_memory_handler.delete_tenant_points(self.collection(source.chat_id), meta_filter)
+
+
+class FakeFileManager:
+    """The uploaded files the core reads back: the bytes of a source exist iff ``(chat_id, name)`` is kept."""
+
+    def __init__(self, kept):
+        self.kept = kept  # set of (chat_id, name)
+
+    def read_file(self, name, folder):
+        parts = folder.split("/", 1)
+        chat_id = parts[1] if len(parts) > 1 else None
+        return b"bytes" if (chat_id, name) in self.kept else None
+
+
+def core_rabbit_hole(files, point_struct):
+    """The REAL core ``RabbitHole`` (``rerun_source`` / ``reingest_source`` / locks / rows), bound to a fake cat, with
+    the built-in parsing and embedding of ``FakeRabbitHole``. A source whose content is gone fails its parsing."""
+    from cat.rabbit_hole import RabbitHole
+    from cat.rabbit_hole.phases import PhaseResult
+
+    builtin = FakeRabbitHole(files, point_struct)
+
+    class CoreRabbitHole(RabbitHole):
+        async def setup(self, _cat):
+            self.cat, self.stray = _cat, None
+
+        async def run_parsing_chunking(self, source, cat):
+            if (source.chat_id, source.name) not in files:
+                return PhaseResult(status="error", reason=f"Cannot parse {source.name}")
+            return await builtin.run_parsing_chunking(source, cat)
+
+        async def delete_parsing_chunking(self, source, cat):
+            return await builtin.delete_parsing_chunking(source, cat)
+
+        async def run_embedding(self, source, cat):
+            return await builtin.run_embedding(source, cat)
+
+        async def delete_embedding(self, source, cat):
+            return await builtin.delete_embedding(source, cat)
+
+    return CoreRabbitHole()
+
+
+class FakeAgentCat(FakeCat):
+    """The CheshireCat the maintenance CLI works on: the core RabbitHole and the uploaded files."""
+
+    def __init__(self, agent_key, handler, main_module, rabbit_hole, kept):
+        super().__init__(agent_key, handler, main_module)
+        self.rabbit_hole = rabbit_hole
+        self.file_manager = FakeFileManager(kept)
+        self.kept = kept
+
+    async def _find_stray_cat(self, chat_id):
+        return None  # the owner of the chat is not needed by the fake phases
+
+
+def load_cli(handler_module, phases_module):
+    """The maintenance CLI module (``scripts/maintenance_agent.py``), bound to the plugin modules under test."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "maintenance_agent", os.path.join(PLUGIN_DIR, "scripts", "maintenance_agent.py"),
+    )
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    modules = {"graphrag_handler": handler_module, "phases": phases_module}
+    cli._resolve_plugin_id = lambda: "cat_graphrag"
+    cli._plugin_module = lambda name: modules[name]
+    return cli
+
+
+async def run_cli(cli, *argv):
+    """Run the CLI's ``main`` with ``argv``; returns ``(exit code, stdout lines)``."""
+    import contextlib
+    import io
+    import sys
+
+    out = io.StringIO()
+    saved = sys.argv
+    sys.argv = ["maintenance_agent", *argv]
+    code = None
+    try:
+        with contextlib.redirect_stdout(out):
+            await cli.main()
+    except SystemExit as exc:
+        code = exc.code
+    finally:
+        sys.argv = saved
+    return code, out.getvalue().splitlines()
+
+
+class CliWorld:
+    """One agent as the maintenance CLI sees it: its graph, the content of its sources, the files kept, its cat."""
+
+    def __init__(self, agent, main_module, handler_module, point_struct, concepts=True):
+        self.agent = agent
+        self.point_struct = point_struct
+        self.store = FakeGraphStore()
+        self.files = {}  # (chat_id, name) -> the content of the source (its kept bytes, parsed)
+        self.kept = set()  # (chat_id, name) whose bytes are kept
+        self.handler = self.store.install(make_handler(handler_module, agent, enable_concept_relations=concepts))
+        self.rh = core_rabbit_hole(self.files, point_struct)
+        self.cat = FakeAgentCat(agent, self.handler, main_module, self.rh, self.kept)
+
+    async def upload(self, name, chunks, chat=None, keep=True):
+        """An upload through the server: a fresh row, then the phases (``keep``: the bytes are stored)."""
+        from cat.rabbit_hole import engine
+
+        self.files[(chat, name)] = chunks
+        if keep:
+            self.kept.add((chat, name))
+        else:
+            self.kept.discard((chat, name))
+        return await ingest(engine, self.rh, self.cat, chat, name)
+
+    async def legacy(self, name, chunks, chat=None, custom=None):
+        """A source ingested before the states existed: its points (and graph), its stored file, no row. ``custom``:
+        the metadata of its upload, on every chunk."""
+        import asyncio
+
+        self.files[(chat, name)] = chunks
+        self.kept.add((chat, name))
+        meta = (custom or {}) | {"source": name} | ({"chat_id": chat} if chat else {})
+        points = [
+            self.point_struct(
+                id=uuid.uuid4().hex,
+                payload={"page_content": text, "metadata": meta | {"chunk_index": i}},
+                vector=[1.0, float(i + 1)],
+            )
+            for i, text in enumerate(chunks)
+        ]
+        await self.handler.add_points_to_tenant(FakeRabbitHole.collection(chat), points)
+        await asyncio.gather(*self.handler._pending_entity_tasks, return_exceptions=True)
+
+    async def delete(self, name, chat=None):
+        from cat.rabbit_hole import engine
+
+        await delete(engine, self.rh, self.cat, chat, name)
+        self.files.pop((chat, name), None)
+        self.kept.discard((chat, name))
+
+    async def row(self, name, chat=None):
+        from cat.db.cruds import ingestions as crud_ingestions
+
+        return await crud_ingestions.get_status(self.agent, chat, name)
+
+    def graph_ok(self, name, chat=None, concepts=True):
+        """The source holds exactly the documents of its content and the graph derived from them."""
+        ids = self.store.scoped_doc_ids(name, FakeRabbitHole.collection(chat), chat)
+        if sorted(self.store.docs[d]["content"] for d in ids) != sorted(self.files[(chat, name)]):
+            return False
+        return self.store.actual_for(ids, name) == self.store.expected_for(ids, concepts)
+
+
+async def current_tags(rabbit_hole, cat):
+    """The current tag of every phase of the agent (what the core's automatic resume compares the diaries with)."""
+    from cat.rabbit_hole import engine
+    from cat.rabbit_hole.phases import compute_tags
+
+    return await compute_tags(await engine.collect_phases(rabbit_hole, cat), cat)

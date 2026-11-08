@@ -285,7 +285,7 @@ class EntityExtractor:
 
         Long texts are split into contiguous segments (paragraph-aligned,
         each ≤ SPACY_MAX_SEGMENT_CHARS chars) processed together with a single
-        batched ``nlp.pipe`` call inside a worker thread — this keeps every
+        batched ``nlp.pipe`` call on the core's ingestion lane — this keeps every
         processed text far below spaCy's max_length guard (E088) while the
         entity/relation offsets stay global (per-segment local offsets are
         shifted by the segment's start offset).
@@ -298,9 +298,13 @@ class EntityExtractor:
         nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
 
         segments = _segment_text(text)
-        # nlp.pipe is blocking CPU work (like the previous nlp(text)); the
-        # generator is consumed inside the worker thread, never in the loop.
-        pairs = await asyncio.to_thread(_run_segment_pipe, nlp, segments, SPACY_PIPE_BATCH_SIZE)
+        # nlp.pipe is blocking CPU work, part of an ingestion: it runs on the
+        # core's ingestion lane (de-prioritized threads, never competing on
+        # equal terms with the chats); the generator is consumed there, never
+        # in the loop. A chat message is analysed by ``extract_doc`` instead.
+        from cat.rabbit_hole import run_in_ingestion_executor
+
+        pairs = await run_in_ingestion_executor(_run_segment_pipe, nlp, segments, SPACY_PIPE_BATCH_SIZE)
 
         # Extract entities (global offsets: per-segment local + segment start)
         extracted_entities = []
