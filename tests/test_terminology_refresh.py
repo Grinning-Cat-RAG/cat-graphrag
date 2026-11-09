@@ -668,8 +668,6 @@ def main():
     _pkg.__path__ = [REPO_ROOT]
     sys.modules["catgraphrag_tertest"] = _pkg
 
-    global graphrag_handler, main, entity_extractor, models
-
     tests = [
         test_hook_ignores_other_vector_databases,
         test_hook_ignores_unchanged_patterns,

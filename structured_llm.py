@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # the type hint only: nothing third-party is imported at module level (see above)
+    from pydantic import BaseModel
 
 
 class StructuredLLMError(Exception):
