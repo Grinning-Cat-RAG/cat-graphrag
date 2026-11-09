@@ -34,6 +34,9 @@ if __name__ == "__main__":
     import graph_fakes as gf
 
     main_mod, handler_mod, _ = gf.bootstrap("_graphrag_concepts")
+    import importlib
+
+    jobs_mod = importlib.import_module("_graphrag_concepts.background_jobs")
 
     from cat.db.database import get_async_db
 
@@ -80,7 +83,7 @@ if __name__ == "__main__":
     async def agent_for_recompute(tenant):
         return await PODS[tenant].agent_for_job(tenant)
 
-    main_mod._agent_for_recompute = agent_for_recompute
+    jobs_mod.load_agent = agent_for_recompute
 
     HELD = []  # every Event a test holds a recompute on: released whatever the test's outcome
 
@@ -88,7 +91,7 @@ if __name__ == "__main__":
         """Wait for the background recomputes, bounded: a test failing while a job waits must not hang the run."""
         for event in HELD:
             event.set()
-        jobs = list(main_mod._concept_jobs)
+        jobs = list(jobs_mod.JOBS)
         if jobs:
             await asyncio.wait(jobs, timeout=10)
 

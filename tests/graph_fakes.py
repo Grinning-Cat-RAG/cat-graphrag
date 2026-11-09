@@ -35,6 +35,30 @@ class StubVectorMemoryType(str):
     PROCEDURAL = "procedural"
 
 
+def install_ingestion_registry_stub():
+    """For the harnesses that stub the core: ``cat.db.cruds.ingestions`` answering that the source's ingestion is
+    writing (row ``processing`` on the embedding phase), the case those harnesses exercise: the points of a write
+    start the extraction tasks the spaCy phase joins."""
+    import sys
+
+    db = sys.modules.setdefault("cat.db", types.ModuleType("cat.db"))
+    db.__path__ = getattr(db, "__path__", [])
+    cruds = sys.modules.setdefault("cat.db.cruds", types.ModuleType("cat.db.cruds"))
+    cruds.__path__ = getattr(cruds, "__path__", [])
+    ingestions = types.ModuleType("cat.db.cruds.ingestions")
+
+    async def get_status(agent_id, chat_id, source):
+        return {"source": source, "chat_id": chat_id, "status": "processing", "phase": "embedding"}
+
+    async def reset_phase_entries(agent_id, chat_id, source, phase_ids):
+        return True
+
+    ingestions.get_status = get_status
+    ingestions.reset_phase_entries = reset_phase_entries
+    cruds.ingestions = ingestions
+    sys.modules["cat.db.cruds.ingestions"] = ingestions
+
+
 def bootstrap(package_name):
     """Prepare the REAL core (env vars, Redis on localhost) and load the plugin as ``package_name``.
 

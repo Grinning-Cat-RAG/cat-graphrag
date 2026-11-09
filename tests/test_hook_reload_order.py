@@ -349,8 +349,9 @@ def test_settings_hook_schedules_recompute_after_reload_order():
     main._concept_recompute_job.assert_called_once_with("agent_reload_test", "gen_new")
     # held by the plugin, not by the request's handler: the request's agent closes that handler when it ends
     assert handler._pending_entity_tasks == [], "the job is tied to the request's handler"
-    assert len(main._concept_jobs) == 1 and "done_callback" in captured, "the scheduled job is not held"
-    main._concept_jobs.clear()
+    jobs = importlib.import_module(f"{PKG}.background_jobs").JOBS
+    assert len(jobs) == 1 and "done_callback" in captured, "the scheduled job is not held"
+    jobs.clear()
 
 
 def test_settings_hook_skips_when_no_concept_change():

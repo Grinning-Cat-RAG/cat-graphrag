@@ -123,6 +123,9 @@ def _install_cat_stub():
 
     models_mod.VectorMemoryType = StubVectorMemoryType
     sys.modules["cat.services.memory.models"] = models_mod
+    from graph_fakes import install_ingestion_registry_stub
+
+    install_ingestion_registry_stub()  # the core's state registry: the writes are the ingestion's
 
 
 def _install_neo4j_stub():

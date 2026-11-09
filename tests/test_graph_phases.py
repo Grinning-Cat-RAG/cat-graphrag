@@ -305,15 +305,13 @@ if __name__ == "__main__":
                 env.store.embedders_used
             )
 
-    async def test_transfer_to_graphrag_rebuilds_every_source():
-        """Switching an agent to GraphRAG: once the points are transferred, every source runs its graph phases
-        again on the agent's handler — also a source that failed while the transfer was running, and a source whose
-        diary still holds the graph tags of a previous GraphRAG period."""
+    async def test_transfer_to_graphrag_brings_every_source_up_to_date():
+        """Once the points are transferred to GraphRAG, the hook brings every source up to date under its lock, with
+        no invalidation: the transfer's writes already made the graph phases due (test_outside_writes.py), so a
+        source already rebuilt is not rebuilt twice."""
         async with Env() as env:
             await env.upload("a.pdf", ["Alice met Bob"])
             await env.upload("c.pdf", ["Carol saw Dave"], chat="chat-1")
-            env.store.fail_writes = 1
-            await env.upload("b.pdf", ["Erin met Frank"])  # failed during the transfer window
             reruns = []
 
             class Hole:
@@ -322,14 +320,12 @@ if __name__ == "__main__":
                     return await gf.rerun(engine, env.rh, cat, chat_id, name, invalidate=invalidate)
 
             env.cat.rabbit_hole = Hole()
+            writes = len(env.store.writes)
             hook = getattr(main.after_vector_memory_transfer_on_agent, "function", main.after_vector_memory_transfer_on_agent)
             await hook(True, env.cat)
-            assert sorted(reruns) == sorted([
-                ("a.pdf", None, (SPACY,)), ("b.pdf", None, (SPACY,)), ("c.pdf", "chat-1", (SPACY,)),
-            ]), reruns
-            for name, chat in (("a.pdf", None), ("b.pdf", None), ("c.pdf", "chat-1")):
-                row = await crud_ingestions.get_status(env.agent, chat, name)
-                assert row["status"] == "completed", (name, row["status"])
+            assert sorted(reruns) == sorted([("a.pdf", None, ()), ("c.pdf", "chat-1", ())]), reruns
+            assert len(env.store.writes) == writes, "an up-to-date source was rebuilt again"
+            for name, chat in (("a.pdf", None), ("c.pdf", "chat-1")):
                 env.assert_current_graph(name, chat)
 
             reruns.clear()
@@ -373,11 +369,15 @@ if __name__ == "__main__":
 
     async def test_points_without_source_or_vector():
         async with Env() as env:
-            # a payload-only point (zero vector) still starts the extraction, without a similarity task
+            # a payload-only point (zero vector) of an ingestion still starts the extraction, without a similarity task
+            from cat.db.cruds import ingestions as crud_ingestions
+
+            await crud_ingestions.create_status(env.handler.agent_id, None, "z.pdf", type_="file")
+            await crud_ingestions.update_status(env.handler.agent_id, None, "z.pdf", status="processing", phase="embedding")
             await env.handler.add_points_to_tenant(gf.DECLARATIVE, [
                 PointStruct(id="z0", payload={"page_content": "Alice met Bob", "metadata": {"source": "z.pdf"}},
                             vector=[0.0, 0.0]),
-                # a point without a source is stored, but tracked under no source
+                # a point without a source is stored: no graph is built for it (no extraction), only its similarity
                 PointStruct(id="n0", payload={"page_content": "Carol", "metadata": {}}, vector=[1.0, 1.0]),
             ])
             tasks = env.handler._pending_source_tasks.get(("z.pdf", None)) or []

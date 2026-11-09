@@ -8,6 +8,7 @@ from cat import hook, RecallSettings, VectorDatabaseSettings
 from cat.log import log
 from cat.looking_glass.stray_cat import StrayCat
 
+from . import background_jobs
 from .graphrag_handler import Neo4jGraphRAGConfig, GraphRAGHandler
 from .entity_extractor import EntityExtractor
 
@@ -30,8 +31,6 @@ _CONCEPT_RECOMPUTE_LOCK_SECONDS = 2 * 60 * 60
 # may die, its lock then expires and the next check here starts the work.
 _concept_recheck_at: Dict[str, float] = {}
 _CONCEPT_RECHECK_SECONDS = 10 * 60
-# The running recomputes: held here, owned by no request (a request's agent closes its handler when it ends).
-_concept_jobs: set = set()
 
 
 @hook(priority=10)
@@ -228,26 +227,19 @@ async def after_vector_memory_transfer_on_agent(success: bool, cat) -> None:
 
 
 async def _rebuild_graph_after_transfer(cat) -> None:
-    """Run the graph phases of every source of the agent again, once its points are in GraphRAG.
+    """Bring the graph of every source of the agent up to date, once its points are in GraphRAG.
 
-    The transfer writes the points in the background, and nothing tells the
-    core's automatic resume to wait for it: meanwhile it may run the graph
-    phases on a partial store (a partial graph, or an ``error`` it never
-    retries), and a source whose diary still holds the graph tags of a
-    previous GraphRAG period would not run them at all. Invalidating the spaCy
-    phase (the LLM phase follows it) rebuilds every source, failed ones
-    included, under the lock of the source and on this handler, which also
-    joins the extraction tasks the transfer started. A failing source does not
-    stop the others.
+    The transfer writes the points outside any ingestion: each write already made the graph phases of its sources
+    due (``GraphRAGHandler._graph_routes``) and queued their rerun. This pass, under the lock of each source, is the
+    safety net once the whole transfer is done (e.g. the resume ran a graph phase on a store still being filled): a
+    source already rebuilt has nothing to do. No invalidation, so no source is rebuilt twice. A failing source does
+    not stop the others.
     """
     from cat.db.cruds import ingestions as crud_ingestions
-    from .phases import GRAPH_SPACY_PHASE
 
     for row in await crud_ingestions.list_statuses(cat.agent_key):
         try:
-            await cat.rabbit_hole.rerun_source(
-                cat, row["source"], row["chat_id"], invalidate=[GRAPH_SPACY_PHASE],
-            )
+            await cat.rabbit_hole.rerun_source(cat, row["source"], row["chat_id"])
         except Exception as e:  # noqa: BLE001 - the other sources still need their graph
             log.error(
                 f"[GraphRAG] Graph rebuild of '{row['source']}' after the transfer to GraphRAG failed: {e}"
@@ -336,17 +328,8 @@ def _schedule_concept_recompute(tenant: str, new_gen: str, why: str) -> None:
     """Start the recompute of the tenant's concepts to ``new_gen`` in background. The task belongs to no request (a
     request's agent shuts its handler down, cancelling the handler's tasks, as soon as the request ends): it is held
     here until it ends, and it loads an agent of its own."""
-    task = asyncio.create_task(_concept_recompute_job(tenant, new_gen))
-    _concept_jobs.add(task)
-    task.add_done_callback(_concept_jobs.discard)
+    background_jobs.start(_concept_recompute_job(tenant, new_gen))
     log.info(f"[GraphRAG] {why} for {tenant}: scheduled recompute to generation {new_gen[:12]}")
-
-
-async def _agent_for_recompute(tenant: str):
-    """The agent the recompute works on: loaded as a request loads it (its handler, its LLM), owned by the job."""
-    from cat.looking_glass.bill_the_lizard import BillTheLizard
-
-    return await BillTheLizard().get_cheshire_cat(tenant)
 
 
 async def _concept_recompute_job(tenant: str, new_gen: str) -> None:
@@ -372,7 +355,7 @@ async def _concept_recompute_job(tenant: str, new_gen: str) -> None:
             blocking_timeout=0.1,
         ):
             held = True
-            ccat = await _agent_for_recompute(tenant)
+            ccat = await background_jobs.load_agent(tenant)
             handler = getattr(ccat, "vector_memory_handler", None)
             if not isinstance(handler, _GH):
                 log.info(f"[GraphRAG] Concept recompute of {tenant}: the agent is gone or not on GraphRAG anymore")

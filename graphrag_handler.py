@@ -27,6 +27,7 @@ try:
 except ImportError:
     distributed_lock = None
 
+from . import background_jobs
 from .batched_delete import delete_in_batches
 from .entity_extractor import EntityExtractor
 from .epoch import EpochMixin
@@ -234,6 +235,92 @@ def provenance_key(source: str, chat_id: Optional[str] = None) -> str:
     A file with the same name in the knowledge base and in a chat are two sources: deleting one never strips the
     other's provenance."""
     return source if chat_id is None else f"{_CHAT_PROVENANCE_PREFIX}{chat_id}:{source}"
+
+
+_ROUTE_PHASE, _ROUTE_RESUME, _ROUTE_JOB = "phase", "resume", "job"
+_ROUTE_SIMILARITY, _ROUTE_NONE = "similarity", "none"
+# The LLM phase may answer not_ready (a transient LLM failure): retried within the budget of the phase.
+_GRAPH_JOB_NOT_READY_BUDGET_SECONDS = 300.0
+
+
+def _route_key(metadata: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """The source of a point: its name and its chat (a file with the same name in the knowledge base and in a chat
+    are two sources)."""
+    return metadata.get("source"), metadata.get("chat_id")
+
+
+# The graph work of the writes made outside an ingestion, per tenant: (collection, source, chat) -> its route. One
+# worker per tenant in this process goes through it, one source at a time, on one agent it loads: a burst of writes
+# to the same source is rebuilt once, and the work never piles up in parallel.
+_outside_work: Dict[str, Dict[Tuple[str, str, Optional[str]], str]] = {}
+_outside_workers: Dict[str, asyncio.Task] = {}
+
+
+def _schedule_outside_work(tenant: str, collection_name: str, source: str, chat_id: Optional[str], route: str) -> None:
+    _outside_work.setdefault(tenant, {})[(collection_name, source, chat_id)] = route
+    worker = _outside_workers.get(tenant)
+    if worker is None or worker.done():
+        _outside_workers[tenant] = background_jobs.start(_outside_worker(tenant))
+
+
+async def _outside_worker(tenant: str) -> None:
+    """Build the graph of the sources written outside their ingestion (see ``GraphRAGHandler._graph_routes``):
+
+    - a source with a state row (e.g. cloned, completed or in error): the core's ``rerun_source``, which runs its graph
+      phases (made due by the write) under the source's lock and records them;
+    - a source without one (e.g. a memory dump, the memory API): the work of its graph phases, under the core's lock
+      of the source (one at a time across the pods, and never together with an ingestion of that name). It is left
+      to the ingestion when the source got a row meanwhile.
+
+    Best effort for the row-less sources: there is no state to resume them from if the pod dies meanwhile.
+    """
+    ccat = handler = None
+    try:
+        while _outside_work.get(tenant):
+            (collection_name, source, chat_id), route = _outside_work[tenant].popitem()
+            try:
+                if ccat is None:
+                    ccat = await background_jobs.load_agent(tenant)
+                    handler = getattr(ccat, "vector_memory_handler", None)
+                if not isinstance(handler, GraphRAGHandler):
+                    log.info(f"[GraphRAG] Graph of the writes of {tenant} not built: gone, or not on GraphRAG")
+                    _outside_work.pop(tenant, None)
+                    return
+                if route == _ROUTE_RESUME:
+                    await ccat.rabbit_hole.rerun_source(ccat, source, chat_id)
+                else:
+                    await _build_rowless_source(ccat, handler, tenant, collection_name, source, chat_id)
+            except Exception as e:  # noqa: BLE001 - one source failing does not stop the others
+                log.error(f"[GraphRAG] Graph of '{source}' ({tenant}) failed: {e}")
+    finally:
+        if _outside_workers.get(tenant) is asyncio.current_task():
+            _outside_workers.pop(tenant, None)
+
+
+async def _build_rowless_source(
+    ccat, handler: "GraphRAGHandler", tenant: str, collection_name: str, source: str, chat_id: Optional[str],
+) -> None:
+    from cat.db.cruds import ingestions as crud_ingestions
+    from cat.rabbit_hole import engine
+    from cat.rabbit_hole.phases import IngestionSource
+    from cat.utils import is_url
+
+    async with engine.source_lock(IngestionSource(tenant, chat_id, source, "url" if is_url(source) else "file")):
+        if await crud_ingestions.get_status(tenant, chat_id, source) is not None:
+            return  # it got a state meanwhile: its ingestion owns its graph
+        spacy = await handler.run_spacy_extraction_phase(source, collection_name, chat_id)
+        if spacy.get("status") != "done":
+            log.error(f"[GraphRAG] Graph of '{source}' ({tenant}) not built: {spacy.get('reason')}")
+            return
+        started = asyncio.get_running_loop().time()
+        while True:
+            concepts = await handler.run_llm_extraction_phase(source, collection_name, chat_id, cat=ccat)
+            waited = asyncio.get_running_loop().time() - started
+            if concepts.get("status") != "not_ready" or waited > _GRAPH_JOB_NOT_READY_BUDGET_SECONDS:
+                break
+            await asyncio.sleep(concepts.get("retry_after") or 5)
+        if concepts.get("status") not in ("done", "skipped"):
+            log.error(f"[GraphRAG] Concepts of '{source}' ({tenant}) not built: {concepts.get('reason')}")
 
 
 def _stored_metadata(raw: Any) -> Dict:
@@ -1355,14 +1442,25 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         metadata: Dict = None,
         id_point: str | None = None,
         point_index: int | None = None,
+        route: Optional[str] = None,
         **kwargs,
     ) -> PointStruct | None:
         """
         Adds a document:
         - Creates a Document node with embedding
-        - Starts entity extraction in the background
+        - Starts the extraction and the similarity edges in the background when the source's ingestion is writing it
+          (``route``, decided by ``add_points_to_tenant``: see ``_graph_routes``); called alone (e.g. the memory API),
+          the point is routed here as a write of its own
         """
         await self._ensure_connected()
+        routes = None
+        if route is None:
+            routes = await self._graph_routes(collection_name, [metadata or {}])
+            route = routes[_route_key(metadata or {})]
+        # outside an ingestion the work goes to the graph phases (resume) or to a job, which both rebuild the
+        # extraction AND the similarity edges: tasks here would die with the request's handler, unjoined
+        extract = route == _ROUTE_PHASE
+        similarity = route in (_ROUTE_PHASE, _ROUTE_SIMILARITY)
 
         point_id = id_point or str(uuid.uuid4())
 
@@ -1472,7 +1570,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Start entity extraction in the background, whatever the vector: a
         # payload-only document (zero/empty vector, e.g. an image under a
         # non-multimodal embedder) still builds the graph.
-        if self._enable_entity_extraction and self._entity_extractor:
+        if extract and self._enable_entity_extraction and self._entity_extractor:
             # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
             # chunk of the source may extract in parallel. It returns the
             # extracted batch; the source's ONE write happens in the spaCy
@@ -1489,7 +1587,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Create SIMILAR_TO relationships in the background (tracked for clean shutdown)
         # Only when the vector is valid: a zero/non-finite vector would produce
         # meaningless (or failing) vector-similarity edges.
-        if vector_valid:
+        if vector_valid and similarity:
             # Same detached-context rule as entity extraction above.
             # Named so ``_gather_source_tasks`` can tell a similarity failure
             # (no extraction product lost) from an extraction failure.
@@ -1510,6 +1608,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # released when its phase takes it (pop), at close(), or when the source
         # is explicitly deleted/purged (``_drop_source_tasks``).
         self._pending_entity_tasks = [t for t in self._pending_entity_tasks if not t.done()]
+
+        if routes is not None:
+            await self._after_outside_writes(collection_name, routes)
 
         return PointStruct(
             id=point_id,
@@ -2519,14 +2620,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if points:
             await self._ensure_current_embedder()
 
+        routes = await self._graph_routes(collection_name, [(p.payload or {}).get("metadata") or {} for p in points])
         for index, point in enumerate(points):
+            metadata = point.payload.get("metadata", {})  # type: ignore[union-attr]
             await self.add_point_to_tenant(
                 collection_name,
                 point.payload.get("page_content", ""),  # type: ignore[arg-type]
                 point.vector,
-                point.payload.get("metadata", {}),  # type: ignore[arg-type]
+                metadata,  # type: ignore[arg-type]
                 str(point.id),
                 point_index=index,
+                route=routes[_route_key(metadata or {})],
             )
 
         # Derived structure graph (SourceFile / NEXT / Section / ...). The
@@ -2540,7 +2644,68 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         for source, src_points in sources.items():
             await self.create_derived_graph_for_source(source, src_points)
 
+        await self._after_outside_writes(collection_name, routes)
         return UpdateResult(status="completed", operation_id=operation_id)
+
+    async def _graph_routes(
+        self, collection_name: str, metadatas: List[Dict]
+    ) -> Dict[Tuple[Optional[str], Optional[str]], str]:
+        """How the graph of each source of a write gets built, by the source's state row (core
+        ``cat.db.cruds.ingestions``):
+
+        - the source's ingestion is writing (row ``processing`` on the embedding phase): ``_ROUTE_PHASE``, the
+          extraction tasks the spaCy phase joins;
+        - the source has a row but no ingestion runs (e.g. a cloned agent, completed or in error, a vector-database
+          transfer): ``_ROUTE_RESUME``, its graph phases are made due and the plugin's worker reruns them through the
+          core (the automatic resume covers a completed row if the pod dies first);
+        - no row (e.g. a memory dump, ``store_documents``, the memory API, whose source is the user by default):
+          ``_ROUTE_JOB``, the worker rebuilds the graph of the whole source (a burst of writes once);
+        - no source (no graph phase ever runs for it): ``_ROUTE_SIMILARITY``, its similarity edges only;
+        - the procedures (not knowledge, never in the graph): ``_ROUTE_NONE``, nothing.
+        """
+        from cat.db.cruds import ingestions as crud_ingestions
+
+        routes: Dict[Tuple[Optional[str], Optional[str]], str] = {}
+        for metadata in metadatas:
+            key = _route_key(metadata)
+            if key in routes:
+                continue
+            if collection_name == str(VectorMemoryType.PROCEDURAL):
+                routes[key] = _ROUTE_NONE
+                continue
+            if key[0] is None:
+                routes[key] = _ROUTE_SIMILARITY
+                continue
+            row = await crud_ingestions.get_status(self.agent_id, key[1], key[0])
+            if row is None:
+                routes[key] = _ROUTE_JOB
+            elif row.get("status") == "processing" and row.get("phase") == "embedding":
+                routes[key] = _ROUTE_PHASE
+            else:
+                routes[key] = _ROUTE_RESUME
+        return routes
+
+    async def _after_outside_writes(
+        self, collection_name: str, routes: Dict[Tuple[Optional[str], Optional[str]], str]
+    ) -> None:
+        """Get the graph of the sources written outside their ingestion built (see ``_graph_routes``)."""
+        for (source, chat_id), route in routes.items():
+            if route == _ROUTE_RESUME:
+                from cat.db.cruds import ingestions as crud_ingestions
+
+                from .phases import GRAPH_LLM_PHASE, GRAPH_SPACY_PHASE
+
+                # state first: if this pod dies before the rebuild, the automatic resume finds the phases due
+                try:
+                    await crud_ingestions.reset_phase_entries(
+                        self.agent_id, chat_id, source, [GRAPH_SPACY_PHASE, GRAPH_LLM_PHASE],
+                    )
+                except Exception as e:  # noqa: BLE001 - the points are stored: their graph waits for a later rebuild
+                    log.warning(f"[GraphRAG] Could not make the graph of '{source}' due again: {e}")
+                    continue
+                _schedule_outside_work(self.agent_id, collection_name, source, chat_id, route)
+            elif route == _ROUTE_JOB:
+                _schedule_outside_work(self.agent_id, collection_name, source, chat_id, route)
 
     async def _system_embedder(self) -> Optional[Embeddings]:
         """The embedder of the system (embedders are system-level), or None when it cannot be resolved."""

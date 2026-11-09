@@ -1,7 +1,7 @@
 """Stateful property test of the graph phases on the REAL ingestion engine of the core.
 
 A generator (hypothesis ``RuleBasedStateMachine``) explores sequences of operations on the sources of one agent —
-upload / re-upload with new content, deletion, an embedder change (embedding invalidated), a change of the spaCy
+upload / re-upload with new content, deletion, a write outside an ingestion without a state row (a memory dump), an embedder change (embedding invalidated), a change of the spaCy
 models, the concept toggle, the automatic resume — with injected faults: a Neo4j write failure, a transient LLM
 outcome, a crash of the worker in the middle of the spaCy phase followed by a restart (new handler, no task in
 memory). After every step it checks the business rules:
@@ -16,8 +16,10 @@ A file with the same name in the knowledge base and in a chat is part of the gen
 the RELATED_TO provenance of each is scoped (the name in the knowledge base, the chat and the name in a chat).
 
 ``--mutate llm-dependency`` (the LLM phase no longer depends on the spaCy one), ``--mutate no-purge`` (the spaCy
-phase no longer purges before writing) and ``--mutate name-only-provenance`` (the RELATED_TO provenance is the file
-name only, shared by the knowledge base and the chats) inject a wrong rule: the run must then FAIL, which proves the rules above
+phase no longer purges before writing), ``--mutate name-only-provenance`` (the RELATED_TO provenance is the file
+name only, shared by the knowledge base and the chats), ``--mutate outside-as-ingestion`` (a write outside an
+ingestion is treated as one: its extraction waits for a spaCy phase that never runs) and ``--mutate no-row-rebuild``
+(a source with a state row written outside an ingestion is not rebuilt) inject a wrong rule: the run must then FAIL, which proves the rules above
 catch it.
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout and a Redis Stack on
@@ -38,7 +40,11 @@ if __name__ == "__main__":
     import graph_fakes as gf
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mutate", choices=["llm-dependency", "no-purge", "name-only-provenance"], default=None)
+    parser.add_argument(
+        "--mutate",
+        choices=["llm-dependency", "no-purge", "name-only-provenance", "outside-as-ingestion", "no-row-rebuild"],
+        default=None,
+    )
     parser.add_argument("--examples", type=int, default=120)
     args = parser.parse_args()
 
@@ -55,6 +61,25 @@ if __name__ == "__main__":
         phases_mod.GraphConceptPhase.depends_on = ("embedding",)
     if args.mutate == "name-only-provenance":
         handler_mod.provenance_key = lambda source, chat_id=None: source
+    if args.mutate == "outside-as-ingestion":
+        real_routes = handler_mod.GraphRAGHandler._graph_routes
+
+        async def as_ingestion(self, collection_name, metadatas):
+            routes = await real_routes(self, collection_name, metadatas)
+            return {k: (handler_mod._ROUTE_PHASE if r == handler_mod._ROUTE_JOB else r) for k, r in routes.items()}
+
+        handler_mod.GraphRAGHandler._graph_routes = as_ingestion
+    if args.mutate == "no-row-rebuild":
+        real_after = handler_mod.GraphRAGHandler._after_outside_writes
+
+        async def no_row_rebuild(self, collection_name, routes):
+            await real_after(self, collection_name, {k: r for k, r in routes.items() if r != handler_mod._ROUTE_RESUME})
+
+        handler_mod.GraphRAGHandler._after_outside_writes = no_row_rebuild
+
+    import importlib
+
+    jobs_mod = importlib.import_module("_graphrag_stateful.background_jobs")
 
     LOOP = asyncio.new_event_loop()
 
@@ -62,6 +87,8 @@ if __name__ == "__main__":
         return LOOP.run_until_complete(coro)
 
     SOURCES = [("a.pdf", None), ("b.pdf", None), ("c.pdf", "chat-1"), ("a.pdf", "chat-1")]
+    # sources written outside an ingestion, without a state row (e.g. a memory dump, a point of the memory API)
+    ROWLESS = [("dump.json", None), ("note", "chat-1")]
     WORDS = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace"]
     # a fault in one operation out of four: rare enough that most operations complete and interleave
     RARE = st.sampled_from([False, False, False, True])
@@ -81,8 +108,17 @@ if __name__ == "__main__":
             self.models = {"en": "en_core_web_sm"}
             self.expected = {}  # (name, chat) -> "completed" | "error" | "processing"
             self.crash_next = False
+            self.rowless = {}  # (name, chat) -> whether the concepts were on when it was written
             self.cat = gf.FakeCat(self.agent, self._handler(), main)
             run(gf.create_agent(self.agent))
+
+            async def load_agent(tenant):  # the agent a background job loads: a new handler on the same graph, and
+                # the core's RabbitHole, as on every agent of the core
+                return gf.FakeAgentCat(
+                    self.agent, self._handler(), main, gf.core_rabbit_hole(self.files, PointStruct), set(),
+                )
+
+            jobs_mod.load_agent = load_agent
 
         def _handler(self):
             handler = self.store.install(
@@ -170,6 +206,54 @@ if __name__ == "__main__":
         def llm_transient(self):
             self.store.concept_outcomes = ["not_ready"]
 
+        @rule(source=st.sampled_from(ROWLESS), chunks=contents)
+        def rowless_write(self, source, chunks):
+            """Points written outside an ingestion, for a source without a state row: a background job builds its
+            graph (the request's handler closes at the end of the request)."""
+            name, chat = source
+            meta = {"source": name} | ({"chat_id": chat} if chat else {})
+            points = [
+                PointStruct(id=uuid.uuid4().hex, payload={"page_content": text, "metadata": meta | {"chunk_index": i}},
+                            vector=[1.0, float(i + 1)])
+                for i, text in enumerate(chunks)
+            ]
+            # the job is not awaited: the next operations interleave with it
+            run(self.cat.vector_memory_handler.add_points_to_tenant(gf.FakeRabbitHole.collection(chat), points))
+            self.rowless[source] = self.concepts
+
+        @rule()
+        def jobs_end(self):
+            jobs = list(jobs_mod.JOBS)
+            if jobs:
+                run(asyncio.wait(jobs, timeout=10))
+
+        @rule(data=st.data())
+        def written_again_outside_an_ingestion(self, data):
+            """A source with a state row whose points are written again outside any ingestion, its graph gone (what a
+            cloned agent or a transfer to GraphRAG sees): the graph phases are made due and rerun through the core.
+            Drawn among the sources completed or in error now (the state depends only on the previous operations)."""
+            candidates = sorted((k for k, v in self.expected.items() if v in ("completed", "error")), key=str)
+            if not candidates:
+                return
+            source = data.draw(st.sampled_from(candidates))
+            name, chat = source
+            collection = gf.FakeRabbitHole.collection(chat)
+            handler = self.cat.vector_memory_handler
+            ids = self.store.scoped_doc_ids(name, collection, chat)
+            meta = {"source": name} | ({"chat_id": chat} if chat else {})
+            points = [
+                PointStruct(id=uuid.uuid4().hex, payload={"page_content": text, "metadata": meta | {"chunk_index": i}},
+                            vector=[1.0, float(i + 1)])
+                for i, text in enumerate(self.files[(chat, name)])
+            ]
+            run(handler.purge_source_graph_artifacts(name, collection, chat))
+            run(handler.delete_tenant_points_by_ids(collection, list(ids)))
+            run(handler.add_points_to_tenant(collection, points))
+            self.jobs_end()
+            row = run(crud_ingestions.get_status(self.agent, chat, name))
+            if row is not None:
+                self.expected[source] = row["status"]
+
         @rule()
         def restart(self):
             """The process restarts: a new handler on the same graph, nothing in memory; then the resume."""
@@ -220,6 +304,18 @@ if __name__ == "__main__":
                     continue
                 assert not self.store.scoped_doc_ids(name, gf.FakeRabbitHole.collection(chat), chat), name
                 assert not self.store.related_of(name, chat), (name, chat, self.store.related_of(name, chat))
+
+        @invariant()
+        def sources_without_a_row_hold_their_graph(self):
+            """Built by the job with the settings of its time (no state: a later change of the settings does not
+            rebuild them, by design)."""
+            if not hasattr(self, "agent") or jobs_mod.JOBS:
+                return  # checked once their jobs ended
+            for (name, chat), concepts in self.rowless.items():
+                ids = self.store.scoped_doc_ids(name, gf.FakeRabbitHole.collection(chat), chat)
+                actual = self.store.actual_for(ids, name, chat)
+                expected = self.store.expected_for(ids, concepts)
+                assert actual == expected, f"{name}: the graph of a source written outside an ingestion\n{actual}\n!=\n{expected}"
 
         @invariant()
         def no_orphan_tasks(self):
