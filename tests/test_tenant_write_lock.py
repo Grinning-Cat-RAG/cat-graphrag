@@ -53,12 +53,18 @@ if __name__ == "__main__":
     cat_pkg.log = cat_log
 
     # ── Stub ``cat.db.crud`` with an in-process Redis-like lock ────────────
-    # Mirrors ``cat.db.crud.distributed_lock``: an async context manager keyed
-    # by a pattern, with a blocking-acquisition timeout that raises LockError.
+    # Mirrors ``cat.db.crud.distributed_lock`` (a redis-py Lock): an async context
+    # manager keyed by a pattern, polling a busy lock until ``blocking_timeout``
+    # (then LockError); the lock EXPIRES after ``timeout`` unless extended, and
+    # another writer can take it then; ``extend`` fails once the lock is lost.
     class LockError(Exception):
         """Stand-in for ``redis.exceptions.LockError`` re-exported by crud."""
 
-    _locks = {}
+    class LockNotOwnedError(LockError):
+        """Stand-in for ``redis.exceptions.LockNotOwnedError``."""
+
+    _owners = {}  # key -> [token, expires_at]
+    _extensions = []
     _active = {}
     _max_active = {}
     _acquisitions = {}
@@ -67,17 +73,34 @@ if __name__ == "__main__":
     _events = []
     _guard = asyncio.Lock()
 
+    class _RedisLock:
+        def __init__(self, key, token):
+            self.key, self.token = key, token
+
+        async def extend(self, additional_time, replace_ttl=False):
+            now = asyncio.get_running_loop().time()
+            owner = _owners.get(self.key)
+            if owner is None or owner[0] is not self.token or owner[1] <= now:
+                raise LockNotOwnedError(f"lock '{self.key}' lost")
+            owner[1] = now + additional_time if replace_ttl else owner[1] + additional_time
+            _extensions.append(self.key)
+
     @asynccontextmanager
     async def distributed_lock(key_pattern, timeout=10.0, blocking_timeout=15.0):
         global _total_active, _max_total_active
-        async with _guard:
-            lock = _locks.setdefault(key_pattern, asyncio.Lock())
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=blocking_timeout)
-        except asyncio.TimeoutError:
-            raise LockError(
-                f"Could not acquire lock '{key_pattern}' within {blocking_timeout}s"
-            )
+        loop = asyncio.get_running_loop()
+        token = object()
+        deadline = loop.time() + blocking_timeout
+        while True:
+            owner = _owners.get(key_pattern)
+            if owner is None or owner[1] <= loop.time():  # free, or expired
+                _owners[key_pattern] = [token, loop.time() + timeout]
+                break
+            if loop.time() >= deadline:
+                raise LockError(
+                    f"Could not acquire lock '{key_pattern}' within {blocking_timeout}s"
+                )
+            await asyncio.sleep(0.01)
         async with _guard:
             _active[key_pattern] = _active.get(key_pattern, 0) + 1
             _max_active[key_pattern] = max(
@@ -88,13 +111,15 @@ if __name__ == "__main__":
             _max_total_active = max(_max_total_active, _total_active)
             _events.append(("acquire", key_pattern))
         try:
-            yield
+            yield _RedisLock(key_pattern, token)
         finally:
             async with _guard:
                 _active[key_pattern] -= 1
                 _total_active -= 1
                 _events.append(("release", key_pattern))
-            lock.release()
+            owner = _owners.get(key_pattern)
+            if owner is not None and owner[0] is token:
+                del _owners[key_pattern]
 
     cat_db = types.ModuleType("cat.db")
     cat_db_crud = types.ModuleType("cat.db.crud")
@@ -125,7 +150,8 @@ if __name__ == "__main__":
 
     def reset():
         global _total_active, _max_total_active
-        _locks.clear()
+        _owners.clear()
+        _extensions.clear()
         _active.clear()
         _max_active.clear()
         _acquisitions.clear()
@@ -369,6 +395,70 @@ if __name__ == "__main__":
         )
         print(f"(f) PASS  fallback lock serialises with a pre-initialised dict, order={order}")
 
+    # ── (g) a write longer than the lock timeout keeps the lock ───────────
+    async def test_g_a_long_write_keeps_the_lock():
+        """A write longer than CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS (e.g. the
+        removal of a large old graph) renews the lock while it runs: a writer of
+        another pod waiting meanwhile never enters before it ends."""
+        reset()
+        os.environ["CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS"] = "0.3"
+        try:
+            holder_ready = asyncio.Event()
+            order = []
+
+            async def long_write():
+                async with twl.acquire_tenant_write_lock(_Handler("tenant-g"), "tenant-g", "long write"):
+                    holder_ready.set()
+                    order.append("long-start")
+                    await asyncio.sleep(1.0)  # three lock timeouts
+                    order.append("long-end")
+
+            async def other_pod():
+                await asyncio.wait_for(holder_ready.wait(), 5)
+                # another pod: its own process, so its own local gate
+                twl._GATES.clear()
+                try:
+                    async with twl.acquire_tenant_write_lock(_Handler("tenant-g"), "tenant-g", "other write"):
+                        order.append("other")
+                except twl.TenantWriteLockTimeout:
+                    order.append("other-timeout")
+
+            await asyncio.wait_for(asyncio.gather(long_write(), other_pod()), 10)
+            _check(_max_active.get("graph-write:tenant-g", 0) == 1, f"(g) two writers inside the lock: {order}")
+            _check("other" not in order[:order.index("long-end")], f"(g) the other write entered meanwhile: {order}")
+            _check(_extensions, "(g) the lock was never renewed")
+            print(f"(g) PASS  a long write renewed its lock ({len(_extensions)} renewals), order={order}")
+        finally:
+            os.environ.pop("CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS", None)
+
+    # ── (h) a failed renewal is retried; a lost lock is not renewed anymore ─
+    async def test_h_failed_and_lost_renewals():
+        reset()
+        os.environ["CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS"] = "0.3"
+        real_extend = _RedisLock.extend
+        calls = []
+
+        async def flaky_extend(self, additional_time, replace_ttl=False):
+            calls.append(self.key)
+            if len(calls) == 1:
+                raise RuntimeError("redis timeout")  # a missed beat
+            if len(calls) == 2:
+                return await real_extend(self, additional_time, replace_ttl)
+            _owners.pop(self.key, None)  # Redis restarted: the lock is gone
+            return await real_extend(self, additional_time, replace_ttl)
+
+        _RedisLock.extend = flaky_extend
+        try:
+            async with twl.acquire_tenant_write_lock(_Handler("tenant-h"), "tenant-h", "long write"):
+                await asyncio.sleep(0.6)  # beats at 0.1 (fails), 0.2 (renews), 0.3 (lost), then none
+            _check(len(calls) == 3, f"(h) renewals after the lock was lost: {calls}")
+            _check(any("Renewal" in w and "failed" in w for w in warnings_logged), f"(h) {warnings_logged}")
+            _check(any("lost while held" in w for w in warnings_logged), f"(h) {warnings_logged}")
+            print("(h) PASS  a failed renewal was retried; a lost lock was logged and not renewed anymore")
+        finally:
+            _RedisLock.extend = real_extend
+            os.environ.pop("CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS", None)
+
     # ── Runner ────────────────────────────────────────────────────────────
     async def _run_all():
         await test_a_same_tenant_never_overlaps()
@@ -377,6 +467,8 @@ if __name__ == "__main__":
         await test_d_timeout_raises_and_blocks_write()
         await test_e_delete_serialises_against_write()
         await test_f_fallback_with_empty_lock_dict_serialises()
+        await test_g_a_long_write_keeps_the_lock()
+        await test_h_failed_and_lost_renewals()
 
     asyncio.run(_run_all())
-    print("\nALL 6 TENANT WRITE LOCK TESTS PASSED")
+    print("\nALL 8 TENANT WRITE LOCK TESTS PASSED")

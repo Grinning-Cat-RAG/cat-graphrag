@@ -18,7 +18,9 @@ Serialise ALL Neo4j writes for ONE tenant behind a single distributed lock::
     primitive: ``cat.db.crud.distributed_lock`` (Redis-backed, cross-worker)
     timeout  : ``CAT_GRAPH_WRITE_LOCK_TIMEOUT_SECONDS`` (default 300 s), used as
                both the lock's auto-release TTL and its acquisition blocking
-               timeout.
+               timeout. A heartbeat renews the TTL every third of it while the
+               write runs, so a write longer than the timeout keeps the lock; a
+               writer that dies releases it within the timeout.
 
 No raw Redis is used: the sanctioned ``cat.db.crud.distributed_lock`` helper is
 the only locking primitive. The key embeds the tenant id, so different tenants
@@ -69,6 +71,7 @@ failure/retry.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import functools
 import inspect
@@ -258,12 +261,16 @@ async def acquire_tenant_write_lock(
             await asyncio.sleep(min(_YIELD_SECONDS, max(0.0, deadline - now)))
             gate.streak_since = loop.time()
         # no time left after the queue: a single try
-        async with distributed_lock(key, timeout=timeout, blocking_timeout=max(0.0, deadline - loop.time())):
+        async with distributed_lock(key, timeout=timeout, blocking_timeout=max(0.0, deadline - loop.time())) as lock:
             acquired = True
             token = GRAPH_WRITE_LOCK_HELD.set(held | {tenant_id})
+            heartbeat = asyncio.create_task(_renew_while_held(lock, key, timeout))
             try:
                 yield
             finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
                 GRAPH_WRITE_LOCK_HELD.reset(token)
     except _DistributedLockError as exc:
         if acquired:
@@ -281,6 +288,22 @@ async def acquire_tenant_write_lock(
         if not gate.waiting:  # nobody behind: the streak ends
             gate.streak_since = None
         gate.lock.release()
+
+
+async def _renew_while_held(lock: Any, key: str, timeout: float) -> None:
+    """The heartbeat of a held lock: its TTL is ``timeout``, so a write longer than that (e.g. the removal of a large
+    old graph) would lose it and let another pod in. It is renewed every third of the timeout until the body ends. A
+    failed renewal is retried at the next beat; a lock already lost (e.g. Redis restarted) is logged, and not
+    renewed anymore."""
+    while True:
+        await asyncio.sleep(timeout / 3)
+        try:
+            await lock.extend(timeout, replace_ttl=True)
+        except _DistributedLockError as exc:  # LockNotOwnedError: another writer may hold it now
+            log.warning(f"[GraphRAG] Tenant write lock '{key}' lost while held ({exc}); not renewed anymore")
+            return
+        except Exception as exc:  # noqa: BLE001 - retried at the next beat
+            log.warning(f"[GraphRAG] Renewal of the tenant write lock '{key}' failed: {exc}")
 
 
 def tenant_write_locked(operation: str | None = None):
