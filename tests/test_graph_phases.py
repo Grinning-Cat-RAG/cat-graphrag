@@ -305,32 +305,42 @@ if __name__ == "__main__":
                 env.store.embedders_used
             )
 
-    async def test_transfer_to_graphrag_brings_every_source_up_to_date():
-        """Once the points are transferred to GraphRAG, the hook brings every source up to date under its lock, with
-        no invalidation: the transfer's writes already made the graph phases due (test_outside_writes.py), so a
-        source already rebuilt is not rebuilt twice."""
+    async def test_transfer_to_graphrag_makes_every_graph_due():
+        """Once the points are transferred to GraphRAG, the hook makes the graph phases of every source due (knowledge
+        base and chats) under the lock of the source, and runs nothing: the automatic resume builds them after the
+        transfer (test_outside_writes.py). A failed transfer touches nothing (the core embeds everything again)."""
         async with Env() as env:
             await env.upload("a.pdf", ["Alice met Bob"])
             await env.upload("c.pdf", ["Carol saw Dave"], chat="chat-1")
-            reruns = []
+            calls = []
 
             class Hole:
-                async def rerun_source(self, cat, name, chat_id=None, blocking=True, invalidate=None):
-                    reruns.append((name, chat_id, tuple(invalidate or ())))
-                    return await gf.rerun(engine, env.rh, cat, chat_id, name, invalidate=invalidate)
+                """The core's invalidate_source (run for real in test_outside_writes.py): the phases and their
+                dependents (the LLM phase depends on the spaCy one) left to run again."""
+
+                async def invalidate_source(self, cat, name, chat_id=None, phase_ids=()):
+                    calls.append((name, chat_id, tuple(phase_ids)))
+                    return await crud_ingestions.reset_phase_entries(
+                        cat.agent_key, chat_id, name, [*phase_ids, phases_mod.GRAPH_LLM_PHASE],
+                    )
+
+                async def rerun_source(self, *args, **kwargs):
+                    calls.append(("rerun", args, kwargs))
 
             env.cat.rabbit_hole = Hole()
             writes = len(env.store.writes)
             hook = getattr(main.after_vector_memory_transfer_on_agent, "function", main.after_vector_memory_transfer_on_agent)
             await hook(True, env.cat)
-            assert sorted(reruns) == sorted([("a.pdf", None, ()), ("c.pdf", "chat-1", ())]), reruns
-            assert len(env.store.writes) == writes, "an up-to-date source was rebuilt again"
+            spacy = phases_mod.GRAPH_SPACY_PHASE
+            assert sorted(calls) == sorted([("a.pdf", None, (spacy,)), ("c.pdf", "chat-1", (spacy,))]), calls
+            assert len(env.store.writes) == writes, "the hook ran a graph phase within the transfer"
             for name, chat in (("a.pdf", None), ("c.pdf", "chat-1")):
-                env.assert_current_graph(name, chat)
+                diary = (await crud_ingestions.get_status(env.cat.agent_key, chat, name))["completed_phases"]
+                assert not {spacy, phases_mod.GRAPH_LLM_PHASE} & set(diary), (name, sorted(diary))
 
-            reruns.clear()
+            calls.clear()
             await hook(False, env.cat)  # a failed transfer touches nothing
-            assert reruns == []
+            assert calls == []
 
     async def test_no_system_embedder_keeps_the_injected_one():
         async with Env(enable_entity_embeddings=True) as env:

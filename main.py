@@ -227,22 +227,31 @@ async def after_vector_memory_transfer_on_agent(success: bool, cat) -> None:
 
 
 async def _rebuild_graph_after_transfer(cat) -> None:
-    """Bring the graph of every source of the agent up to date, once its points are in GraphRAG.
+    """Make the graph of every source of the agent due, once its points are in GraphRAG.
 
-    The transfer writes the points outside any ingestion: each write already made the graph phases of its sources
-    due (``GraphRAGHandler._graph_routes``) and queued their rerun. This pass, under the lock of each source, is the
-    safety net once the whole transfer is done (e.g. the resume ran a graph phase on a store still being filled): a
-    source already rebuilt has nothing to do. No invalidation, so no source is rebuilt twice. A failing source does
-    not stop the others.
+    The copy wrote the points outside any ingestion and left the rows alone (``GraphRAGHandler._after_outside_writes``:
+    a changed row would be embedded again by the core). The core has already embedded again, with the phases depending
+    on the embedding (the graph included), the rows in flight or updated since the start of the transfer; every other
+    row gets its graph phases due (its diary may claim them done: the agent was on GraphRAG before, on another graph),
+    under the lock of the source (``invalidate_source``: it waits for a worker on it). Nothing runs here: the agent is
+    in maintenance until the hook returns, and the automatic resume builds the graphs afterwards, across the pods and
+    surviving a restart. A failing source does not stop the others.
     """
     from cat.db.cruds import ingestions as crud_ingestions
 
+    from .phases import GRAPH_SPACY_PHASE
+
+    transfer = await crud_ingestions.get_vector_transfer(cat.agent_key)
+    since = transfer["since"] if transfer else None
     for row in await crud_ingestions.list_statuses(cat.agent_key):
+        if since is not None and (row.get("updated_at") or 0) >= since:
+            continue  # embedded again by the core, with its graph
         try:
-            await cat.rabbit_hole.rerun_source(cat, row["source"], row["chat_id"])
+            # the LLM phase depends on the spaCy one: invalidated with it
+            await cat.rabbit_hole.invalidate_source(cat, row["source"], row["chat_id"], [GRAPH_SPACY_PHASE])
         except Exception as e:  # noqa: BLE001 - the other sources still need their graph
             log.error(
-                f"[GraphRAG] Graph rebuild of '{row['source']}' after the transfer to GraphRAG failed: {e}"
+                f"[GraphRAG] Graph of '{row['source']}' not made due after the transfer to GraphRAG: {e}"
             )
 
 

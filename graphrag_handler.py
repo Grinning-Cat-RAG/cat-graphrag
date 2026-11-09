@@ -613,6 +613,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             "CREATE CONSTRAINT collection_unique IF NOT EXISTS FOR (c:Collection) REQUIRE (c.name, c.tenant_id) IS UNIQUE",
             # Composite index to speed up entity lookups by (tenant, name) without toLower() overhead
             "CREATE INDEX entity_name_idx IF NOT EXISTS FOR (e:Entity) ON (e.tenant_id, e.name)",
+            # The SourceFile of a source, found by its scoped key at every write of the source
+            "CREATE INDEX sourcefile_key_idx IF NOT EXISTS FOR (sf:SourceFile) ON (sf.tenant_id, sf.key)",
         ]
 
         for constraint in constraints:
@@ -2635,14 +2637,15 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         # Derived structure graph (SourceFile / NEXT / Section / ...). The
         # entity and concept graph is built by the graph phases (phases.py).
-        sources: Dict[str, List[PointStruct]] = {}
+        # a knowledge base file and a chat file with the same name are two sources: two structures
+        sources: Dict[Tuple[str, Optional[str]], List[PointStruct]] = {}
         for p in points:
             meta = (p.payload or {}).get("metadata", {}) or {}
             src = meta.get("source")
             if src:
-                sources.setdefault(src, []).append(p)
-        for source, src_points in sources.items():
-            await self.create_derived_graph_for_source(source, src_points)
+                sources.setdefault((src, meta.get("chat_id")), []).append(p)
+        for (source, chat_id), src_points in sources.items():
+            await self.create_derived_graph_for_source(source, src_points, chat_id)
 
         await self._after_outside_writes(collection_name, routes)
         return UpdateResult(status="completed", operation_id=operation_id)
@@ -2688,10 +2691,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     async def _after_outside_writes(
         self, collection_name: str, routes: Dict[Tuple[Optional[str], Optional[str]], str]
     ) -> None:
-        """Get the graph of the sources written outside their ingestion built (see ``_graph_routes``)."""
+        """Get the graph of the sources written outside their ingestion built (see ``_graph_routes``).
+
+        During a transfer to another vector database (recorded by the core) the sources with a row are left to the
+        transfer: a change of their row would make the core embed them again after the copy (it re-embeds the rows
+        updated since the start), and the transfer hook rebuilds their graph once the copy is done
+        (``main._rebuild_graph_after_transfer``)."""
+        from cat.db.cruds import ingestions as crud_ingestions
+
+        if any(route == _ROUTE_RESUME for route in routes.values()):
+            try:
+                transferring = await crud_ingestions.get_vector_transfer(self.agent_id) is not None
+            except Exception as e:  # noqa: BLE001 - not known: the graph is made due (worst case: embedded again)
+                log.warning(f"[GraphRAG] Could not read the vector transfer of {self.agent_id}: {e}")
+                transferring = False
+        else:
+            transferring = False
         for (source, chat_id), route in routes.items():
             if route == _ROUTE_RESUME:
-                from cat.db.cruds import ingestions as crud_ingestions
+                if transferring:
+                    continue
 
                 from .phases import GRAPH_LLM_PHASE, GRAPH_SPACY_PHASE
 
@@ -2861,34 +2880,38 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             await delete_in_batches(entity_ids, _prune_entities)
 
         async with self._get_session() as session:
-            result = await session.run(
-                """
-                MATCH (sf:SourceFile {tenant_id: $tenant_id})
-                WHERE NOT (sf)<-[:PART_OF]-()
-                RETURN sf.name AS name
-                """,
-                tenant_id=self.agent_id,
-            )
-            sourcefile_names = [
-                record["name"] async for record in result if record["name"] is not None
-            ]
-
-            async def _delete_sourcefiles(batch: List[str]) -> None:
-                await (
-                    await session.run(
-                        """
-                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
-                        WHERE sf.name IN $names
-                        DETACH DELETE sf
-                        """,
-                        names=batch,
-                        tenant_id=self.agent_id,
-                    )
-                ).consume()
-
-            await delete_in_batches(sourcefile_names, _delete_sourcefiles)
+            await self._sweep_orphan_source_files(session)
 
         return UpdateResult(status="completed", operation_id=operation_id)
+
+    async def _sweep_orphan_source_files(self, session) -> None:
+        """Delete the tenant's SourceFile nodes left without a piece (no PART_OF), by node: a knowledge base file and
+        a chat file with the same name have one node each, and only the orphan one goes. Bounded sequential batches;
+        the orphan condition is checked again when deleting (a piece may have been linked meanwhile)."""
+        result = await session.run(
+            cast(LiteralString, """
+            MATCH (sf:SourceFile {tenant_id: $tenant_id})
+            WHERE NOT (sf)<-[:PART_OF]-()
+            RETURN elementId(sf) AS sid
+            """),
+            tenant_id=self.agent_id,
+        )
+        orphan_ids = [record["sid"] async for record in result if record["sid"] is not None]
+
+        async def _delete(batch: List[str]) -> None:
+            await (
+                await session.run(
+                    cast(LiteralString, """
+                    MATCH (sf:SourceFile {tenant_id: $tenant_id})
+                    WHERE elementId(sf) IN $sids AND NOT (sf)<-[:PART_OF]-()
+                    DETACH DELETE sf
+                    """),
+                    sids=batch,
+                    tenant_id=self.agent_id,
+                )
+            ).consume()
+
+        await delete_in_batches(orphan_ids, _delete)
 
     async def _strip_provenance(
         self, session, key: Optional[str] = None, prefix: Optional[str] = None, knowledge_base: bool = False,
@@ -3181,32 +3204,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
             await delete_in_batches(orphan_entity_ids, _delete_orphan_entities)
 
-            result = await session.run(
-                """
-                MATCH (sf:SourceFile {tenant_id: $tenant_id})
-                WHERE NOT (sf)<-[:PART_OF]-()
-                RETURN sf.name AS name
-                """,
-                tenant_id=self.agent_id,
-            )
-            orphan_sourcefile_names = [
-                record["name"] async for record in result if record["name"] is not None
-            ]
-
-            async def _delete_orphan_sourcefiles(batch: List[str]) -> None:
-                await (
-                    await session.run(
-                        cast(LiteralString, """
-                        MATCH (sf:SourceFile {tenant_id: $tenant_id})
-                        WHERE sf.name IN $names
-                        DETACH DELETE sf
-                        """),
-                        names=batch,
-                        tenant_id=self.agent_id,
-                    )
-                ).consume()
-
-            await delete_in_batches(orphan_sourcefile_names, _delete_orphan_sourcefiles)
+            await self._sweep_orphan_source_files(session)
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
@@ -3860,6 +3858,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         self,
         source: str,
         stored_points: List[PointStruct],
+        chat_id: Optional[str] = None,
     ) -> None:
         """
         Create the document-structure graph of a source from its stored points.
@@ -3941,9 +3940,12 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             self, None, "create derived graph for source"
         ):
             async with self._get_session() as session:
-                # 1 — SourceFile node (idempotent)
+                # 1 — SourceFile node (idempotent), one per source: its key is the source's provenance key, so a
+                # knowledge base file and a chat file with the same name have one each (a node written before the
+                # key is swept once its pieces are replaced)
                 await session.run(
-                    "MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})",
+                    "MERGE (sf:SourceFile {key: $key, tenant_id: $tenant_id}) ON CREATE SET sf.name = $source",
+                    key=provenance_key(source, chat_id),
                     source=source,
                     tenant_id=tenant_id,
                 )
@@ -3953,11 +3955,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     """
                     UNWIND $point_ids AS pid
                     MATCH (d:Document {id: pid, tenant_id: $tenant_id})
-                    MERGE (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                    MATCH (sf:SourceFile {key: $key, tenant_id: $tenant_id})
                     MERGE (d)-[:PART_OF]->(sf)
                     """,
                     point_ids=point_ids,
-                    source=source,
+                    key=provenance_key(source, chat_id),
                     tenant_id=tenant_id,
                 )
 
@@ -4038,11 +4040,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     await session.run(
                         """
                         MATCH (card:Document {id: $card_id, tenant_id: $tenant_id})
-                        MATCH (sf:SourceFile {name: $source, tenant_id: $tenant_id})
+                        MATCH (sf:SourceFile {key: $key, tenant_id: $tenant_id})
                         MERGE (sf)-[:HAS_SUMMARY]->(card)
                         """,
                         card_id=catalogue_id,
-                        source=source,
+                        key=provenance_key(source, chat_id),
                         tenant_id=tenant_id,
                     )
 

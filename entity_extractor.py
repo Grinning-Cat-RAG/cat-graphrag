@@ -265,6 +265,11 @@ class EntityExtractor:
                 for model_name in self._models.values()
             ])
             self._nlps = dict(zip(self._models.keys(), nlps))
+            # langdetect loads its profiles lazily at the first detection, one at a time and unguarded: detections
+            # run in threads (the ingestion lane, a chat message), so the profiles are loaded once here, before any
+            from langdetect import detector_factory
+
+            await asyncio.to_thread(detector_factory.init_factory)
             self._initialized = True
 
     # ------------------------------------------------------------------
@@ -275,6 +280,11 @@ class EntityExtractor:
         if not self._initialized:
             await self.ensure_initialized()
 
+        # Blocking CPU work: in a thread of its own, so a long pasted text does not stop the other chats meanwhile;
+        # never on the ingestion lane, so the message does not wait behind an upload
+        return await asyncio.to_thread(self._analyse, text)
+
+    def _analyse(self, text: str) -> Doc:
         lang = self._detect_language(text)
         nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
         return nlp(text)
@@ -293,16 +303,17 @@ class EntityExtractor:
         if not self._initialized:
             await self.ensure_initialized()
 
-        # Process text with spaCy
-        lang = self._detect_language(text)
+        # The language detection and nlp.pipe are blocking CPU work, part of an
+        # ingestion: they run on the core's ingestion lane (de-prioritized
+        # threads, never competing on equal terms with the chats); the
+        # generator is consumed there, never in the loop. A chat message is
+        # analysed by ``extract_doc`` instead.
+        from cat.rabbit_hole import run_in_ingestion_executor
+
+        lang = await run_in_ingestion_executor(self._detect_language, text)
         nlp = self._nlps.get(lang, self._nlps["default"]) if lang else self._nlps["default"]
 
         segments = _segment_text(text)
-        # nlp.pipe is blocking CPU work, part of an ingestion: it runs on the
-        # core's ingestion lane (de-prioritized threads, never competing on
-        # equal terms with the chats); the generator is consumed there, never
-        # in the loop. A chat message is analysed by ``extract_doc`` instead.
-        from cat.rabbit_hole import run_in_ingestion_executor
 
         pairs = await run_in_ingestion_executor(_run_segment_pipe, nlp, segments, SPACY_PIPE_BATCH_SIZE)
 

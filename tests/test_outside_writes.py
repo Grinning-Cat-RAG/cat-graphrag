@@ -154,15 +154,19 @@ if __name__ == "__main__":
         assert w.graph_ok("user-1"), w.store.mentions
         await gf.destroy_agent(w.agent)
 
-    async def test_a_transfer_rebuilds_every_source_once():
-        """A transfer to GraphRAG: the points of the old store are written into the new one outside any ingestion.
-        Every source with a row (completed, or in error after a failure during the transfer window) is rebuilt by the
-        worker through the core; the transfer hook afterwards finds nothing left to do."""
+    async def test_a_transfer_leaves_the_rows_to_the_core_and_its_hook_rebuilds_every_source_once():
+        """A transfer to GraphRAG (the core records it and puts the agent in maintenance): the copy writes the points
+        outside any ingestion, and changes no row (a row updated since the start of the transfer is embedded again by
+        the core, with its graph) and starts no rebuild. The transfer hook then makes the graph phases due for every
+        source not touched since the start (completed, or in error), even if its row claims them done (the agent was
+        on GraphRAG before), and runs nothing: the automatic resume builds them once the transfer ends (distributed
+        across the pods, surviving a restart). A source the core embedded again is not rebuilt twice."""
         old = await new_world()
         await old.upload("a.pdf", ["Alice met Bob"])
         old.store.fail_writes = 1
         await old.upload("b.pdf", ["Erin met Frank"])  # its graph phase failed
         old.store.fail_writes = 0
+        await old.upload("c.pdf", ["Grace met Heidi"])
         assert (await old.row("b.pdf"))["status"] == "error"
         new_store = gf.FakeGraphStore()
         target = World(old.agent, main_mod, handler_mod, PointStruct)  # the agent, now on the new store
@@ -172,20 +176,82 @@ if __name__ == "__main__":
         target.handler = new_store.install(gf.make_handler(handler_mod, old.agent, enable_concept_relations=True))
         target.cat = gf.FakeAgentCat(old.agent, target.handler, main_mod, target.rh, target.kept)
         AGENTS[old.agent] = target
-        transferred = (await old.handler.get_all_tenant_points(gf.DECLARATIVE))[0]
-        await target.handler.add_points_to_tenant(gf.DECLARATIVE, [
-            PointStruct(id=p.id, payload=p.payload, vector=p.vector) for p in transferred
-        ])
-        await settle()
-        for name in ("a.pdf", "b.pdf"):
+        builds = []
+        real = handler_mod.GraphRAGHandler.run_spacy_extraction_phase
+
+        async def counting(self, source, collection_name, chat_id=None):
+            builds.append(source)
+            return await real(self, source, collection_name, chat_id)
+
+        handler_mod.GraphRAGHandler.run_spacy_extraction_phase = counting
+        try:
+            await crud_ingestions.start_vector_transfer(old.agent)
+            rows = {name: await target.row(name) for name in ("a.pdf", "b.pdf", "c.pdf")}
+            transferred = (await old.handler.get_all_tenant_points(gf.DECLARATIVE))[0]
+            await target.handler.add_points_to_tenant(gf.DECLARATIVE, [
+                PointStruct(id=p.id, payload=p.payload, vector=p.vector) for p in transferred
+            ])
+            await settle()
+            for name, row in rows.items():
+                assert await target.row(name) == row, f"the copy changed the row of {name}: the core re-embeds it"
+            assert not builds and not new_store.mentions, f"rebuilt during the copy: {builds}"
+            # c.pdf was updated during the transfer: the core embeds it again, with the phases depending on it
+            await target.rh.rerun_source(target.cat, "c.pdf", None, invalidate=["embedding"])
+            assert builds == ["c.pdf"] and target.graph_ok("c.pdf"), builds
+            hook = getattr(main_mod.after_vector_memory_transfer_on_agent, "function",
+                           main_mod.after_vector_memory_transfer_on_agent)
+            await hook(True, target.cat)
+            await settle()
+            assert builds == ["c.pdf"], f"the hook ran the graph phases within the transfer: {builds}"
+            for name in ("a.pdf", "b.pdf"):
+                assert not GRAPH_PHASES & set((await target.row(name))["completed_phases"]), name
+            await crud_ingestions.end_vector_transfer(old.agent)
+
+            async def get_cat(agent_id):
+                return target.cat
+
+            await recovery.resume_agent(types.SimpleNamespace(rabbit_hole=target.rh, get_cheshire_cat=get_cat), old.agent)
+        finally:
+            handler_mod.GraphRAGHandler.run_spacy_extraction_phase = real
+            await crud_ingestions.end_vector_transfer(old.agent)
+        for name in ("a.pdf", "b.pdf", "c.pdf"):
             row = await target.row(name)
             assert row["status"] == "completed" and target.graph_ok(name), (name, row["status"], new_store.mentions)
-        writes = len(new_store.writes)
+        assert sorted(builds) == ["a.pdf", "b.pdf", "c.pdf"], f"a source was rebuilt twice, or not at all: {builds}"
+        await gf.destroy_agent(old.agent)
+
+    async def test_a_transfer_hook_without_a_record_makes_every_graph_due():
+        """The hook with no record of the transfer (e.g. an older core): the graph of every source is made due."""
+        w = await new_world()
+        await w.upload("a.pdf", ["Alice met Bob"])
         hook = getattr(main_mod.after_vector_memory_transfer_on_agent, "function",
                        main_mod.after_vector_memory_transfer_on_agent)
-        await hook(True, target.cat)
-        assert len(new_store.writes) == writes, "the transfer rebuilt a source twice"
-        await gf.destroy_agent(old.agent)
+        await hook(True, w.cat)
+        assert not GRAPH_PHASES & set((await w.row("a.pdf"))["completed_phases"])
+        await gf.destroy_agent(w.agent)
+
+    async def test_a_write_whose_transfer_cannot_be_read_makes_the_graph_due():
+        """The record of the transfer cannot be read (Redis hiccup): the write makes the graph due, as without one."""
+        w = await new_world()
+        await w.upload("a.pdf", ["Alice met Bob"])
+        real = crud_ingestions.get_vector_transfer
+
+        async def broken(agent_id):
+            raise ConnectionError("redis down")
+
+        crud_ingestions.get_vector_transfer = broken
+        try:
+            points_ = (await w.handler.get_all_tenant_points(gf.DECLARATIVE))[0]
+            await w.handler.add_points_to_tenant(gf.DECLARATIVE, [
+                PointStruct(id=uuid.uuid4().hex, payload=p.payload, vector=p.vector) for p in points_
+            ])
+            for job in list(jobs_mod.JOBS):  # look at the state before the worker reruns it
+                job.cancel()
+            assert not GRAPH_PHASES & set((await w.row("a.pdf"))["completed_phases"])
+        finally:
+            crud_ingestions.get_vector_transfer = real
+        await settle()
+        await gf.destroy_agent(w.agent)
 
     async def test_a_burst_of_writes_to_a_source_without_a_row_is_built_once_and_whole():
         """The memory API in a loop (its source is the user by default): the writes queue the source once while the

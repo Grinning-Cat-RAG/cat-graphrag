@@ -50,6 +50,15 @@ silently skip acquisition; :func:`detached_write_task` clears the inherited
 state so the task takes the lock on its own instead of writing UNLOCKED after
 the parent releases.
 
+Handover
+--------
+``distributed_lock`` (redis-py) polls a busy lock every 100 ms. The writers of
+one process queue on a local gate per tenant (FIFO) and only the head of the
+queue waits on Redis: a handover inside the process is immediate, the polling
+is left to the contention between pods. A streak of local handovers pauses
+once a second for longer than a poll, so another pod is not starved. The
+timeout bounds the wait on both.
+
 Failure policy
 --------------
 On acquisition timeout the helper logs a WARNING naming the tenant and the
@@ -64,6 +73,7 @@ import contextvars
 import functools
 import inspect
 import os
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, Optional
 
@@ -92,6 +102,34 @@ GRAPH_WRITE_LOCK_TIMEOUT_DEFAULT = 300.0
 GRAPH_WRITE_LOCK_HELD: contextvars.ContextVar[FrozenSet[str]] = contextvars.ContextVar(
     "cat_graphrag_graph_write_lock_held", default=frozenset()
 )
+
+
+#: A streak of local handovers longer than this pauses once (``_YIELD_SECONDS``), so another pod gets its turn.
+_YIELD_AFTER_SECONDS = 1.0
+#: Longer than the polling interval of ``distributed_lock`` (redis-py: 0.1 s): another pod waiting finds the lock free.
+_YIELD_SECONDS = 0.15
+
+
+class _Gate:
+    """The local queue of the writers of one tenant in this process (FIFO, immediate handover): only its head waits on
+    the distributed lock. ``distributed_lock`` (redis-py) polls a busy lock every 100 ms: without the gate, every
+    handover between two writers of the same process left the lock idle until the next poll. With it, the lock is
+    free only for an instant between two local writers, so another pod's poll would hardly ever find it free: a streak
+    of local handovers (writers waiting all along) pauses once every ``_YIELD_AFTER_SECONDS``."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.waiting = 0
+        self.streak_since: Optional[float] = None
+
+
+#: The gates of each tenant, per event loop (an ``asyncio.Lock`` belongs to one loop).
+_GATES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, _Gate]]" = weakref.WeakKeyDictionary()
+
+
+def _gate(tenant_id: str) -> _Gate:
+    gates = _GATES.setdefault(asyncio.get_running_loop(), {})
+    return gates.setdefault(tenant_id, _Gate())
 
 
 class TenantWriteLockTimeout(RuntimeError):
@@ -191,9 +229,36 @@ async def acquire_tenant_write_lock(
     # Lock ordering: taken AFTER the source lock held by the caller (the core
     # RabbitHole holds the lock of the source before its phases invoke the
     # handler); never the reverse. See the module docstring.
+    # The local gate first (the writers of this process hand over at once), then the distributed lock (against the
+    # other pods); the wait on both is bounded by ``timeout`` as a whole.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    gate = _gate(tenant_id)
+    gate.waiting += 1
+    try:
+        await asyncio.wait_for(gate.lock.acquire(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        log.warning(
+            f"[GraphRAG] Timed out after {timeout:.0f}s acquiring tenant "
+            f"write lock '{key}' for operation '{operation}' "
+            f"(tenant {tenant_id!r}); aborting the write."
+        )
+        raise TenantWriteLockTimeout(
+            f"Could not acquire tenant write lock {key} for {operation}"
+        ) from exc
+    finally:
+        gate.waiting -= 1
     acquired = False
     try:
-        async with distributed_lock(key, timeout=timeout, blocking_timeout=timeout):
+        now = loop.time()
+        if gate.streak_since is None:
+            gate.streak_since = now
+        elif now - gate.streak_since >= _YIELD_AFTER_SECONDS:
+            # a long streak of local handovers: the lock stays free for longer than a poll, for another pod
+            await asyncio.sleep(min(_YIELD_SECONDS, max(0.0, deadline - now)))
+            gate.streak_since = loop.time()
+        # no time left after the queue: a single try
+        async with distributed_lock(key, timeout=timeout, blocking_timeout=max(0.0, deadline - loop.time())):
             acquired = True
             token = GRAPH_WRITE_LOCK_HELD.set(held | {tenant_id})
             try:
@@ -212,6 +277,10 @@ async def acquire_tenant_write_lock(
         raise TenantWriteLockTimeout(
             f"Could not acquire tenant write lock {key} for {operation}"
         ) from exc
+    finally:
+        if not gate.waiting:  # nobody behind: the streak ends
+            gate.streak_since = None
+        gate.lock.release()
 
 
 def tenant_write_locked(operation: str | None = None):

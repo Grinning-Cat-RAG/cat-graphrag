@@ -53,8 +53,13 @@ Requirements per script:
   lock): a change of the agent's LLM recomputes the concepts once, across
   pods, and a failure is retried;
 - `test_ingestion_lane.py` — the REAL core and Redis: the heavy steps of an
-  ingestion run on the core's ingestion lane (a one-worker lane), a chat
-  message's analysis stays off it;
+  ingestion (language detection included) run on the core's ingestion lane
+  (a one-worker lane), a chat message's analysis stays off it and off the
+  event loop (a thread of its own);
+- `test_write_lock_handoff.py` — the REAL core and Redis: the tenant write
+  lock hands over at once between the writers of one process (a local FIFO
+  gate in front of the polling distributed lock), bounded by its timeout
+  against another pod, unaffected by a cancelled waiter;
 - `test_maintenance_cli.py`, `test_maintenance_cli_stateful.py` — the
   maintenance CLI on the REAL core RabbitHole (`reingest_source` /
   `rerun_source`, rows, locks, phase engine, automatic resume) and a Redis

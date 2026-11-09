@@ -126,6 +126,23 @@ if __name__ == "__main__":
         await h.recompute_concept_relations(types.SimpleNamespace(), gen="g")
         assert sorted(calls, key=str) == sorted([("a.pdf", ["d1", "d3"], {None}), ("a.pdf", ["d2"], {"c1"})], key=str), calls
 
+    async def test_the_document_structure_is_built_per_kb_and_chat_file():
+        """A write holding a knowledge base file and a chat file with the same name builds two document structures."""
+        from cat.services.memory.models import PointStruct
+
+        h = gf.FakeGraphStore().install(handler())
+        built = []
+
+        async def derived(source, points, chat_id=None):
+            built.append((source, chat_id, len(points)))
+
+        h.create_derived_graph_for_source = derived
+        await h.add_points_to_tenant(gf.EPISODIC, [
+            PointStruct(id=f"p{i}", payload={"page_content": "x", "metadata": {"source": "a.pdf"} | chat}, vector=[1.0, 1.0])
+            for i, chat in enumerate([{}, {"chat_id": "c1"}, {"chat_id": "c1"}])
+        ])
+        assert sorted(built, key=str) == sorted([("a.pdf", None, 1), ("a.pdf", "c1", 2)], key=str), built
+
     TESTS = [v for k, v in dict(globals()).items() if k.startswith("test_")]
 
     async def run_all():

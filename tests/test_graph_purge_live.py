@@ -10,7 +10,8 @@
 - ``has_stale_visible_concepts``: visible concepts of another generation, on nodes or on edges only, per tenant;
 - a concept found again by a recompute takes the new generation and survives the flip and the GC;
 - the RELATED_TO provenance is scoped by knowledge base / chat in every deletion path (a source, a chat destroyed, a
-  whole collection), in the concept store and in the boot backfill.
+  whole collection), in the concept store and in the boot backfill;
+- the SourceFile of a knowledge base file and of a chat file with the same name are two nodes;
 - the read-only graph checks of the maintenance ``--verify`` (``_graph_checks``) on a healthy and a broken graph.
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout, a Redis Stack on
@@ -366,6 +367,29 @@ if __name__ == "__main__":
         await handler.recompute_provenance()
         assert await keys_of(handler, "Q1", "Q2") == {"chat:c7:q.pdf"}, await keys_of(handler, "Q1", "Q2")
 
+    async def source_files(handler, name):
+        rows = await run(handler, "MATCH (sf:SourceFile {tenant_id: $tenant_id, name: $name}) "
+                                  "OPTIONAL MATCH (d:Document)-[:PART_OF]->(sf) "
+                                  "RETURN sf.key AS key, collect(d.id) AS docs", name=name)
+        return {r["key"]: set(r["docs"]) for r in rows}
+
+    async def test_source_files_are_scoped_by_kb_and_chat(handler, other):
+        """A knowledge base file and a chat file with the same name have a SourceFile each, with their own pieces;
+        deleting one sweeps only its node. A node written before the scope (no key) is swept once its pieces are
+        replaced by a new ingestion."""
+        key = handler_mod.provenance_key
+        kb = await add_points(handler, gf.DECLARATIVE, "s.pdf", 2)
+        chat = await add_points(handler, gf.EPISODIC, "s.pdf", 2, chat_id="cs")
+        assert await source_files(handler, "s.pdf") == {key("s.pdf"): set(kb), key("s.pdf", "cs"): set(chat)}
+        await handler.delete_tenant_points(gf.EPISODIC, {"source": "s.pdf", "chat_id": "cs"})
+        assert await source_files(handler, "s.pdf") == {key("s.pdf"): set(kb)}, "the chat file took the KB node"
+
+        old = await add_points(handler, gf.DECLARATIVE, "l.pdf", 2)
+        await run(handler, "MATCH (sf:SourceFile {tenant_id: $tenant_id, name: 'l.pdf'}) REMOVE sf.key")  # an older node
+        new = await add_points(handler, gf.DECLARATIVE, "l.pdf", 2)  # the embedding phase: new pieces, then
+        await handler.delete_tenant_points_by_ids(gf.DECLARATIVE, old)  # the old ones go
+        assert await source_files(handler, "l.pdf") == {key("l.pdf"): set(new)}, await source_files(handler, "l.pdf")
+
     async def main_async():
         handler = make_handler()
         other = make_handler(OTHER)
@@ -374,6 +398,7 @@ if __name__ == "__main__":
             test_wipe_tenant_graph, test_verify_graph_checks, test_stored_metadata_are_the_callers,
             test_stale_visible_concepts, test_a_concept_found_again_survives_the_flip,
             test_provenance_is_scoped_by_kb_and_chat, test_concepts_and_backfill_key_by_the_chat,
+            test_source_files_are_scoped_by_kb_and_chat,
         )
         failed = 0
         try:

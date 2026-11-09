@@ -202,8 +202,8 @@ if __name__ == "__main__":
                     and any(_removed(f, params) for f in (store.related[rid].get("files") or []))
                 ])
 
-            if "RETURN sf.name AS name" in q:
-                return _FakeResult([{"name": name} for name in sorted(store.sourcefiles)])
+            if "RETURN elementId(sf) AS sid" in q:  # the orphan SourceFiles, by node (here: by name)
+                return _FakeResult([{"sid": name} for name in sorted(store.sourcefiles)])
 
             # ── writes ────────────────────────────────────────────────────
             if "DETACH DELETE d" in q:
@@ -232,11 +232,8 @@ if __name__ == "__main__":
                 return _FakeResult()
 
             if "DETACH DELETE sf" in q:
-                if "sf.name IN $names" in q:
-                    for name in params.get("names", []):
-                        store.sourcefiles.discard(name)
-                else:
-                    store.sourcefiles.discard(params.get("source"))
+                for name in params.get("sids", []):  # the orphan sweep, by node
+                    store.sourcefiles.discard(name)
                 store.txns["sourcefile"] += 1
                 return _FakeResult()
 

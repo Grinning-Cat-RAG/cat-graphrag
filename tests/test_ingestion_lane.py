@@ -6,9 +6,11 @@ ingestion belong to it:
 
 - the spaCy analysis of a chunk (``EntityExtractor.extract``);
 - the embedding of the entities of a chunk (``_extract_document_graph``);
-- the re-embedding of every Document of the tenant on a change of the embedder (``_reembed_tenant_impl``).
+- the re-embedding of every Document of the tenant on a change of the embedder (``_reembed_tenant_impl``);
+- the language detection of a chunk.
 
-What serves a chat stays out of it: the analysis of the user's message (``extract_doc``) never waits behind an upload.
+What serves a chat stays out of it: the analysis of the user's message (``extract_doc``) never waits behind an upload;
+it runs in a thread of its own, so a long pasted text does not stop the other chats meanwhile.
 With a lane of ONE worker, many chunks extracted at once while the lane is busy all complete (nothing waits on itself).
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout and a Redis Stack on
@@ -61,12 +63,49 @@ if __name__ == "__main__":
         LANE.clear()
         extracted = await ready_extractor().extract("Alice met Bob in Paris. " * 20, "doc-1", {"source": "a.pdf"})
         assert extracted is not None
-        assert LANE == ["_run_segment_pipe"], LANE
+        assert LANE == ["_detect_language", "_run_segment_pipe"], LANE
 
-    async def test_the_analysis_of_a_chat_message_stays_off_the_lane():
+    async def test_the_analysis_of_a_chat_message_stays_off_the_lane_and_off_the_loop():
+        """The user's message is analysed in a thread (a long pasted text must not stop the other chats), never on
+        the lane (it must not wait behind an upload)."""
         LANE.clear()
-        await ready_extractor().extract_doc("Who is Alice?")
+        extractor = ready_extractor()
+        threads = []
+        blank = extractor._nlps["default"]
+
+        def nlp(text):
+            threads.append(threading.current_thread())
+            return blank(text)
+
+        extractor._nlps = {"default": nlp, "en": nlp}
+        doc = await extractor.extract_doc("Who is Alice?")
+        assert [t.text for t in doc] == ["Who", "is", "Alice", "?"]
         assert LANE == [], LANE
+        assert threads and threads[0] is not threading.main_thread(), "the message was analysed on the event loop"
+
+    async def test_the_language_profiles_are_loaded_once_at_init():
+        """langdetect loads its profiles lazily, one at a time, at the first detection: two threads of the lane (or
+        the lane and a chat) detecting at once would see them half loaded. They are loaded at the initialisation of
+        the extractor, before any detection."""
+        import langdetect.detector_factory as factory_mod
+
+        factory_mod._factory = None
+        real = extractor_mod._get_or_load_model
+
+        async def blank_model(model_name):
+            return spacy.blank("en")
+
+        extractor_mod._get_or_load_model = blank_model
+        try:
+            await extractor_mod.EntityExtractor({"en": "en_core_web_sm"}).ensure_initialized()
+        finally:
+            extractor_mod._get_or_load_model = real
+        assert factory_mod._factory is not None and factory_mod._factory.langlist, "the profiles are loaded lazily"
+
+    async def test_the_language_of_a_chunk_is_detected_on_the_lane():
+        LANE.clear()
+        await ready_extractor().extract("Alice met Bob in Paris. " * 20, "doc-1", {"source": "a.pdf"})
+        assert LANE[0] == "_detect_language", LANE
 
     async def test_the_embedding_of_the_entities_runs_on_the_lane():
         handler = gf.make_handler(handler_mod, "lane_agent", enable_entity_embeddings=True)
