@@ -12,11 +12,12 @@ memory). After every step it checks the business rules:
 3. a deleted source leaves no document, edge or RELATED_TO provenance behind, and the others are untouched (1);
 4. no extraction task outlives the phase that owns it, a failure, or the deletion of its source.
 
-Sources with the same name in the knowledge base and in a chat are out of the generator on purpose: RELATED_TO
-records the provenance by name only (a known limitation, see the README).
+A file with the same name in the knowledge base and in a chat is part of the generator: they are two sources, and
+the RELATED_TO provenance of each is scoped (the name in the knowledge base, the chat and the name in a chat).
 
-``--mutate llm-dependency`` (the LLM phase no longer depends on the spaCy one) and ``--mutate no-purge`` (the spaCy
-phase no longer purges before writing) inject a wrong rule: the run must then FAIL, which proves the rules above
+``--mutate llm-dependency`` (the LLM phase no longer depends on the spaCy one), ``--mutate no-purge`` (the spaCy
+phase no longer purges before writing) and ``--mutate name-only-provenance`` (the RELATED_TO provenance is the file
+name only, shared by the knowledge base and the chats) inject a wrong rule: the run must then FAIL, which proves the rules above
 catch it.
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout and a Redis Stack on
@@ -37,7 +38,7 @@ if __name__ == "__main__":
     import graph_fakes as gf
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mutate", choices=["llm-dependency", "no-purge"], default=None)
+    parser.add_argument("--mutate", choices=["llm-dependency", "no-purge", "name-only-provenance"], default=None)
     parser.add_argument("--examples", type=int, default=120)
     args = parser.parse_args()
 
@@ -52,13 +53,15 @@ if __name__ == "__main__":
 
     if args.mutate == "llm-dependency":
         phases_mod.GraphConceptPhase.depends_on = ("embedding",)
+    if args.mutate == "name-only-provenance":
+        handler_mod.provenance_key = lambda source, chat_id=None: source
 
     LOOP = asyncio.new_event_loop()
 
     def run(coro):
         return LOOP.run_until_complete(coro)
 
-    SOURCES = [("a.pdf", None), ("b.pdf", None), ("c.pdf", "chat-1")]
+    SOURCES = [("a.pdf", None), ("b.pdf", None), ("c.pdf", "chat-1"), ("a.pdf", "chat-1")]
     WORDS = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace"]
     # a fault in one operation out of four: rare enough that most operations complete and interleave
     RARE = st.sampled_from([False, False, False, True])
@@ -204,7 +207,7 @@ if __name__ == "__main__":
                     continue
                 ids = self.store.scoped_doc_ids(name, gf.FakeRabbitHole.collection(chat), chat)
                 assert len(ids) == len(self.files[(chat, name)]), (name, len(ids))
-                actual = self.store.actual_for(ids, name)
+                actual = self.store.actual_for(ids, name, chat)
                 expected = self.store.expected_for(ids, self.concepts)
                 assert actual == expected, f"{name}: graph is not the one of its content\n{actual}\n!=\n{expected}"
 
@@ -216,7 +219,7 @@ if __name__ == "__main__":
                 if (name, chat) in self.expected:
                     continue
                 assert not self.store.scoped_doc_ids(name, gf.FakeRabbitHole.collection(chat), chat), name
-                assert not self.store.related_of(name), (name, self.store.related_of(name))
+                assert not self.store.related_of(name, chat), (name, chat, self.store.related_of(name, chat))
 
         @invariant()
         def no_orphan_tasks(self):
@@ -253,7 +256,8 @@ if __name__ == "__main__":
 
     if args.mutate:
         if outcome == "FAIL":
-            print(f"PASS mutation '{args.mutate}' is caught: {str(failure).splitlines()[0][:200]}")
+            reasons = [str(e).splitlines()[0][:160] for e in getattr(failure, "exceptions", [failure])]
+            print(f"PASS mutation '{args.mutate}' is caught: {' | '.join(reasons)}")
             sys.exit(0)
         print(f"FAIL mutation '{args.mutate}' was NOT caught by the rules")
         sys.exit(1)

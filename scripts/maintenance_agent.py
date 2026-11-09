@@ -570,11 +570,14 @@ async def _sources_without_state(ccat, collections: list[str]) -> list[tuple[str
     existed), read from their points. Their bytes are not checked here: ``reingest_source`` reports a source whose
     file was not kept (``SourceNotKept``), so it is listed among the failures instead of being skipped."""
     from cat.db.cruds import ingestions as crud_ingestions
+    from cat.services.memory.models import VectorMemoryType
 
     with_state = {(row["source"], row.get("chat_id")) for row in await crud_ingestions.list_statuses(ccat.agent_key)}
     found: list[tuple[str, str | None]] = []
-    for collection in collections:
-        points, _ = await ccat.vector_memory_handler.get_all_tenant_points(collection, with_vectors=False)
+    for collection in collections:  # a --collection value is the core's collection name
+        points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
+            str(VectorMemoryType(collection)), with_vectors=False,
+        )
         for point in points:
             metadata = (point.payload or {}).get("metadata") or {}
             key = (metadata.get("source"), metadata.get("chat_id"))
@@ -677,6 +680,7 @@ async def _op_graph(ccat, handler, report: _OpReport) -> None:
     again; the ones whose file was not kept cannot be rebuilt and are reported.
     """
     from cat.db.cruds import ingestions as crud_ingestions
+    from cat.services.memory.models import VectorMemoryType
 
     phases = _plugin_module("phases")
     graph_phases = [phases.GRAPH_SPACY_PHASE, phases.GRAPH_LLM_PHASE]
@@ -692,7 +696,7 @@ async def _op_graph(ccat, handler, report: _OpReport) -> None:
         lambda name, chat_id: rabbit_hole.rerun_source(ccat, name, chat_id, invalidate=graph_phases),
     )
     await _each_source(
-        report, await _sources_without_state(ccat, ["declarative", "episodic"]),
+        report, await _sources_without_state(ccat, [str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)]),
         lambda name, chat_id: rabbit_hole.reingest_source(ccat, name, chat_id),
     )
     if handler._enable_concept_relations and not await _align_concept_marker(handler, agent_id, concept_marker):

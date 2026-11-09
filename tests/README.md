@@ -41,8 +41,11 @@ Requirements per script:
   dependencies (`neo4j`, `spacy`, `langdetect`) installed;
 - `test_graph_phases.py`, `test_graph_phases_stateful.py` — the REAL core and
   a Redis Stack on `localhost:6379`; the stateful one also needs `hypothesis`
-  and accepts `--examples N` and `--mutate llm-dependency|no-purge` (a wrong
+  and accepts `--examples N` and `--mutate llm-dependency|no-purge|name-only-provenance` (a wrong
   rule injected on purpose: the run must then report the mutation as caught);
+- `test_provenance_scope.py` — the REAL core: the RELATED_TO provenance
+  key is scoped by knowledge base / chat in every writer (spaCy, LLM,
+  recompute); the stripping Cypher runs in `test_graph_purge_live.py`;
 - `test_concept_generation.py` — the REAL core and Redis (the recompute
   lock): a change of the agent's LLM recomputes the concepts once, across
   pods, and a failure is retried;

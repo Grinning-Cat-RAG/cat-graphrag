@@ -105,11 +105,11 @@ def _install_cat_stub():
     models_mod.ScoredPoint = type("ScoredPoint", (), {})
     models_mod.UpdateResult = type("UpdateResult", (), {})
 
-    class VectorMemoryType(str):
-        DECLARATIVE = "declarative"
-        EPISODIC = "episodic"
+    # the core's enum: one copy for every harness (graph_fakes.py), checked against the core
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from graph_fakes import StubVectorMemoryType
 
-    models_mod.VectorMemoryType = VectorMemoryType
+    models_mod.VectorMemoryType = StubVectorMemoryType
     sys.modules["cat.services.memory.models"] = models_mod
 
     # the phase API of the core RabbitHole (phases.py subclasses it)

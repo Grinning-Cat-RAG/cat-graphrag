@@ -8,7 +8,9 @@
   documents and structure, and never touches another tenant;
 - the metadata read back are the ones the caller stored (no ``tenant_id``, also on Documents written before);
 - ``has_stale_visible_concepts``: visible concepts of another generation, on nodes or on edges only, per tenant;
-- a concept found again by a recompute takes the new generation and survives the flip and the GC.
+- a concept found again by a recompute takes the new generation and survives the flip and the GC;
+- the RELATED_TO provenance is scoped by knowledge base / chat in every deletion path (a source, a chat destroyed, a
+  whole collection), in the concept store and in the boot backfill.
 - the read-only graph checks of the maintenance ``--verify`` (``_graph_checks``) on a healthy and a broken graph.
 
 Standalone script (plugin rules: the body runs only as ``__main__``). Needs the core checkout, a Redis Stack on
@@ -80,7 +82,8 @@ if __name__ == "__main__":
             return [record async for record in result]
 
     async def link(handler, doc_ids, entity, source, gen):
-        """The graph the phases write for a source: MENTIONS + PROVENANCE, a similarity edge, a RELATED_TO.
+        """The graph the phases write for a source: MENTIONS + PROVENANCE, a similarity edge, a RELATED_TO whose
+        provenance is ``source`` (the source's provenance key).
         Entity ids are unique per run: the id constraint spans every tenant of the database."""
         await run(
             handler,
@@ -122,19 +125,19 @@ if __name__ == "__main__":
 
     async def test_purge_is_scoped_to_collection_and_chat(handler):
         gen = await handler._read_generation(TENANT)
-        kb = await add_points(handler, "declarative", "x.pdf", 2)
-        chat = await add_points(handler, "episodic", "x.pdf", 2, chat_id="c1")
-        other_chat = await add_points(handler, "episodic", "x.pdf", 2, chat_id="c2")
+        kb = await add_points(handler, gf.DECLARATIVE, "x.pdf", 2)
+        chat = await add_points(handler, gf.EPISODIC, "x.pdf", 2, chat_id="c1")
+        other_chat = await add_points(handler, gf.EPISODIC, "x.pdf", 2, chat_id="c2")
         await link(handler, kb, "KbEntity", "x.pdf", gen)
-        await link(handler, chat, "ChatEntity", "x.pdf", gen)
-        await link(handler, other_chat, "OtherEntity", "x.pdf", gen)
+        await link(handler, chat, "ChatEntity", handler_mod.provenance_key("x.pdf", "c1"), gen)
+        await link(handler, other_chat, "OtherEntity", handler_mod.provenance_key("x.pdf", "c2"), gen)
         before = {
             name: await edges_of(handler, ids, exclude=chat + kb)
             for name, ids in (("kb", kb), ("c1", chat), ("c2", other_chat))
         }
         assert all(before.values()), before
 
-        count = await handler.purge_source_graph_artifacts("x.pdf", "episodic", "c1")
+        count = await handler.purge_source_graph_artifacts("x.pdf", gf.EPISODIC, "c1")
         assert count == 2, count
         assert await edges_of(handler, chat) == 0, "the chat copy kept its graph"
         assert await edges_of(handler, kb, exclude=chat + kb) == before["kb"], "purging a chat touched the KB"
@@ -148,26 +151,26 @@ if __name__ == "__main__":
         files = await run(handler, "MATCH (s:SourceFile {name: 'x.pdf', tenant_id: $tenant_id}) RETURN s")
         assert files, "the purge deleted the SourceFile"
 
-        assert await handler.purge_source_graph_artifacts("x.pdf", "declarative") == 2
+        assert await handler.purge_source_graph_artifacts("x.pdf", gf.DECLARATIVE) == 2
         assert await edges_of(handler, kb) == 0
         assert await edges_of(handler, other_chat, exclude=chat + kb) == before["c2"], "purging the KB touched a chat"
-        assert await handler.purge_source_graph_artifacts("x.pdf", "declarative") == 2  # idempotent
+        assert await handler.purge_source_graph_artifacts("x.pdf", gf.DECLARATIVE) == 2  # idempotent
 
     async def test_points_read_once_across_pages(handler):
         # pages of 100 instead of 1000: the same paging over 3 pages, without inserting thousands of points (an insert
         # is slow on recent Neo4j versions)
         saved, handler_mod._PAGE_SIZE = handler_mod._PAGE_SIZE, 100
         try:
-            ids = await add_points(handler, "declarative", "big.pdf", 235)
-            points = await handler.get_source_points("declarative", "big.pdf")
+            ids = await add_points(handler, gf.DECLARATIVE, "big.pdf", 235)
+            points = await handler.get_source_points(gf.DECLARATIVE, "big.pdf")
             read = [p.id for p in points]
             assert len(read) == len(set(read)) == 235 and set(read) == set(ids), (len(read), len(set(read)))
             # the core's contract, which its embedding phase and the vector-memory transfer rely on: no limit = all
             every, next_offset = await handler.get_all_tenant_points(
-                "declarative", metadata={"source": "big.pdf"}, with_vectors=False
+                gf.DECLARATIVE, metadata={"source": "big.pdf"}, with_vectors=False
             )
             assert len(every) == 235 and next_offset is None, (len(every), next_offset)
-            page, next_offset = await handler.get_all_tenant_points("declarative", limit=100, metadata={"source": "big.pdf"})
+            page, next_offset = await handler.get_all_tenant_points(gf.DECLARATIVE, limit=100, metadata={"source": "big.pdf"})
             assert len(page) == 100 and next_offset == "100", (len(page), next_offset)
         finally:
             handler_mod._PAGE_SIZE = saved
@@ -186,10 +189,10 @@ if __name__ == "__main__":
 
     async def test_wipe_tenant_graph(handler, other):
         gen = await handler._read_generation(TENANT)
-        ids = await add_points(handler, "declarative", "w.pdf", 2)
+        ids = await add_points(handler, gf.DECLARATIVE, "w.pdf", 2)
         await link(handler, ids, "WipeEntity", "w.pdf", gen)
         other_gen = await other._read_generation(OTHER)
-        other_ids = await add_points(other, "declarative", "w.pdf", 2)
+        other_ids = await add_points(other, gf.DECLARATIVE, "w.pdf", 2)
         await link(other, other_ids, "WipeEntity", "w.pdf", other_gen)
         await run(handler, "CREATE (:Entity {id: $eid, tenant_id: $tenant_id, name: 'lonely'})",
                   eid=f"{TENANT}:lonely")
@@ -204,7 +207,7 @@ if __name__ == "__main__":
         await handler.wipe_tenant_graph()  # idempotent on an empty graph
 
     async def test_verify_graph_checks(handler, other):
-        await add_points(handler, "declarative", "v.pdf", 2)
+        await add_points(handler, gf.DECLARATIVE, "v.pdf", 2)
         checks = dict(await cli._graph_checks(handler, TENANT))
         assert checks == {"no-null-embeddings": True, "no-orphan-entities": True}, checks
         await run(handler, "CREATE (:Entity {id: $eid, tenant_id: $tenant_id, name: 'orphan'})", eid=f"{TENANT}:orphan")
@@ -226,19 +229,19 @@ if __name__ == "__main__":
         a source for its upload metadata): no tenant_id, also for the Documents older versions wrote it in."""
         meta = {"source": "m.pdf", "author": "Erin"}
         point = PointStruct(id=uuid.uuid4().hex, payload={"page_content": "Erin wrote", "metadata": meta}, vector=[1.0, 2.0])
-        await handler.add_points_to_tenant("declarative", [point])
+        await handler.add_points_to_tenant(gf.DECLARATIVE, [point])
         await asyncio.gather(*handler._pending_entity_tasks, return_exceptions=True)
         assert meta == {"source": "m.pdf", "author": "Erin"}, f"the caller's metadata were changed: {meta}"
         await run(handler, "MATCH (d:Document {id: $id, tenant_id: $tenant_id}) SET d.metadata = $old",
                   id=point.id, old=json.dumps(meta | {"tenant_id": TENANT}))  # written by an older version
-        points, _ = await handler.get_all_tenant_points("declarative", metadata={"source": "m.pdf"}, with_vectors=False)
+        points, _ = await handler.get_all_tenant_points(gf.DECLARATIVE, metadata={"source": "m.pdf"}, with_vectors=False)
         assert [p.payload["metadata"] for p in points] == [meta], [p.payload["metadata"] for p in points]
-        records = await handler.retrieve_tenant_points("declarative", [point.id])
+        records = await handler.retrieve_tenant_points(gf.DECLARATIVE, [point.id])
         assert [r.payload["metadata"] for r in records] == [meta], [r.payload["metadata"] for r in records]
-        recalled = [d.document.metadata for d in await handler.recall_tenant_memory("declarative")
+        recalled = [d.document.metadata for d in await handler.recall_tenant_memory(gf.DECLARATIVE)
                     if d.document.id == point.id]
         assert recalled == [meta], recalled
-        found = [p.payload["metadata"] for p in await handler.search_in_tenant("declarative", [1.0, 2.0], limit=1000)
+        found = [p.payload["metadata"] for p in await handler.search_in_tenant(gf.DECLARATIVE, [1.0, 2.0], limit=1000)
                  if p.id == point.id]
         assert found == [meta], found
 
@@ -291,6 +294,78 @@ if __name__ == "__main__":
                                    "RETURN r.concept_gen AS gen, r.concept_gen_active AS active")
         assert [(r["gen"], r["active"]) for r in edges] == [("gen-b", None)], [dict(r) for r in edges]
 
+    async def relate(handler, doc_ids, key, a="A", b="B"):
+        """A RELATED_TO between two entities mentioned by the documents, written by the real source-graph writer with
+        the provenance ``key``."""
+        ids = [f"{TENANT}:{a}", f"{TENANT}:{b}"]
+        await handler._write_source_graph(
+            [{"id": i, "name": i.lower(), "type": "PERSON", "metadata": "{}", "embedding": None} for i in ids],
+            [{"doc_id": d, "entity_id": i, "confidence": 0.9} for d in doc_ids for i in ids],
+            [{"source_id": ids[0], "target_id": ids[1], "rel_type": "MET", "weight": 1.0, "source_files": [key]}],
+        )
+
+    async def keys_of(handler, a="A", b="B"):
+        rows = await run(handler, "MATCH (:Entity {id: $a, tenant_id: $tenant_id})-[r:RELATED_TO {type: 'MET'}]->"
+                                  "(:Entity {id: $b, tenant_id: $tenant_id}) RETURN r.source_files AS keys",
+                         a=f"{TENANT}:{a}", b=f"{TENANT}:{b}")
+        return None if not rows else set(rows[0]["keys"] or [])
+
+    async def test_provenance_is_scoped_by_kb_and_chat(handler, other):
+        """The same relation from a knowledge base file and a chat file with the same name: each deletion path
+        strips only its own scope."""
+        key = handler_mod.provenance_key
+        kb = await add_points(handler, gf.DECLARATIVE, "p.pdf", 1)
+        chat = await add_points(handler, gf.EPISODIC, "p.pdf", 1, chat_id="c1")
+        await relate(handler, kb, key("p.pdf"))
+        await relate(handler, chat, key("p.pdf", "c1"))
+        assert await keys_of(handler) == {"p.pdf", "chat:c1:p.pdf"}
+
+        await handler.delete_tenant_points(gf.EPISODIC, {"source": "p.pdf", "chat_id": "c1"})  # the chat file deleted
+        assert await keys_of(handler) == {"p.pdf"}, "deleting the chat file touched the knowledge base"
+
+        chat = await add_points(handler, gf.EPISODIC, "p.pdf", 1, chat_id="c1")
+        await relate(handler, chat, key("p.pdf", "c1"))
+        await handler.purge_source_graph_artifacts("p.pdf", gf.DECLARATIVE)  # the KB file's graph rebuilt
+        assert await keys_of(handler) == {"chat:c1:p.pdf"}, "purging the knowledge base touched the chat"
+
+        await relate(handler, kb, key("p.pdf"))
+        await handler.delete_tenant_points(gf.EPISODIC, {"chat_id": "c1"})  # the chat destroyed
+        assert await keys_of(handler) == {"p.pdf"}, "destroying the chat left (or took too much)"
+
+        await handler.delete_tenant_points(gf.PROCEDURAL)  # at every plugin toggle: it holds no source
+        assert await keys_of(handler) == {"p.pdf"}, "deleting the procedural memory stripped the knowledge base"
+
+        chat2 = await add_points(handler, gf.EPISODIC, "p.pdf", 1, chat_id="c2")
+        await relate(handler, chat2, key("p.pdf", "c2"))
+        await handler.delete_tenant_points(gf.EPISODIC)  # the whole episodic memory
+        assert await keys_of(handler) == {"p.pdf"}, "deleting the chats' collection touched the knowledge base"
+        await handler.delete_tenant_points(gf.DECLARATIVE)
+        assert await keys_of(handler) is None, "a relation without provenance survived"
+
+    async def test_concepts_and_backfill_key_by_the_chat(handler, other):
+        key = handler_mod.provenance_key
+        payload = {
+            "concepts": [{"text": "Zeta", "type": "DEFINITION"}, {"text": "Eta", "type": "DEFINITION"}],
+            "relations": [{"origin": "Zeta", "destination": "Eta", "type": "LINKS", "text": "links"}],
+        }
+        await handler._store_concept_relations(TENANT, payload, source=key("z.pdf", "c9"), document_ids=["dz"],
+                                               concept_gen="g")
+        rows = await run(handler, "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO {type: 'LINKS'}]->() "
+                                  "RETURN r.source_files AS keys")
+        assert [r["keys"] for r in rows] == [["chat:c9:z.pdf"]], [dict(r) for r in rows]
+        await handler.delete_tenant_points(gf.EPISODIC, {"chat_id": "c9"})
+        rows = await run(handler, "MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO {type: 'LINKS'}]->() RETURN r")
+        assert not rows, "the chat's concept relation survived its chat"
+
+        # an edge written before the provenance existed, between entities a chat document mentions: the boot
+        # backfill keys it by the chat
+        docs = await add_points(handler, gf.EPISODIC, "q.pdf", 1, chat_id="c7")
+        await relate(handler, docs, key("q.pdf", "c7"), a="Q1", b="Q2")
+        await run(handler, "MATCH (:Entity {id: $a, tenant_id: $tenant_id})-[r:RELATED_TO]->() REMOVE r.source_files",
+                  a=f"{TENANT}:Q1")
+        await handler.recompute_provenance()
+        assert await keys_of(handler, "Q1", "Q2") == {"chat:c7:q.pdf"}, await keys_of(handler, "Q1", "Q2")
+
     async def main_async():
         handler = make_handler()
         other = make_handler(OTHER)
@@ -298,6 +373,7 @@ if __name__ == "__main__":
             test_purge_is_scoped_to_collection_and_chat, test_points_read_once_across_pages,
             test_wipe_tenant_graph, test_verify_graph_checks, test_stored_metadata_are_the_callers,
             test_stale_visible_concepts, test_a_concept_found_again_survives_the_flip,
+            test_provenance_is_scoped_by_kb_and_chat, test_concepts_and_backfill_key_by_the_chat,
         )
         failed = 0
         try:

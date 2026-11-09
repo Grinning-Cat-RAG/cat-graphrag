@@ -150,6 +150,11 @@ def _install_cat_stub():
     models_mod.Record = _StubModel
     models_mod.ScoredPoint = _StubModel
     models_mod.UpdateResult = _StubModel
+    # the core's enum: one copy for every harness (graph_fakes.py), checked against the core
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from graph_fakes import StubVectorMemoryType
+
+    models_mod.VectorMemoryType = StubVectorMemoryType
     sys.modules["cat.services.memory.models"] = models_mod
 
 

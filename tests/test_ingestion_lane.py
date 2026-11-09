@@ -99,7 +99,7 @@ if __name__ == "__main__":
             """The read of every Document of the tenant; any later statement (the swap) is out of this test."""
 
             def __init__(self):
-                self.rows = [{"id": "doc-1", "content": "Alice wrote", "collection_name": "declarative"}]
+                self.rows = [{"id": "doc-1", "content": "Alice wrote", "collection_name": gf.DECLARATIVE}]
 
             def __aiter__(self):
                 return self

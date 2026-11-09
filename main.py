@@ -43,14 +43,14 @@ def factory_allowed_vector_databases(allowed: List[VectorDatabaseSettings], cat)
 @hook(priority=10)
 async def after_cheshire_cat_creation(cat) -> None:
     """
-    Boot-time provenance migration.
+    Provenance migration of an agent being CREATED.
 
-    Every agent's graph that predates the PROVENANCE / ``source_files``
-    tracking (nodes and relations created before this feature) is reconciled
-    in the background, so the file-deletion cascade works for historical data
-    too. ``recompute_provenance`` self-skips tenants that are already
-    reconciled (a single ``provenance_reconciled`` marker count), so this is a
-    cheap no-op on every boot after the first migration.
+    The core fires this hook only when an agent is created
+    (``BillTheLizard.create_cheshire_cat``), not when an existing agent is
+    loaded: an agent's graph that predates the PROVENANCE / ``source_files``
+    tracking is reconciled here in the background. ``recompute_provenance``
+    self-skips tenants that are already reconciled (a single
+    ``provenance_reconciled`` marker count).
     """
     # Lazy import (FX-9): the plugin loader reloads main.py BEFORE
     # graphrag_handler.py (glob order), so a module-level import binds the
@@ -388,9 +388,7 @@ async def _concept_recompute_job(tenant: str, new_gen: str) -> None:
         log.error(f"[GraphRAG] Concept recompute failed for {tenant}: {e}")
     finally:
         if elsewhere:
-            async with _concept_recompute_lock:
-                if _concept_recompute_pending.get(tenant) == new_gen:
-                    _concept_recompute_pending.pop(tenant, None)
+            await _drop_pending(tenant, new_gen)
             _concept_recheck_at[tenant] = time.monotonic() + _CONCEPT_RECHECK_SECONDS
         elif not done:
             await _forget_concept_work(tenant, new_gen)
@@ -419,18 +417,14 @@ async def _concept_recompute_passes(
             return False  # superseded work: a newer job took over
         active = await handler._read_concept_gen(tenant)
         if active == pending:
-            async with _concept_recompute_lock:
-                if _concept_recompute_pending.get(tenant) == pending:
-                    _concept_recompute_pending.pop(tenant, None)
+            await _drop_pending(tenant, pending)
             return True
 
         await handler.recompute_concept_relations(cat, gen=pending)
         flipped = await handler._flip_concept_gen(tenant, active, pending)
         if flipped:
             await handler._gc_stale_concept_nodes(tenant)
-            async with _concept_recompute_lock:
-                if _concept_recompute_pending.get(tenant) == pending:
-                    _concept_recompute_pending.pop(tenant, None)
+            await _drop_pending(tenant, pending)
             return True
 
         # Gen-guard aborted: a newer save won the race -> loop re-reads the
@@ -442,12 +436,17 @@ async def _concept_recompute_passes(
     return False
 
 
-async def _forget_concept_work(tenant: str, gen: str) -> None:
-    """A recompute to ``gen`` that will not complete here: nothing pending for it, nothing checked, so the next recall
-    of this process checks the concepts again and starts it if they are still stale."""
+async def _drop_pending(tenant: str, gen: str) -> None:
+    """Nothing pending for the tenant anymore, if what is pending is still ``gen`` (a newer generation stays)."""
     async with _concept_recompute_lock:
         if _concept_recompute_pending.get(tenant) == gen:
             _concept_recompute_pending.pop(tenant, None)
+
+
+async def _forget_concept_work(tenant: str, gen: str) -> None:
+    """A recompute to ``gen`` that will not complete here: nothing pending for it, nothing checked, so the next recall
+    of this process checks the concepts again and starts it if they are still stale."""
+    await _drop_pending(tenant, gen)
     if _concept_checked.get(tenant) == gen:
         _concept_checked.pop(tenant, None)
     _concept_recheck_at.pop(tenant, None)

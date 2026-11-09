@@ -14,7 +14,7 @@ from pydantic import Field, ConfigDict, BaseModel, BeforeValidator, create_model
 
 from cat import BaseVectorDatabaseHandler, Embeddings, VectorDatabaseSettings
 from cat.services.memory.models import (
-    DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult
+    DocumentRecall, PointStruct, Record, ScoredPoint, UpdateResult, VectorMemoryType
 )
 from cat.log import log
 
@@ -223,6 +223,17 @@ def _normalize_entity_name(name: str) -> str:
     """
     normalized = name.lower().strip()
     return re.sub(r"^(the|a|an)\s+", "", normalized)
+
+
+_CHAT_PROVENANCE_PREFIX = "chat:"
+
+
+def provenance_key(source: str, chat_id: Optional[str] = None) -> str:
+    """The provenance key of a source on the RELATED_TO edges it contributes to (``source_files``): its name in the
+    knowledge base (the key every edge carried before chats were told apart), ``chat:<chat_id>:<name>`` in a chat.
+    A file with the same name in the knowledge base and in a chat are two sources: deleting one never strips the
+    other's provenance."""
+    return source if chat_id is None else f"{_CHAT_PROVENANCE_PREFIX}{chat_id}:{source}"
 
 
 def _stored_metadata(raw: Any) -> Dict:
@@ -1728,7 +1739,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # list on RELATED_TO relations (None for non-file memories such as
         # episodic points, which are never wiped per-source).
         _doc_source = (metadata or {}).get("source")
-        _source_files = [_doc_source] if _doc_source else None
+        _source_files = [provenance_key(_doc_source, (metadata or {}).get("chat_id"))] if _doc_source else None
 
         extracted = await self._entity_extractor.extract(
             content, document_id, metadata
@@ -2359,7 +2370,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                             meta = json.loads(rec["metadata"])
                             src = meta.get("source")
                             if src:
-                                doc_sources[rec["id"]] = str(src)
+                                doc_sources[rec["id"]] = provenance_key(str(src), meta.get("chat_id"))
                         except (TypeError, ValueError):
                             continue  # metadata not a JSON string / unparsable
 
@@ -2620,38 +2631,16 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
             await delete_in_batches(document_ids, _delete_documents)
 
-            if source:
-                result = await session.run(
-                    """
-                    MATCH (s:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(t:Entity {tenant_id: $tenant_id})
-                    WHERE r.source_files IS NOT NULL AND $source IN r.source_files
-                    RETURN elementId(r) AS rid
-                    """,
-                    source=source,
-                    tenant_id=self.agent_id,
-                )
-                related_ids = [
-                    record["rid"] async for record in result if record["rid"] is not None
-                ]
-
-                async def _strip_related(batch: List[str]) -> None:
-                    await (
-                        await session.run(
-                            """
-                            MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
-                            WHERE elementId(r) IN $rids
-                            SET r.source_files = [x IN r.source_files WHERE x <> $source]
-                            WITH r
-                            WHERE size(r.source_files) = 0
-                            DELETE r
-                            """,
-                            rids=batch,
-                            source=source,
-                            tenant_id=self.agent_id,
-                        )
-                    ).consume()
-
-                await delete_in_batches(related_ids, _strip_related)
+            chat_id = (metadata or {}).get("chat_id")
+            if source:  # a source deleted: its own provenance key
+                await self._strip_provenance(session, key=provenance_key(source, chat_id))
+            elif metadata and set(metadata) == {"chat_id"}:  # a chat destroyed (core destroy_chat): its keys
+                await self._strip_provenance(session, prefix=provenance_key("", chat_id))
+            elif not metadata and collection_name == str(VectorMemoryType.DECLARATIVE):
+                await self._strip_provenance(session, knowledge_base=True)  # the whole knowledge base deleted
+            elif not metadata and collection_name == str(VectorMemoryType.EPISODIC):
+                await self._strip_provenance(session, prefix=_CHAT_PROVENANCE_PREFIX)  # every chat's memory deleted
+            # any other collection (e.g. procedural, deleted at every plugin toggle) holds no source: nothing to strip
 
             # Entity pruning:
             # - Per-file deletion (source set): keep the provenance-tracked
@@ -2736,6 +2725,47 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         return UpdateResult(status="completed", operation_id=operation_id)
 
+    async def _strip_provenance(
+        self, session, key: Optional[str] = None, prefix: Optional[str] = None, knowledge_base: bool = False,
+    ) -> None:
+        """Remove provenance keys from the tenant's RELATED_TO edges, then delete the edges left without one (they
+        existed only because of what is being removed): ``key`` (one source), every key starting with ``prefix`` (a
+        chat), or with ``knowledge_base`` every key of the knowledge base (not of a chat). Bounded sequential
+        batches (a large tenant exceeds the transaction memory of Neo4j in one)."""
+        scope = {"key": key, "prefix": prefix, "kb": knowledge_base, "chat_prefix": _CHAT_PROVENANCE_PREFIX}
+        removed = (
+            "(($key IS NOT NULL AND x = $key) OR ($prefix IS NOT NULL AND x STARTS WITH $prefix)"
+            " OR ($kb AND NOT x STARTS WITH $chat_prefix))"
+        )
+        result = await session.run(
+            cast(LiteralString, f"""
+            MATCH (:Entity {{tenant_id: $tenant_id}})-[r:RELATED_TO]->(:Entity {{tenant_id: $tenant_id}})
+            WHERE r.source_files IS NOT NULL AND any(x IN r.source_files WHERE {removed})
+            RETURN elementId(r) AS rid
+            """),
+            tenant_id=self.agent_id,
+            **scope,
+        )
+        related_ids = [record["rid"] async for record in result if record["rid"] is not None]
+
+        async def _strip(batch: List[str]) -> None:
+            await (
+                await session.run(
+                    cast(LiteralString, f"""
+                    MATCH (:Entity {{tenant_id: $tenant_id}})-[r:RELATED_TO]->(:Entity {{tenant_id: $tenant_id}})
+                    WHERE elementId(r) IN $rids
+                    SET r.source_files = [x IN r.source_files WHERE NOT {removed}]
+                    WITH r WHERE size(r.source_files) = 0
+                    DELETE r
+                    """),
+                    tenant_id=self.agent_id,
+                    rids=batch,
+                    **scope,
+                )
+            ).consume()
+
+        await delete_in_batches(related_ids, _strip)
+
     @tenant_write_locked("wipe tenant graph")
     async def wipe_tenant_graph(self) -> None:
         """Delete everything the graph phases derived for this tenant: the entity edges (MENTIONS, PROVENANCE), the
@@ -2785,9 +2815,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
              no other provenance/mention (entities untouched by this source are
              never candidates);
           2. delete SIMILAR_TO_* edges touching this source's Documents;
-          3. strip ``source`` from RELATED_TO ``source_files`` and drop edges
-             that existed only because of it. ``source_files`` records names
-             only, so this step is shared by the sources with the same name.
+          3. strip the source's provenance key (``provenance_key``: scoped by
+             the chat) from RELATED_TO ``source_files`` and drop the edges that
+             existed only because of it.
 
         The source's SourceFile node (document structure, built during the
         embedding phase) is kept: it is removed with the source's points.
@@ -2905,37 +2935,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
             await delete_in_batches(similar_ids, _delete_similar)
 
-            # RELATED_TO provenance strip + empty-edge delete, chunked.
-            result = await session.run(
-                """
-                MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
-                WHERE r.source_files IS NOT NULL AND $source IN r.source_files
-                RETURN elementId(r) AS rid
-                """,
-                tenant_id=tenant_id,
-                source=source,
-            )
-            related_ids = [
-                record["rid"] async for record in result if record["rid"] is not None
-            ]
-
-            async def _strip_related(batch: List[str]) -> None:
-                await (
-                    await session.run(
-                        """
-                        MATCH (:Entity {tenant_id: $tenant_id})-[r:RELATED_TO]->(:Entity {tenant_id: $tenant_id})
-                        WHERE elementId(r) IN $rids
-                        SET r.source_files = [x IN r.source_files WHERE x <> $source]
-                        WITH r WHERE size(r.source_files) = 0
-                        DELETE r
-                        """,
-                        tenant_id=tenant_id,
-                        rids=batch,
-                        source=source,
-                    )
-                ).consume()
-
-            await delete_in_batches(related_ids, _strip_related)
+            # RELATED_TO provenance strip (this source's key) + empty-edge delete, chunked.
+            await self._strip_provenance(session, key=provenance_key(source, chat_id))
             # The SourceFile node (document structure) is NOT a graph-phase
             # product: the embedding phase builds it, and a re-run of a graph
             # phase does not re-run the embedding. It goes away with the
@@ -4056,6 +4057,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         no concepts/relations) and ``processed=0``; a phase that produced
         nothing because the LLM could NOT run stays ``not_ready`` / ``error``.
         """
+        # the points are ONE source's (scoped by its chat): its provenance key, also for the retry counter
+        chat_ids = {((getattr(p, "payload", None) or {}).get("metadata") or {}).get("chat_id") for p in stored_points}
+        provenance = provenance_key(source, next(iter(chat_ids)) if len(chat_ids) == 1 else None)
         tenant_id = self.agent_id
 
         # Resolve the LLM to use: an explicit ``llm`` wins, then the stray's
@@ -4126,7 +4130,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         if len(combined) > max_chars:
             combined = combined[:max_chars] + " [truncated]"
 
-        attempt = self._next_concept_attempt(source)
+        attempt = self._next_concept_attempt(provenance)
         outcome = await self._llm_extract_relations(combined, llm=llm, attempt=attempt)
         status = outcome.get("status")
         if status != "done":
@@ -4135,7 +4139,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 f"complete: status={status} reason={outcome.get('reason')}"
             )
             if status == "error":
-                self._clear_concept_attempt(source)
+                self._clear_concept_attempt(provenance)
             return outcome
 
         relations = {
@@ -4150,7 +4154,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # no LLM), which stays ``not_ready`` / ``error`` in
         # ``_llm_extract_relations``.
         if not relations["concepts"] and not relations["relations"]:
-            self._clear_concept_attempt(source)
+            self._clear_concept_attempt(provenance)
             log.warning(
                 f"[GraphRAG] LLM extraction found no concepts or relations in "
                 f"{len(combined)} chars for '{source}'"
@@ -4180,11 +4184,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         await self._store_concept_relations(
             tenant_id,
             relations,
-            source=source,
+            source=provenance,
             document_ids=document_ids,
             concept_gen=gen or await self._concept_fingerprint(),
         )
-        self._clear_concept_attempt(source)
+        self._clear_concept_attempt(provenance)
         log.info(
             f"[GraphRAG] Stored {len(relations.get('relations', []))} concept relations for '{source}'"
         )
@@ -4917,7 +4921,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 )
                 docs = [record async for record in result]
 
-        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        by_source: Dict[Tuple[str, Optional[str]], List[Dict[str, Any]]] = {}
         for doc in docs:
             raw_meta = doc["metadata"]
             try:
@@ -4933,7 +4937,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             source = str(meta.get("source") or "unknown")
             if source_group is not None and source != source_group:
                 continue
-            by_source.setdefault(source, []).append(
+            # a knowledge base file and a chat file with the same name are two sources
+            by_source.setdefault((source, meta.get("chat_id")), []).append(
                 {
                     "id": doc["id"],
                     "page_content": doc["content"] or "",
@@ -4941,7 +4946,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 }
             )
 
-        for source in sorted(by_source):
+        for source, chat_id in sorted(by_source, key=lambda k: (k[0], k[1] or "")):
             payloads = [
                 PointStruct(
                     id=p["id"],
@@ -4952,7 +4957,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                     },
                     vector=[],
                 )
-                for p in by_source[source]
+                for p in by_source[(source, chat_id)]
             ]
             outcome = await self._extract_concept_relations(
                 source, payloads, stray_cat, gen=gen

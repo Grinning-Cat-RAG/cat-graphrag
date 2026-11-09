@@ -100,13 +100,13 @@ if __name__ == "__main__":
         await w.upload("a.pdf", ["Alice met Bob"])
         await w.upload("lost.pdf", ["Carol met Dave"], keep=False)
         before = await w.row("lost.pdf")
-        docs_before = w.store.scoped_doc_ids("lost.pdf", "declarative", None)
+        docs_before = w.store.scoped_doc_ids("lost.pdf", gf.DECLARATIVE, None)
         code, lines = await cli("--agent", w.agent, "--reingest", "--yes")
         assert code == 1, lines
         assert lines_with(lines, "source=lost.pdf", "detail=source-not-kept"), lines
         assert lines_with(lines, "op=reingest", "result=fail"), lines
         assert await w.row("lost.pdf") == before, "a source that cannot be reingested was touched"
-        assert w.store.scoped_doc_ids("lost.pdf", "declarative", None) == docs_before
+        assert w.store.scoped_doc_ids("lost.pdf", gf.DECLARATIVE, None) == docs_before
         assert (await w.row("a.pdf"))["status"] == "completed"
         assert not await crud_ingestions.is_in_maintenance(w.agent)
 
@@ -127,14 +127,14 @@ if __name__ == "__main__":
         await w.upload("a.pdf", ["Alice met Bob", "Carol"])
         await w.legacy("old.pdf", ["Erin met Frank"])
         parsing_before = (await w.row("a.pdf"))["completed_phases"]["parsing_chunking"]
-        ids_before = w.store.scoped_doc_ids("a.pdf", "declarative", None)
+        ids_before = w.store.scoped_doc_ids("a.pdf", gf.DECLARATIVE, None)
         code, lines = await cli("--agent", w.agent, "--reembed", "--yes")
         assert code == 0, lines
         row = await w.row("a.pdf")
         assert row["status"] == "completed"
         assert row["completed_phases"]["parsing_chunking"] == parsing_before, "reembed parsed again"
         assert row["completed_phases"]["embedding"]["finished_at"] >= parsing_before["finished_at"]
-        assert not ids_before & w.store.scoped_doc_ids("a.pdf", "declarative", None), "the points were not replaced"
+        assert not ids_before & w.store.scoped_doc_ids("a.pdf", gf.DECLARATIVE, None), "the points were not replaced"
         assert w.graph_ok("a.pdf")
         legacy = await w.row("old.pdf")
         assert legacy is not None and legacy["status"] == "completed" and w.graph_ok("old.pdf")
@@ -295,7 +295,7 @@ if __name__ == "__main__":
         assert lines_with(lines, "source=cloud.pdf", "detail=source-not-kept"), lines
         assert w.store.wipes == 1 and w.graph_ok("a.pdf")
         assert await w.row("cloud.pdf") is None
-        assert w.store.scoped_doc_ids("cloud.pdf", "declarative", None), "its points must stay"
+        assert w.store.scoped_doc_ids("cloud.pdf", gf.DECLARATIVE, None), "its points must stay"
         code, lines = await cli("--agent", w.agent, "--reembed", "--yes")
         assert code == 1 and lines_with(lines, "source=cloud.pdf", "detail=source-not-kept"), lines
 

@@ -128,6 +128,16 @@ if __name__ == "__main__":
             if source:
                 self.sourcefiles.add(source)
 
+
+    def _removed(key, params):
+        """The provenance keys the strip removes (the real Cypher of ``GraphRAGHandler._strip_provenance``): the key
+        of one source, every key of a chat (prefix), or every knowledge base key."""
+        return bool(
+            (params.get("key") is not None and key == params["key"])
+            or (params.get("prefix") is not None and key.startswith(params["prefix"]))
+            or (params.get("kb") and not key.startswith(params["chat_prefix"]))
+        )
+
     class _FakeSession:
         def __init__(self, store):
             self.store = store
@@ -183,14 +193,13 @@ if __name__ == "__main__":
                         if rid in params.get("rids", list(store.similar))
                         and rel.get("tenant") == tenant
                     ])
-                source = params.get("source")
                 return _FakeResult([
                     {"rid": rid}
                     for rid, rel in store.related.items()
                     if rid in store.related
                     and rid in params.get("rids", list(store.related))
                     and ent_tenant(store, rid) == tenant
-                    and source in (store.related[rid].get("files") or [])
+                    and any(_removed(f, params) for f in (store.related[rid].get("files") or []))
                 ])
 
             if "RETURN sf.name AS name" in q:
@@ -208,7 +217,7 @@ if __name__ == "__main__":
                     rel = store.related.get(rid)
                     if rel is None:
                         continue
-                    files = [f for f in rel.get("files", []) if f != params["source"]]
+                    files = [f for f in rel.get("files", []) if not _removed(f, params)]
                     if files:
                         rel["files"] = files
                     else:

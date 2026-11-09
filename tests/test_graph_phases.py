@@ -75,7 +75,7 @@ if __name__ == "__main__":
         def assert_current_graph(self, name, chat=None, concepts=True):
             ids = self.doc_ids(name, chat)
             expected = self.store.expected_for(ids, concepts)
-            actual = self.store.actual_for(ids, name)
+            actual = self.store.actual_for(ids, name, chat)
             assert actual == expected, f"graph of {name!r} ({chat}) is not the one of its content:\n{actual}\n!=\n{expected}"
             assert not self.handler._pending_source_tasks.get((name, chat)), f"tasks left for {name!r}"
 
@@ -201,16 +201,16 @@ if __name__ == "__main__":
             await gf.delete(engine, env.rh, env.cat, "chat-1", "x.pdf")
             assert not env.doc_ids("x.pdf", "chat-1")
             assert {(d, e) for d, e in env.store.mentions if d in kb_ids} == kb_mentions, "chat delete touched KB docs"
-            assert all(p[1] == "episodic" and p[2] == "chat-1" for p in env.store.purges[-2:]), env.store.purges
+            assert all(p[1] == gf.EPISODIC and p[2] == "chat-1" for p in env.store.purges[-2:]), env.store.purges
 
     async def test_points_are_read_page_by_page():
         async with Env() as env:
             for i in range(2300):
                 env.store.docs[f"d{i:05d}"] = {
-                    "collection": "declarative", "content": f"Item{i} here", "metadata": {"source": "big.pdf"},
+                    "collection": gf.DECLARATIVE, "content": f"Item{i} here", "metadata": {"source": "big.pdf"},
                     "vector": [1.0, 1.0],
                 }
-            points = await env.handler.get_source_points("declarative", "big.pdf", None)
+            points = await env.handler.get_source_points(gf.DECLARATIVE, "big.pdf", None)
             assert len(points) == 2300, len(points)
 
     # ── outcomes ─────────────────────────────────────────────────────────────
@@ -374,7 +374,7 @@ if __name__ == "__main__":
     async def test_points_without_source_or_vector():
         async with Env() as env:
             # a payload-only point (zero vector) still starts the extraction, without a similarity task
-            await env.handler.add_points_to_tenant("declarative", [
+            await env.handler.add_points_to_tenant(gf.DECLARATIVE, [
                 PointStruct(id="z0", payload={"page_content": "Alice met Bob", "metadata": {"source": "z.pdf"}},
                             vector=[0.0, 0.0]),
                 # a point without a source is stored, but tracked under no source
@@ -384,7 +384,7 @@ if __name__ == "__main__":
             assert len(tasks) == 1, tasks  # the extraction only: no similarity for a zero vector
             assert set(env.handler._pending_source_tasks) == {("z.pdf", None)}, env.handler._pending_source_tasks
             env.handler._embedder = None
-            await env.handler.add_points_to_tenant("declarative", [])  # nothing to store: no embedder resolved
+            await env.handler.add_points_to_tenant(gf.DECLARATIVE, [])  # nothing to store: no embedder resolved
             assert env.handler._embedder is None
             env.handler._drop_source_tasks(None)  # no source: nothing to drop
             assert ("z.pdf", None) in env.handler._pending_source_tasks
@@ -413,6 +413,13 @@ if __name__ == "__main__":
         assert read(json.dumps({"source": "a.pdf", "tenant_id": "t"})) == {"source": "a.pdf"}
         assert read({"source": "a.pdf", "tenant_id": "t"}) == {"source": "a.pdf"}
         assert read("not json") == {} and read(None) == {} and read(json.dumps([1])) == {}
+
+    async def test_the_stub_of_the_core_enum_matches_the_core():
+        """The harnesses that stub the core share one copy of ``VectorMemoryType``: it must be the core's."""
+        from cat.services.memory.models import VectorMemoryType
+
+        stub = {k: v for k, v in vars(gf.StubVectorMemoryType).items() if k.isupper()}
+        assert stub == {m.name: m.value for m in VectorMemoryType}, stub
 
     # ── EffING leftovers ─────────────────────────────────────────────────────
     async def test_no_effing_leftovers():

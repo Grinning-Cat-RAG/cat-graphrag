@@ -53,6 +53,9 @@ if __name__ == "__main__":
     _pkg.__path__ = [REPO_ROOT]
     sys.modules["catgraphrag_pendingtest"] = _pkg
     graphrag_handler = importlib.import_module("catgraphrag_pendingtest.graphrag_handler")
+    from cat.services.memory.models import VectorMemoryType  # the stub of the core's enum (test_kg_master_switch)
+
+    DECLARATIVE, EPISODIC = str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)
 
     class _FakeResult:
         async def single(self):
@@ -123,7 +126,7 @@ if __name__ == "__main__":
     async def _track_points(handler, source, point_ids, chat_id=None):
         for point_id in point_ids:
             await handler.add_point_to_tenant(
-                collection_name="declarative" if chat_id is None else "episodic",
+                collection_name=DECLARATIVE if chat_id is None else EPISODIC,
                 content=f"content {point_id}",
                 vector=[0.1, 0.2, 0.3],
                 metadata={"source": source} | ({"chat_id": chat_id} if chat_id else {}),
@@ -168,16 +171,16 @@ if __name__ == "__main__":
             return await original(document_id, content, metadata)
 
         handler._extract_document_graph = counting
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result == {"status": "done", "processed": 3}, result
-        assert events == [("purge", source, "declarative", None)], events
+        assert events == [("purge", source, DECLARATIVE, None)], events
         assert len(writes) == 1, f"expected ONE batch write, got {len(writes)}"
         assert {e["id"] for e in writes[0][0]} == {f"entity-{p}" for p in point_ids}
         assert extracted == [], "a complete batch must not be extracted again"
         assert (source, None) not in handler._pending_source_tasks, "the phase must consume the tasks"
 
         # A re-run (no task in memory: e.g. after a restart) replaces the graph by re-extracting.
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result == {"status": "done", "processed": 3}, result
         assert sorted(extracted) == sorted(point_ids) and len(writes) == 2
         print("PASS test_finished_before_prune_still_contributes")
@@ -216,7 +219,7 @@ if __name__ == "__main__":
                 return await good(document_id, content, metadata)
 
             handler._extract_document_graph = counting
-            result = await handler.run_spacy_extraction_phase(source, "declarative")
+            result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
             assert result["status"] == "done", result
             assert sorted(extracted) == sorted(point_ids), f"{kind}: phase did not re-extract: {extracted}"
             assert len(writes) == 1 and len(writes[0][0]) == 3, f"{kind}: {writes}"
@@ -230,7 +233,7 @@ if __name__ == "__main__":
         handler = _make_handler(writes)
         await _track_points(handler, source, ["l-0", "l-1"])
         _stored(handler, source, ["l-0"], [])
-        result = await handler.run_llm_extraction_phase(source, "declarative")
+        result = await handler.run_llm_extraction_phase(source, DECLARATIVE)
         assert result["status"] == "skipped", result
         assert writes == [], f"LLM phase wrote the spaCy batch: {writes}"
         assert handler._pending_source_tasks.get((source, None)), "LLM phase consumed the spaCy tasks"
@@ -257,7 +260,7 @@ if __name__ == "__main__":
             return None
 
         handler._extract_document_graph = counting
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result == {"status": "done", "processed": 2}, result
         assert extracted == [], "a similarity failure must not mark the batch incomplete"
         assert len(writes) == 1 and len(writes[0][0]) == 2, writes
@@ -272,7 +275,7 @@ if __name__ == "__main__":
         assert len(handler._pending_source_tasks[("same.pdf", "c1")]) == 2
 
         _stored(handler, "same.pdf", ["kb-0"], [])
-        await handler.run_spacy_extraction_phase("same.pdf", "declarative")
+        await handler.run_spacy_extraction_phase("same.pdf", DECLARATIVE)
         assert ("same.pdf", None) not in handler._pending_source_tasks
         assert handler._pending_source_tasks.get(("same.pdf", "c1")), "KB phase consumed the chat tasks"
         assert {e["id"] for e in writes[0][0]} == {"entity-kb-0"}, writes
@@ -290,7 +293,7 @@ if __name__ == "__main__":
         await _track_points(handler, "gone.pdf", ["g-0"])
         events = []
         _stored(handler, "gone.pdf", [], events)
-        result = await handler.run_spacy_extraction_phase("gone.pdf", "declarative")
+        result = await handler.run_spacy_extraction_phase("gone.pdf", DECLARATIVE)
         assert result["status"] == "error", result
         assert events == [] and writes == [], (events, writes)
         assert ("gone.pdf", None) not in handler._pending_source_tasks
@@ -315,7 +318,7 @@ if __name__ == "__main__":
             return await good(document_id, content, metadata)
 
         handler._extract_document_graph = counting
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result == {"status": "done", "processed": 1}, result
         assert [e["id"] for e in writes[0][0]] == ["entity-new-0"], writes
         assert extracted == [], "the current point had its extraction: nothing to extract again"
@@ -325,7 +328,7 @@ if __name__ == "__main__":
         await _track_points(handler, source, ["new-0"])
         _stored(handler, source, ["new-0", "new-1"], [])  # new-1 has no extraction in memory
         handler._extract_document_graph = counting
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result == {"status": "done", "processed": 2}, result
         assert sorted(extracted) == ["new-0", "new-1"], extracted
         assert sorted(e["id"] for e in writes[0][0]) == ["entity-new-0", "entity-new-1"], writes
@@ -341,7 +344,7 @@ if __name__ == "__main__":
         await _track_points(handler, source, ["empty-0"])
         _stored(handler, source, ["empty-0"], [])
         handler._extract_document_graph = counting
-        result = await handler.run_spacy_extraction_phase(source, "declarative")
+        result = await handler.run_spacy_extraction_phase(source, DECLARATIVE)
         assert result["status"] == "done" and extracted == [] and writes == [], (result, extracted, writes)
         print("PASS test_tasks_of_replaced_points_are_left_out")
 

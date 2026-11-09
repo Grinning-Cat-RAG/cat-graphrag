@@ -47,7 +47,7 @@ if __name__ == "__main__":
     main_mod, handler_mod, phases_mod = gf.bootstrap("_graphrag_cli_stateful")
 
     from hypothesis import HealthCheck, settings, strategies as st
-    from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
+    from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, rule
 
     from cat.db.cruds import ingestions as crud_ingestions
     from cat.db.cruds import settings as crud_settings
@@ -135,27 +135,30 @@ if __name__ == "__main__":
             return bool(self.world.store.scoped_doc_ids(name, gf.FakeRabbitHole.collection(chat), chat))
 
         # ── server-side operations ──────────────────────────────────────────
-        @precondition(lambda self: not self.dead_cli)
         @rule(source=st.sampled_from(SOURCES), chunks=contents, keep=st.booleans(), fail=RARE)
         def upload(self, source, chunks, keep, fail):
+            if self.dead_cli:  # a CLI died: only its marker expiring or the resume happen (checked here, not as a
+                return  # precondition: whether a crash happened depends on background work hypothesis cannot replay)
             name, chat = source
             self.world.store.fail_writes = 1 if fail else 0
             run(self.world.upload(name, chunks, chat, keep=keep))
             self.world.store.fail_writes = 0
             self.last = None
 
-        @precondition(lambda self: not self.dead_cli)
         @rule(source=st.sampled_from(SOURCES), chunks=contents)
         def legacy(self, source, chunks):
+            if self.dead_cli:
+                return
             name, chat = source
             if run(self.world.row(name, chat)) is not None or self._has_docs(name, chat):
                 return
             run(self.world.legacy(name, chunks, chat))
             self.last = None
 
-        @precondition(lambda self: not self.dead_cli)
         @rule(source=st.sampled_from(SOURCES))
         def delete(self, source):
+            if self.dead_cli:
+                return
             name, chat = source
             if run(self.world.row(name, chat)) is None:
                 return
@@ -163,9 +166,10 @@ if __name__ == "__main__":
             self.last = None
 
         # ── the CLI ─────────────────────────────────────────────────────────
-        @precondition(lambda self: not self.dead_cli)
         @rule(op=st.sampled_from(OPS), episodic=st.booleans(), fault=st.sampled_from([None, None, "neo4j", "crash"]))
         def cli(self, op, episodic, fault):
+            if self.dead_cli:
+                return
             collection = "episodic" if episodic else "declarative"
             scope = self._scope(op, collection)
             not_kept = {s for s in scope if (s[1], s[0]) not in self.world.kept}
@@ -197,12 +201,13 @@ if __name__ == "__main__":
                     return True
             return False
 
-        @precondition(lambda self: not self.dead_cli)
         @rule()
         def graph_dies_after_its_wipe(self):
             """A restart right after the wipe of ``--graph`` (the longest step on a large tenant), when there is a graph
             to lose: what the resume must rebuild. Checked inside the rule, not as a precondition: the graph is written
             by background work, and hypothesis requires preconditions that replay identically."""
+            if self.dead_cli:
+                return
             if not self._a_completed_source_has_a_graph():
                 self.last = None
                 return
@@ -221,9 +226,10 @@ if __name__ == "__main__":
                     scope.add((name, chat))
             return scope
 
-        @precondition(lambda self: self.dead_cli)
         @rule()
         def marker_expires(self):
+            if not self.dead_cli:
+                return
             run(crud_ingestions.clear_maintenance(self.agent))
             self.dead_cli = False
 
@@ -306,7 +312,8 @@ if __name__ == "__main__":
 
     if args.mutate:
         if outcome == "FAIL":
-            print(f"PASS mutation '{args.mutate}' is caught: {str(failure).splitlines()[0][:200]}")
+            reasons = [str(e).splitlines()[0][:160] for e in getattr(failure, "exceptions", [failure])]
+            print(f"PASS mutation '{args.mutate}' is caught: {' | '.join(reasons)}")
             sys.exit(0)
         print(f"FAIL mutation '{args.mutate}' was NOT caught by the rules")
         sys.exit(1)

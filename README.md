@@ -71,7 +71,7 @@ At runtime it provides:
 - a settings model: `Neo4jGraphRAGConfig`, registered through `factory_allowed_vector_databases`
 - ingestion hooks: embedder injection and chunk ordering (`before_rabbithole_stores_documents`), and the two graph phases added to the core's ingestion (`rabbithole_ingestion_phases`, see below)
 - a query hook that captures the raw user message before memory recall
-- maintenance hooks: boot-time provenance reconciliation, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
+- maintenance hooks: provenance reconciliation of a newly created agent, and old-store cleanup on vector-memory switch (`after_vector_memory_transfer_on_agent`)
 
 The query hook is important: it allows the retrieval stage to extract entities from the actual query text, instead of relying only on whatever vector search returns.
 
@@ -123,7 +123,7 @@ How a source goes through them:
 
 Outcomes: `done` (the spaCy phase reports `processed` = entities + relations, or an `empty-extraction` warning when the content has none), `skipped` (the LLM phase with `enable_concept_relations` off), `not_ready` for a transient LLM outcome (retried by the core within the phase's 300 s budget), `error` otherwise — including a source without stored points, which the embedding phase always writes before. A failed spaCy phase fails the LLM phase after it (the core marks the dependents of a failed phase).
 
-**Sources are scoped by name AND chat**: a file with the same name in the knowledge base and in a chat are two sources. The points read by the phases, their background tasks and the purge are limited to the collection (declarative / episodic) and the chat of the source. The `source_files` provenance of the `RELATED_TO` relations records names only, so it is shared by sources with the same name.
+**Sources are scoped by name AND chat**: a file with the same name in the knowledge base and in a chat are two sources. The points read by the phases, their background tasks and the purge are limited to the collection (declarative / episodic) and the chat of the source. The `source_files` provenance of the `RELATED_TO` relations is scoped too: the name for a knowledge base file, `chat:<chat_id>:<name>` for a chat file. Every deletion strips only its own scope: a source deleted, a chat destroyed (all its keys), a whole collection deleted (the knowledge base keys, or all the chat keys). Relations written by an earlier version for a chat file carry the name alone, as if they came from the knowledge base: on upgrade, run `--graph` (maintenance CLI) on the agents with files uploaded in chats, which rebuilds them scoped. Deleting another collection (e.g. `procedural`, at every plugin toggle) strips no provenance.
 
 ### Concept and relation extraction (agent-level LLM)
 
@@ -401,7 +401,7 @@ A few things are worth knowing before production use:
 
 | File | Purpose |
 |---|---|
-| `main.py` | Hook registration: query capture, embedder injection, graph phase registration, transfer cleanup, boot reconciliation, concept recompute on save |
+| `main.py` | Hook registration: query capture, embedder injection, graph phase registration, transfer cleanup, provenance reconciliation of a new agent, concept recompute on save and on an LLM change |
 | `phases.py` | The two graph phases added to the core's ingestion (`graph_spacy_extraction`, `graph_llm_extraction`) |
 | `graphrag_handler.py` | `GraphRAGHandler` core logic + `Neo4jGraphRAGConfig` settings model |
 | `entity_extractor.py` | spaCy-based entity and relation extraction pipeline |

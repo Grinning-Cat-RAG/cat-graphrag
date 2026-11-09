@@ -20,6 +20,20 @@ PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: Redis database of the harnesses: never the one of a running Cat (0) nor the one of the core test suite (1).
 TEST_REDIS_DB = "14"
 
+#: The names of the core's collections (``str(VectorMemoryType.X)``): set by ``bootstrap``, which loads the core (this
+#: module imports nothing from ``cat`` at import time).
+DECLARATIVE = EPISODIC = PROCEDURAL = None
+
+
+class StubVectorMemoryType(str):
+    """The core's ``VectorMemoryType`` (cat/services/memory/models.py) for the harnesses that stub the core instead of
+    loading it: ``str()`` of a member is its value, as in the core. The one copy: ``test_graph_phases.py`` checks it
+    against the real enum."""
+
+    EPISODIC = "episodic"
+    DECLARATIVE = "declarative"
+    PROCEDURAL = "procedural"
+
 
 def bootstrap(package_name):
     """Prepare the REAL core (env vars, Redis on localhost) and load the plugin as ``package_name``.
@@ -39,6 +53,12 @@ def bootstrap(package_name):
     package = types.ModuleType(package_name)
     package.__path__ = [PLUGIN_DIR]
     sys.modules[package_name] = package
+    global DECLARATIVE, EPISODIC, PROCEDURAL
+    from cat.services.memory.models import VectorMemoryType
+
+    DECLARATIVE = str(VectorMemoryType.DECLARATIVE)
+    EPISODIC = str(VectorMemoryType.EPISODIC)
+    PROCEDURAL = str(VectorMemoryType.PROCEDURAL)
     return (
         importlib.import_module(f"{package_name}.main"),
         importlib.import_module(f"{package_name}.graphrag_handler"),
@@ -140,6 +160,7 @@ class FakeGraphStore:
         self.concept_fingerprint = "fp-1"  # the fingerprint of the current concept settings
         self.concept_marker = None  # the persisted active concept generation
         self.concept_gcs = 0
+        self.key_of = None  # the provenance key of the handler module (set by install)
 
     # ── documents ────────────────────────────────────────────────────────────
     def _matches(self, doc, collection, metadata):
@@ -159,9 +180,11 @@ class FakeGraphStore:
         self.provenance = {(d, e) for d, e in self.provenance if d not in doc_ids}
         self.similar -= set(doc_ids)
 
-    def _strip_related(self, source):
+    def _strip_related(self, keep):
+        """Remove the provenance keys ``keep`` rejects (a key, or a predicate), and the relations left without one."""
+        rejects = keep if callable(keep) else (lambda k: k == keep)
         for key in list(self.related):
-            self.related[key].discard(source)
+            self.related[key] = {k for k in self.related[key] if not rejects(k)}
             if not self.related[key]:
                 del self.related[key]
 
@@ -179,7 +202,12 @@ class FakeGraphStore:
     # ── handler boundary ─────────────────────────────────────────────────────
     def install(self, handler, system_embedder=None):
         """Replace the handler's storage methods with this store (the orchestration code stays real)."""
+        import sys as _sys
+
         store = self
+        # the provenance key of the REAL handler module: the fake keys relations exactly as the real code does
+        key_of = _sys.modules[type(handler).__module__].provenance_key
+        store.key_of = key_of
 
         async def noop(*args, **kwargs):
             return None
@@ -220,6 +248,7 @@ class FakeGraphStore:
             store.embedders_used.append(handler._embedder)
             names = content_entities(content)
             source = (metadata or {}).get("source")
+            source = key_of(source, (metadata or {}).get("chat_id")) if source else None
             return {
                 "entities": [{"id": n} for n in names],
                 "mentions": [{"document_id": document_id, "entity_id": n} for n in names],
@@ -248,11 +277,20 @@ class FakeGraphStore:
             handler._drop_source_tasks((metadata or {}).get("source"), (metadata or {}).get("chat_id"))
             ids = {d for d, doc in store.docs.items() if store._matches(doc, collection_name, metadata)}
             store._drop_docs(ids)
-            source = (metadata or {}).get("source")
+            source, chat_id = (metadata or {}).get("source"), (metadata or {}).get("chat_id")
             if source:
-                store._strip_related(source)
+                store._strip_related(key_of(source, chat_id))
                 store._prune(tracked_only=True)
-            else:
+            elif metadata and set(metadata) == {"chat_id"}:  # a chat destroyed: every key of the chat
+                store._strip_related(lambda k: k.startswith(key_of("", chat_id)))
+                store._prune()
+            elif not metadata and collection_name == DECLARATIVE:  # the whole knowledge base
+                store._strip_related(lambda k: not k.startswith("chat:"))
+                store._prune()
+            elif not metadata and collection_name == EPISODIC:  # every chat's memory
+                store._strip_related(lambda k: k.startswith("chat:"))
+                store._prune()
+            else:  # another collection (e.g. procedural) or another filter: no provenance to strip
                 store._prune()
 
         async def delete_tenant_points_by_ids(collection_name, points_ids):
@@ -269,7 +307,7 @@ class FakeGraphStore:
             store.provenance = {(d, e) for d, e in store.provenance if d not in ids}
             store.similar -= ids
             store._prune(candidates)
-            store._strip_related(source)
+            store._strip_related(key_of(source, chat_id))
             return len(ids)
 
         async def concepts(source, stored_points, stray_cat=None, gen=None, llm=None):
@@ -288,7 +326,8 @@ class FakeGraphStore:
                 concept = f"C:{words[0]}"
                 store.entities.setdefault(concept, {"tracked": True})
                 store.provenance.add((p.id, concept))
-                store.related.setdefault((concept, words[0], "DESCRIBES"), set()).add(source)
+                chat_id = (p.payload.get("metadata") or {}).get("chat_id")
+                store.related.setdefault((concept, words[0], "DESCRIBES"), set()).add(key_of(source, chat_id))
             return {"status": "done", "processed": len(stored_points)}
 
         async def wipe_tenant_graph():
@@ -351,15 +390,18 @@ class FakeGraphStore:
                 related.add((f"C:{names[0]}", names[0], "DESCRIBES"))
         return mentions, provenance, related
 
-    def actual_for(self, doc_ids, source):
+    def actual_for(self, doc_ids, source, chat_id=None):
         return (
             {(d, e) for d, e in self.mentions if d in doc_ids},
             {(d, e) for d, e in self.provenance if d in doc_ids},
-            self.related_of(source),
+            self.related_of(source, chat_id),
         )
 
-    def related_of(self, source):
-        return {key for key, sources in self.related.items() if source in sources}
+    def related_of(self, source, chat_id=None):
+        """The relations whose provenance includes the source (its key: the name in the knowledge base, scoped by
+        the chat in a chat)."""
+        key = self.key_of(source, chat_id)
+        return {k for k, keys in self.related.items() if key in keys}
 
 
 class _FakeResult:
@@ -429,7 +471,7 @@ class FakeRabbitHole:
 
     @staticmethod
     def collection(chat_id):
-        return "declarative" if chat_id is None else "episodic"
+        return DECLARATIVE if chat_id is None else EPISODIC
 
     async def run_parsing_chunking(self, source, cat):
         from cat.rabbit_hole.phases import PhaseResult
@@ -619,7 +661,7 @@ class CliWorld:
         ids = self.store.scoped_doc_ids(name, FakeRabbitHole.collection(chat), chat)
         if sorted(self.store.docs[d]["content"] for d in ids) != sorted(self.files[(chat, name)]):
             return False
-        return self.store.actual_for(ids, name) == self.store.expected_for(ids, concepts)
+        return self.store.actual_for(ids, name, chat) == self.store.expected_for(ids, concepts)
 
 
 async def current_tags(rabbit_hole, cat):
