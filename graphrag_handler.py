@@ -519,6 +519,51 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         return _l2_sq != 0.0 and math.isfinite(math.sqrt(_l2_sq))
 
     @staticmethod
+    def _is_empty_mapping(vector) -> bool:
+        """Whether the point carries a legacy ``vector={}`` empty mapping.
+
+        The old two-phase engine's staging pass wrote ``vector={}`` (a truthy-type but empty ``dict``), NOT a
+        numeric zero-norm vector. The current core writes a source once and always stores the ``List[float]``
+        returned by the embedder (a zero-norm *list* on a fallback), so an empty mapping can only come from data
+        written by that legacy two-pass engine.
+        """
+        return isinstance(vector, dict) and not vector
+
+    async def _is_empty_vector_staging_pass(
+        self, source: Optional[str], metadata: Dict | None, vector=None
+    ) -> bool:
+        """Whether this write belongs to a legacy empty-vector staging pass.
+
+        The old two-phase engine stored every chunk TWICE: once in ``parsing_chunking`` with ``vector={}`` and
+        again in ``embedding`` with real vectors (or payload-only for images). Graph extraction is
+        vector-independent, so it must run on the second pass only. The current core writes a source once, so this
+        discriminator never fires there; it stays to keep data written by the legacy engine readable.
+
+        The discriminator is the CONJUNCTION of two signals:
+
+        1. the point carries the empty mapping ``vector={}`` (see :meth:`_is_empty_mapping`) — written ONLY by the
+           staging pass; and
+        2. the source's recorded phase is ``parsing_chunking``.
+
+        Vector VALIDITY is still not the discriminator: a legitimate payload-only / zero-norm vector (list) MUST
+        build the graph.
+
+        No status doc / no empty mapping (direct writes) means "not a staging pass": build the graph, as before.
+        """
+        if not source or not self._is_empty_mapping(vector):
+            return False
+        try:
+            from cat.db.cruds import ingestions as crud_ingestions
+
+            chat_id = (metadata or {}).get("chat_id")
+            doc = await crud_ingestions.get_status(self.agent_id, chat_id, source)
+        except Exception:  # noqa: BLE001 - never let the discriminator break a write
+            return False
+        if not doc:
+            return False
+        return doc.get("phase") == "parsing_chunking"
+
+    @staticmethod
     def _next_generation(gen: str) -> str:
         """Increment a generation token: 'v1' -> 'v2', 'v2' -> 'v3'."""
         try:
@@ -1443,6 +1488,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         vector: Iterable,
         metadata: Dict = None,
         id_point: str | None = None,
+        skip_graph: bool = False,
         point_index: int | None = None,
         route: Optional[str] = None,
         **kwargs,
@@ -1572,7 +1618,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Start entity extraction in the background, whatever the vector: a
         # payload-only document (zero/empty vector, e.g. an image under a
         # non-multimodal embedder) still builds the graph.
-        if extract and self._enable_entity_extraction and self._entity_extractor:
+        # The gate is the PASS (``skip_graph``, set by ``add_points_to_tenant`` from
+        # ``_is_empty_vector_staging_pass``), not vector validity. Catalogue-card text is never source prose and
+        # must not feed the entity graph, but the FLAG alone is never a veto: content wins (a real prose chunk can
+        # carry leaked card metadata), so only the card HEADER excludes the point.
+        if (
+            extract
+            and not skip_graph
+            and not self._looks_like_catalogue_card_content(content or "")
+            and self._enable_entity_extraction
+            and self._entity_extractor
+        ):
             # EXTRACTION ONLY: the child is CPU-bound and lock-free, so every
             # chunk of the source may extract in parallel. It returns the
             # extracted batch; the source's ONE write happens in the spaCy
@@ -1734,7 +1790,10 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             return {"status": "error", "reason": f"no stored points for source '{source}'"}
 
         await self.purge_source_graph_artifacts(source, collection_name, chat_id)
-        content_points = [p for p in points if (getattr(p, "payload", None) or {}).get("page_content", "")]
+        # Entity extraction runs on real text only, with the SAME content-first selection as the LLM phase: blank,
+        # image, binary and catalogue-card-header points are dropped. The card FLAG alone is never a veto: content
+        # wins, so real prose that merely inherited card metadata still extracts.
+        content_points = self._select_extraction_text_points(points)
         batch = (
             await self._gather_source_tasks(source, tasks, {str(p.id) for p in content_points}) if tasks else None
         )
@@ -2623,7 +2682,23 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             await self._ensure_current_embedder()
 
         routes = await self._graph_routes(collection_name, [(p.payload or {}).get("metadata") or {} for p in points])
-        for index, point in enumerate(points):
+
+        # Discriminate the legacy EMPTY-VECTOR STAGING PASS, not vector validity: that pass wrote every point with
+        # ``vector={}`` and owns no graph, while the ``embedding`` pass (real vectors or payload-only) owns it. The
+        # phase read is cached per (source, chat, empty-mapping) scope, not per point; the empty-mapping signal is
+        # per point and never appears on the current core's single-write path (see ``_is_empty_mapping``).
+        staging_cache: Dict[Tuple[Optional[str], Optional[str], bool], bool] = {}
+        staging_flags: List[bool] = []
+        for point in points:
+            meta = (point.payload or {}).get("metadata", {}) or {}
+            key = (meta.get("source"), meta.get("chat_id"), self._is_empty_mapping(point.vector))
+            if key not in staging_cache:
+                staging_cache[key] = await self._is_empty_vector_staging_pass(
+                    meta.get("source"), meta, point.vector
+                )
+            staging_flags.append(staging_cache[key])
+
+        for index, (point, is_staging) in enumerate(zip(points, staging_flags)):
             metadata = point.payload.get("metadata", {})  # type: ignore[union-attr]
             await self.add_point_to_tenant(
                 collection_name,
@@ -2631,6 +2706,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 point.vector,
                 metadata,  # type: ignore[arg-type]
                 str(point.id),
+                skip_graph=is_staging,
                 point_index=index,
                 route=routes[_route_key(metadata or {})],
             )
@@ -2638,13 +2714,19 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # Derived structure graph (SourceFile / NEXT / Section / ...). The
         # entity and concept graph is built by the graph phases (phases.py).
         # a knowledge base file and a chat file with the same name are two sources: two structures
+        # A source whose every point belongs to the legacy staging pass builds no graph at all.
         sources: Dict[Tuple[str, Optional[str]], List[PointStruct]] = {}
-        for p in points:
-            meta = (p.payload or {}).get("metadata", {}) or {}
+        staging_by_source: Dict[Tuple[str, Optional[str]], List[bool]] = {}
+        for point, is_staging in zip(points, staging_flags):
+            meta = (point.payload or {}).get("metadata", {}) or {}
             src = meta.get("source")
             if src:
-                sources.setdefault((src, meta.get("chat_id")), []).append(p)
+                key = (src, meta.get("chat_id"))
+                sources.setdefault(key, []).append(point)
+                staging_by_source.setdefault(key, []).append(is_staging)
         for (source, chat_id), src_points in sources.items():
+            if all(staging_by_source[(source, chat_id)]):
+                continue
             await self.create_derived_graph_for_source(source, src_points, chat_id)
 
         await self._after_outside_writes(collection_name, routes)
