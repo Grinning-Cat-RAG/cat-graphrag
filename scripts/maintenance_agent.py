@@ -193,6 +193,24 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _ensure_cat_on_path() -> None:
+    """Make the Cat package importable when the script runs from inside it.
+
+    In the container the plugin lives at ``/app/cat/plugins/<plugin>/``, which is not on ``sys.path`` when the
+    script is launched by path: ``sys.path[0]`` is the script directory, so ``import cat`` fails. Walk up from the
+    script and add the first ancestor that actually contains a ``cat`` package.
+    """
+    if importlib.util.find_spec("cat") is not None:
+        return
+
+    from pathlib import Path
+
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "cat" / "__init__.py").is_file():
+            sys.path.insert(0, str(parent))
+            return
+
+
 def _runtime_guard() -> bool:
     """Check we are running inside the Cat runtime.
 
@@ -201,6 +219,7 @@ def _runtime_guard() -> bool:
     Returns True when ``cat`` / ``cat.db.database`` are importable; otherwise
     prints the required invocation and returns False.
     """
+    _ensure_cat_on_path()
     try:
         if importlib.util.find_spec("cat") is None:
             raise ImportError("cat not importable")
