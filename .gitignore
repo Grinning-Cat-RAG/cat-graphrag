@@ -220,3 +220,8 @@ __marimo__/
 
 # local agent/tooling files (never commit)
 .claude/
+
+# local agent tooling
+.opencode
+.omo
+AGENTS.md
