@@ -56,6 +56,11 @@ if __name__ == "__main__":
             neo4j_uri=args.uri,
             neo4j_user=args.user,
             neo4j_password=args.password,
+            # Isolate the vector indexes: the live test uses a 2-dim fake embedder and the index names are
+            # GLOBAL (not tenant-scoped). Without this, `initialize` would drop/recreate the shared
+            # `document_embeddings_v1` / `entity_embeddings_v1` at 2 dims, breaking every real tenant.
+            document_vector_index=f"document_embeddings_test_{uuid.uuid4().hex[:8]}",
+            entity_vector_index=f"entity_embeddings_test_{uuid.uuid4().hex[:8]}",
             enable_entity_extraction=False,
             enable_concept_relations=False,
         )
@@ -470,6 +475,9 @@ if __name__ == "__main__":
         finally:
             for h in (handler, other):
                 await run(h, "MATCH (n {tenant_id: $tenant_id}) DETACH DELETE n")
+                for index in (h._document_vector_index, h._entity_vector_index):
+                    async with h._get_session() as session:
+                        await session.run(f"DROP INDEX {index} IF EXISTS")
                 await h.close()
                 await gf.destroy_agent(h.agent_id)
         print(f"\ntest_graph_purge_live: {len(tests) - failed}/{len(tests)} passed")
