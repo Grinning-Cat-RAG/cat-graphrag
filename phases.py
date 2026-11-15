@@ -13,10 +13,10 @@ generation (``concept_gen IS NOT NULL``). Each phase purges only its own artifac
 keeps the spaCy graph (and vice versa); the LLM phase depends on the spaCy one and runs again when it runs.
 
 The tag of a phase (``settings``) holds only what no dedicated job owns: the spaCy models and the two toggles (the
-concept toggle is in the spaCy tag too: turning the concepts off must re-run the purge that removes them). The
-technology patterns are refreshed on save (``refresh_technology_entities``), and the concept definitions and the
-prompt switch generation atomically (the concept recompute in ``main.py``): putting them in the tags would run the
-same work twice.
+concept toggle is in the spaCy tag too: turning the concepts off must re-run the spaCy phase, and the LLM phase
+after it purges the concepts it wrote before). The technology patterns are refreshed on save
+(``refresh_technology_entities``), and the concept definitions and the prompt switch generation atomically (the
+concept recompute in ``main.py``): putting them in the tags would run the same work twice.
 
 ``graphrag_handler`` is imported lazily (FX-9: the plugin loader reloads ``main.py`` before ``graphrag_handler.py``,
 so a module-level binding would compare against the PRE-reload class and every ``isinstance`` guard would fail).
