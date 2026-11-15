@@ -1769,8 +1769,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         1. takes the source's background extraction tasks (started by ``add_point_to_tenant`` while the embedding
            phase stored the points);
-        2. purges the graph the source contributed before (``purge_source_graph_artifacts``): the phase replaces its
-           product, never adds to it (new content, changed spaCy models, a resume after a crash);
+        2. purges the spaCy graph the source contributed before (``purge_source_graph_artifacts(..., phase=...)``):
+           the phase replaces its product, never adds to it (new content, changed spaCy models, a resume after a
+           crash); the LLM concepts are left untouched (the LLM phase purges its own product);
         3. joins the tasks, keeping the product of the source's CURRENT points only; when a current point has none
            (a resume: the tasks lived in another process) or a chunk failed, extracts every stored chunk CONCURRENTLY
            (spaCy is CPU-bound, no Neo4j locks);
@@ -1779,8 +1780,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
         Returns ``done`` (with ``processed`` = entities + relations, or an ``empty-extraction`` warning when the
         content has no entities) or ``error`` when the source has no stored point (the embedding phase stores them
-        before this phase runs). Exceptions propagate: the core records the phase as ``error``. The purge also
-        removes the concepts of the source: the LLM phase depends on this one and runs again after it.
+        before this phase runs). Exceptions propagate: the core records the phase as ``error``.
         """
         tasks = self._pending_source_tasks.pop(self._source_key(source, chat_id), [])
         points = await self.get_source_points(collection_name, source, chat_id)
@@ -1789,7 +1789,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 await self._gather_source_tasks(source, tasks)  # nothing to attach their product to
             return {"status": "error", "reason": f"no stored points for source '{source}'"}
 
-        await self.purge_source_graph_artifacts(source, collection_name, chat_id)
+        from .phases import GRAPH_SPACY_PHASE
+
+        await self.purge_source_graph_artifacts(source, collection_name, chat_id, phase=GRAPH_SPACY_PHASE)
         # Entity extraction runs on real text only, with the SAME content-first selection as the LLM phase: blank,
         # image, binary and catalogue-card-header points are dropped. The card FLAG alone is never a veto: content
         # wins, so real prose that merely inherited card metadata still extracts.
@@ -1845,8 +1847,8 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         """The ``graph_llm_extraction`` phase of one source: the LLM concept-relations step over its stored points.
 
         Gated on ``_enable_concept_relations`` (``enable_knowledge_graph`` is display-only): with it off the phase
-        is ``skipped``. Runs after the spaCy phase, whose purge removed the source's previous concepts, so its
-        idempotent MERGEs rebuild them. ``cat`` (the agent) provides the LLM.
+        is ``skipped``. Runs after the spaCy phase; it purges its own previous concepts/relations (the spaCy graph is
+        untouched) and its idempotent MERGEs rebuild them. ``cat`` (the agent) provides the LLM.
 
         Returns ``done``, ``not_ready`` for a transient LLM outcome (timeout / 429 / 5xx / dropped connection / first
         empty response: the core retries it within the phase budget), ``error`` for a permanent one (no LLM,
@@ -1855,6 +1857,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         points = await self.get_source_points(collection_name, source, chat_id)
         if not points:
             return {"status": "error", "reason": f"no stored points for source '{source}'"}
+        # The phase replaces its own product: purge the concepts/relations it wrote before (the spaCy graph is
+        # untouched), also when the toggle is off, so disabling the concepts removes them.
+        from .phases import GRAPH_LLM_PHASE
+
+        await self.purge_source_graph_artifacts(source, collection_name, chat_id, phase=GRAPH_LLM_PHASE)
         if not self._enable_concept_relations:
             return {"status": "skipped", "reason": "concept-relations extraction disabled"}
 
@@ -1864,9 +1871,9 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
     def spacy_phase_settings(self) -> Dict[str, Any]:
         """The material settings of the spaCy phase (its tag): the models and the two extraction toggles.
 
-        The concept-relations toggle is here too: the spaCy phase owns the purge of the source's graph, concepts
-        included, so turning the concepts off must re-run it (the LLM phase after it is then ``skipped`` and writes
-        nothing), otherwise the concepts extracted before would stay. The technology patterns are left out: saving
+        The concept-relations toggle is here too: turning it off must re-run the spaCy phase, and the LLM phase
+        after it purges the concepts it wrote before (it is then ``skipped`` and writes nothing), otherwise the
+        concepts extracted before would stay. The technology patterns are left out: saving
         them refreshes the technology entities of every document (``refresh_technology_entities``), so a re-run of
         the phase would repeat that work, and the LLM phase after it.
         """
@@ -2997,20 +3004,26 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     async def _strip_provenance(
         self, session, key: Optional[str] = None, prefix: Optional[str] = None, knowledge_base: bool = False,
+        concept_gen: Optional[bool] = None,
     ) -> None:
         """Remove provenance keys from the tenant's RELATED_TO edges, then delete the edges left without one (they
         existed only because of what is being removed): ``key`` (one source), every key starting with ``prefix`` (a
-        chat), or with ``knowledge_base`` every key of the knowledge base (not of a chat). Bounded sequential
-        batches (a large tenant exceeds the transaction memory of Neo4j in one)."""
-        scope = {"key": key, "prefix": prefix, "kb": knowledge_base, "chat_prefix": _CHAT_PROVENANCE_PREFIX}
+        chat), or with ``knowledge_base`` every key of the knowledge base (not of a chat). ``concept_gen`` restricts
+        the edges to one phase's product (``True``: the LLM concepts, ``False``: the spaCy relations, ``None``: both).
+        Bounded sequential batches (a large tenant exceeds the transaction memory of Neo4j in one)."""
+        scope = {
+            "key": key, "prefix": prefix, "kb": knowledge_base, "chat_prefix": _CHAT_PROVENANCE_PREFIX,
+            "concept_gen": concept_gen,
+        }
         removed = (
             "(($key IS NOT NULL AND x = $key) OR ($prefix IS NOT NULL AND x STARTS WITH $prefix)"
             " OR ($kb AND NOT x STARTS WITH $chat_prefix))"
         )
+        owned = "($concept_gen IS NULL OR (r.concept_gen IS NOT NULL) = $concept_gen)"
         result = await session.run(
             cast(LiteralString, f"""
             MATCH (:Entity {{tenant_id: $tenant_id}})-[r:RELATED_TO]->(:Entity {{tenant_id: $tenant_id}})
-            WHERE r.source_files IS NOT NULL AND any(x IN r.source_files WHERE {removed})
+            WHERE r.source_files IS NOT NULL AND any(x IN r.source_files WHERE {removed}) AND {owned}
             RETURN elementId(r) AS rid
             """),
             tenant_id=self.agent_id,
@@ -3023,7 +3036,7 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
                 await session.run(
                     cast(LiteralString, f"""
                     MATCH (:Entity {{tenant_id: $tenant_id}})-[r:RELATED_TO]->(:Entity {{tenant_id: $tenant_id}})
-                    WHERE elementId(r) IN $rids
+                    WHERE elementId(r) IN $rids AND {owned}
                     SET r.source_files = [x IN r.source_files WHERE NOT {removed}]
                     WITH r WHERE size(r.source_files) = 0
                     DELETE r
@@ -3065,16 +3078,20 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
     @tenant_write_locked("purge source graph artifacts")
     async def purge_source_graph_artifacts(
-        self, source: str, collection_name: str, chat_id: Optional[str] = None
+        self, source: str, collection_name: str, chat_id: Optional[str] = None, phase: Optional[str] = None
     ) -> int:
         """Delete the graph artifacts ONE source contributed to this tenant.
 
         The source is ``source`` in ``collection_name`` (the knowledge base, or
         the episodic memory of the chat ``chat_id``): a file with the same name
-        in the knowledge base and in a chat are two sources. Used by the spaCy
-        phase before it writes the source's graph again (the phase replaces its
-        product) and by the deletion of the graph phases. It removes ONLY what
-        the graph phases derived from the source's Documents and leaves:
+        in the knowledge base and in a chat are two sources. Used by each graph
+        phase before it writes its product again (the phase replaces it) and by
+        the deletion of the graph phases. ``phase`` scopes the purge to one
+        phase's product: ``graph_spacy_extraction`` removes the untagged
+        nodes/edges (``concept_gen IS NULL``), ``graph_llm_extraction`` the
+        concept-tagged ones (``concept_gen IS NOT NULL``); ``None`` removes
+        both (a full source deletion). It removes ONLY what the graph phases
+        derived from the source's Documents and leaves:
           - the chunk Documents themselves (owned by the embedding phase),
           - entities/relations still referenced by OTHER sources,
           - every other tenant's data.
@@ -3084,10 +3101,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
              and prune ONLY the entities those edges pointed at once they have
              no other provenance/mention (entities untouched by this source are
              never candidates);
-          2. delete SIMILAR_TO_* edges touching this source's Documents;
+          2. delete SIMILAR_TO_* edges touching this source's Documents (a
+             spaCy-phase product: skipped by the LLM purge);
           3. strip the source's provenance key (``provenance_key``: scoped by
              the chat) from RELATED_TO ``source_files`` and drop the edges that
-             existed only because of it.
+             existed only because of it (only the edges of the purged phase).
 
         The source's SourceFile node (document structure, built during the
         embedding phase) is kept: it is removed with the source's points.
@@ -3100,6 +3118,17 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
         # late finished result cannot resurrect the graph that was just removed.
         self._drop_source_tasks(source, chat_id)
         tenant_id = self.agent_id
+        # Ownership of the graph artifacts: the spaCy phase writes untagged nodes and edges (``concept_gen IS NULL``),
+        # the LLM phase tags everything it creates with the concept generation (``concept_gen IS NOT NULL``). A
+        # phase-scoped purge removes only its own product; the full purge (``phase=None``) removes both.
+        from .phases import GRAPH_LLM_PHASE, GRAPH_SPACY_PHASE
+
+        if phase == GRAPH_LLM_PHASE:
+            entity_owned, concept_gen = "e.concept_gen IS NOT NULL", True
+        elif phase == GRAPH_SPACY_PHASE:
+            entity_owned, concept_gen = "e.concept_gen IS NULL", False
+        else:
+            entity_owned, concept_gen = "true", None
         scope = {
             "tenant_id": tenant_id,
             "collection_name": collection_name,
@@ -3129,10 +3158,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             # Candidates MUST be resolved before their edges are removed: only
             # entities this source pointed at may ever be pruned here.
             result = await session.run(
-                """
-                MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                f"""
+                MATCH (d:Document {{tenant_id: $tenant_id}})-[r]->(e:Entity {{tenant_id: $tenant_id}})
                 WHERE d.id IN $doc_ids
                   AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                  AND {entity_owned}
                 RETURN DISTINCT e.id AS id
                 """,
                 tenant_id=tenant_id,
@@ -3145,10 +3175,11 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
             async def _delete_source_edges(batch: List[str]) -> None:
                 await (
                     await session.run(
-                        """
-                        MATCH (d:Document {tenant_id: $tenant_id})-[r]->(e:Entity {tenant_id: $tenant_id})
+                        f"""
+                        MATCH (d:Document {{tenant_id: $tenant_id}})-[r]->(e:Entity {{tenant_id: $tenant_id}})
                         WHERE d.id IN $doc_ids
                           AND type(r) IN ['PROVENANCE', 'MENTIONS']
+                          AND {entity_owned}
                         DELETE r
                         """,
                         tenant_id=tenant_id,
@@ -3175,45 +3206,46 @@ class GraphRAGHandler(EpochMixin, BaseVectorDatabaseHandler):
 
             await delete_in_batches(candidate_entity_ids, _prune_entities)
 
-            # SIMILAR_TO_* edges: resolve relationship ids, then chunk.
-            result = await session.run(
-                """
-                MATCH (d:Document {tenant_id: $tenant_id})-[r]-(:Document {tenant_id: $tenant_id})
-                WHERE d.id IN $doc_ids AND type(r) STARTS WITH 'SIMILAR_TO'
-                RETURN DISTINCT elementId(r) AS rid
-                """,
-                tenant_id=tenant_id,
-                doc_ids=document_ids,
-            )
-            similar_ids = [
-                record["rid"] async for record in result if record["rid"] is not None
-            ]
+            # SIMILAR_TO_* edges are a spaCy-phase product: the LLM purge leaves them.
+            if phase != GRAPH_LLM_PHASE:
+                result = await session.run(
+                    """
+                    MATCH (d:Document {tenant_id: $tenant_id})-[r]-(:Document {tenant_id: $tenant_id})
+                    WHERE d.id IN $doc_ids AND type(r) STARTS WITH 'SIMILAR_TO'
+                    RETURN DISTINCT elementId(r) AS rid
+                    """,
+                    tenant_id=tenant_id,
+                    doc_ids=document_ids,
+                )
+                similar_ids = [
+                    record["rid"] async for record in result if record["rid"] is not None
+                ]
 
-            async def _delete_similar(batch: List[str]) -> None:
-                await (
-                    await session.run(
-                        """
-                        MATCH (a:Document {tenant_id: $tenant_id})-[r]-(b:Document {tenant_id: $tenant_id})
-                        WHERE elementId(r) IN $rids
-                          AND type(r) STARTS WITH 'SIMILAR_TO'
-                        DELETE r
-                        """,
-                        tenant_id=tenant_id,
-                        rids=batch,
-                    )
-                ).consume()
+                async def _delete_similar(batch: List[str]) -> None:
+                    await (
+                        await session.run(
+                            """
+                            MATCH (a:Document {tenant_id: $tenant_id})-[r]-(b:Document {tenant_id: $tenant_id})
+                            WHERE elementId(r) IN $rids
+                              AND type(r) STARTS WITH 'SIMILAR_TO'
+                            DELETE r
+                            """,
+                            tenant_id=tenant_id,
+                            rids=batch,
+                        )
+                    ).consume()
 
-            await delete_in_batches(similar_ids, _delete_similar)
+                await delete_in_batches(similar_ids, _delete_similar)
 
             # RELATED_TO provenance strip (this source's key) + empty-edge delete, chunked.
-            await self._strip_provenance(session, key=provenance_key(source, chat_id))
+            await self._strip_provenance(session, key=provenance_key(source, chat_id), concept_gen=concept_gen)
             # The SourceFile node (document structure) is NOT a graph-phase
             # product: the embedding phase builds it, and a re-run of a graph
             # phase does not re-run the embedding. It goes away with the
             # source's points (both point deletes prune orphan SourceFiles).
         log.info(
             f"[GraphRAG] Purged graph artifacts for source '{source}' "
-            f"({doc_count} document(s), tenant {tenant_id})"
+            f"({doc_count} document(s), tenant {tenant_id}, phase {phase or 'all'})"
         )
         return doc_count
 

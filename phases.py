@@ -7,8 +7,10 @@ from ``cat`` (the CheshireCat of the agent) and ``source``.
 - ``graph_spacy_extraction`` (after ``embedding``): the NER, entity linking and similarity graph of the source;
 - ``graph_llm_extraction`` (after the spaCy phase): the concepts and relations the agent's LLM extracts.
 
-Both write the SAME graph (entities, PROVENANCE, RELATED_TO): the spaCy phase replaces the whole graph of the source
-(it purges it before writing), so the LLM phase depends on it and runs again whenever it runs.
+Both write the SAME graph (entities, PROVENANCE, RELATED_TO), but each phase owns its product: the spaCy phase
+writes untagged nodes/edges (``concept_gen IS NULL``), the LLM phase tags everything it creates with the concept
+generation (``concept_gen IS NOT NULL``). Each phase purges only its own artifacts, so re-running the LLM phase
+keeps the spaCy graph (and vice versa); the LLM phase depends on the spaCy one and runs again when it runs.
 
 The tag of a phase (``settings``) holds only what no dedicated job owns: the spaCy models and the two toggles (the
 concept toggle is in the spaCy tag too: turning the concepts off must re-run the purge that removes them). The
@@ -72,13 +74,16 @@ class _GraphPhase(IngestionPhase):
         return True, None
 
     async def delete(self, source: IngestionSource, cat) -> None:
-        """Remove the graph the source contributed (both phases write one graph): its documents' entity edges and
-        similarity edges, its RELATED_TO provenance and the entities left orphaned, plus its pending extraction.
-        Idempotent; the documents themselves go with the points of the source (``embedding``)."""
+        """Remove the graph artifacts THIS phase wrote for the source: its documents' entity edges and similarity
+        edges (spaCy), its RELATED_TO provenance and the entities left orphaned, plus its pending extraction. The
+        other graph phase's product is untouched. Idempotent; the documents themselves go with the points of the
+        source (``embedding``)."""
         handler = graphrag_handler(cat)
         if handler is None:
             return
-        await handler.purge_source_graph_artifacts(source.name, collection_of(source), source.chat_id)
+        await handler.purge_source_graph_artifacts(
+            source.name, collection_of(source), source.chat_id, phase=self.id,
+        )
 
 
 class GraphSpacyPhase(_GraphPhase):
