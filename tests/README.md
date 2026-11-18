@@ -29,7 +29,7 @@ Requirements per script:
   `test_graph_storage_contracts.py`, `test_llm_call_deadline.py`, `test_llm_error_mapping.py`,
   `test_batched_delete.py`, `test_lock_scope.py`, `test_tenant_write_lock.py`,
   `test_source_graph_write.py`, `test_pending_source_tasks.py`,
-  `test_transient_retry.py`;
+  `test_content_gating.py`, `test_transient_retry.py`;
 - `test_cypher_comments.py` — static guard against `#` comments inside Cypher
   strings, plus a live execution of the concept-relation template when a Neo4j
   password is provided (`NEO4J_PASSWORD`/`--password`); without one it reports

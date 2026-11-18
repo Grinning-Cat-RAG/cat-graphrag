@@ -56,6 +56,11 @@ if __name__ == "__main__":
             neo4j_uri=args.uri,
             neo4j_user=args.user,
             neo4j_password=args.password,
+            # Isolate the vector indexes: the live test uses a 2-dim fake embedder and the index names are
+            # GLOBAL (not tenant-scoped). Without this, `initialize` would drop/recreate the shared
+            # `document_embeddings_v1` / `entity_embeddings_v1` at 2 dims, breaking every real tenant.
+            document_vector_index=f"document_embeddings_test_{uuid.uuid4().hex[:8]}",
+            entity_vector_index=f"entity_embeddings_test_{uuid.uuid4().hex[:8]}",
             enable_entity_extraction=False,
             enable_concept_relations=False,
         )
@@ -156,6 +161,61 @@ if __name__ == "__main__":
         assert await edges_of(handler, kb) == 0
         assert await edges_of(handler, other_chat, exclude=chat + kb) == before["c2"], "purging the KB touched a chat"
         assert await handler.purge_source_graph_artifacts("x.pdf", gf.DECLARATIVE) == 2  # idempotent
+
+    async def test_phase_scoped_purge(handler):
+        """The LLM purge removes only the concept-tagged artifacts; the spaCy purge only the untagged ones."""
+        gen = await handler._read_generation(TENANT)
+        ids = await add_points(handler, gf.DECLARATIVE, "scoped.pdf", 2)
+        # spaCy-owned: untagged entities + RELATED_TO, MENTIONS + PROVENANCE, a SIMILAR_TO edge
+        await run(handler, """
+            MERGE (e:Entity {id: $eid, tenant_id: $tenant_id}) SET e.name = 'SpacyEntity', e.tracked_by_provenance = true
+            MERGE (o:Entity {id: $oid, tenant_id: $tenant_id}) SET o.name = 'SpacyOther', o.tracked_by_provenance = true
+            MERGE (e)-[r:RELATED_TO {type: 'SPACY_REL'}]->(o) SET r.source_files = ['scoped.pdf']
+            WITH e, o
+            UNWIND $doc_ids AS did
+            MATCH (d:Document {id: did, tenant_id: $tenant_id})
+            MERGE (d)-[:MENTIONS]->(e)
+            MERGE (d)-[:PROVENANCE]->(e)
+            MERGE (d)-[:PROVENANCE]->(o)
+        """, eid=f"{TENANT}:SpacyEntity", oid=f"{TENANT}:SpacyOther", doc_ids=ids)
+        await run(handler, """
+            MATCH (a:Document {id: $a, tenant_id: $tenant_id}), (b:Document {id: $b, tenant_id: $tenant_id})
+            MERGE (a)-[:SIMILAR_TO_TEST]-(b)
+        """, a=ids[0], b=ids[1])
+        # LLM-owned: concept_gen-tagged entities + RELATED_TO, PROVENANCE
+        await run(handler, """
+            MERGE (c:Entity {id: $cid, tenant_id: $tenant_id}) SET c.name = 'ConceptEntity', c.concept_gen = $gen, c.tracked_by_provenance = true
+            MERGE (o:Entity {id: $oid, tenant_id: $tenant_id}) SET o.name = 'ConceptOther', o.concept_gen = $gen, o.tracked_by_provenance = true
+            MERGE (c)-[r:RELATED_TO {type: 'CONCEPT_REL'}]->(o) SET r.source_files = ['scoped.pdf'], r.concept_gen = $gen
+            WITH c, o
+            UNWIND $doc_ids AS did
+            MATCH (d:Document {id: did, tenant_id: $tenant_id})
+            MERGE (d)-[:PROVENANCE]->(c)
+            MERGE (d)-[:PROVENANCE]->(o)
+        """, cid=f"{TENANT}:ConceptEntity", oid=f"{TENANT}:ConceptOther", gen=gen, doc_ids=ids)
+
+        async def exists(entity_id):
+            return bool(await run(handler, "MATCH (e:Entity {id: $eid, tenant_id: $tenant_id}) RETURN e", eid=entity_id))
+
+        async def related(entity_id):
+            return bool(await run(handler, "MATCH (e:Entity {id: $eid, tenant_id: $tenant_id})-[r:RELATED_TO]->() RETURN r", eid=entity_id))
+
+        # purge only the LLM phase: the concepts go, the spaCy graph and the similarity edge stay
+        await handler.purge_source_graph_artifacts("scoped.pdf", gf.DECLARATIVE, phase="graph_llm_extraction")
+        assert not await exists(f"{TENANT}:ConceptEntity"), "the LLM purge kept a concept entity"
+        assert not await exists(f"{TENANT}:ConceptOther"), "the LLM purge kept an orphan concept endpoint"
+        assert not await related(f"{TENANT}:ConceptEntity"), "the LLM purge kept a concept relation"
+        assert await exists(f"{TENANT}:SpacyEntity"), "the LLM purge removed a spaCy entity"
+        assert await related(f"{TENANT}:SpacyEntity"), "the LLM purge removed a spaCy relation"
+        assert await run(handler, "MATCH (:Document {tenant_id: $tenant_id})-[r:SIMILAR_TO_TEST]-() RETURN r"), \
+            "the LLM purge removed a similarity edge"
+
+        # purge only the spaCy phase: the rest goes
+        await handler.purge_source_graph_artifacts("scoped.pdf", gf.DECLARATIVE, phase="graph_spacy_extraction")
+        assert not await exists(f"{TENANT}:SpacyEntity"), "the spaCy purge kept an entity"
+        assert not await related(f"{TENANT}:SpacyEntity"), "the spaCy purge kept a relation"
+        assert not await run(handler, "MATCH (:Document {tenant_id: $tenant_id})-[r:SIMILAR_TO_TEST]-() RETURN r"), \
+            "the spaCy purge kept a similarity edge"
 
     async def test_points_read_once_across_pages(handler):
         # pages of 100 instead of 1000: the same paging over 3 pages, without inserting thousands of points (an insert
@@ -394,7 +454,7 @@ if __name__ == "__main__":
         handler = make_handler()
         other = make_handler(OTHER)
         tests = (
-            test_purge_is_scoped_to_collection_and_chat, test_points_read_once_across_pages,
+            test_purge_is_scoped_to_collection_and_chat, test_phase_scoped_purge, test_points_read_once_across_pages,
             test_wipe_tenant_graph, test_verify_graph_checks, test_stored_metadata_are_the_callers,
             test_stale_visible_concepts, test_a_concept_found_again_survives_the_flip,
             test_provenance_is_scoped_by_kb_and_chat, test_concepts_and_backfill_key_by_the_chat,
@@ -415,6 +475,9 @@ if __name__ == "__main__":
         finally:
             for h in (handler, other):
                 await run(h, "MATCH (n {tenant_id: $tenant_id}) DETACH DELETE n")
+                for index in (h._document_vector_index, h._entity_vector_index):
+                    async with h._get_session() as session:
+                        await session.run(f"DROP INDEX {index} IF EXISTS")
                 await h.close()
                 await gf.destroy_agent(h.agent_id)
         print(f"\ntest_graph_purge_live: {len(tests) - failed}/{len(tests)} passed")
